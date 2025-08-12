@@ -634,7 +634,7 @@ impl<'a> Module<'a> {
             type_index
         };
 
-        let sp = None; //self.find_mut_i32_global("__stack_pointer")?;
+        let sp = self.find_mut_i32_global("__stack_pointer")?;
         let allocation_state = self.find_mut_i32_global("allocation_state")?;
 
         let mut func_names = Vec::new();
@@ -748,9 +748,9 @@ impl<'a> Module<'a> {
                 // If there are any memories or any mutable globals there must be
                 // precisely one of each as otherwise we don't know how to filter
                 // down to the right one.
-                //if num_memories != 1 {
-                //    bail!("adapter modules don't support multi-memory");
-                //}
+                if num_memories != 1 {
+                    bail!("adapter modules don't support multi-memory");
+                }
 
                 let sp = map.globals.remap(sp);
 
