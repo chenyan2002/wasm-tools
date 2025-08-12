@@ -163,7 +163,8 @@ impl<'a> ComponentWorld<'a> {
                     required.insert(name.to_string());
                 }
 
-                Cow::Owned(
+                Cow::Borrowed(&wasm as &[u8])
+                /*Cow::Owned(
                     crate::gc::run(
                         wasm,
                         &required,
@@ -174,7 +175,7 @@ impl<'a> ComponentWorld<'a> {
                         },
                     )
                     .context("failed to reduce input adapter module to its minimal size")?,
-                )
+                )*/
             };
             let info = validate_adapter_module(
                 self.encoder,
