@@ -357,6 +357,19 @@ impl Printer<'_, '_> {
         Ok(())
     }
 
+    pub(crate) fn print_canonical_name(
+        &mut self,
+        name: &str,
+        version_suffix: Option<&str>,
+    ) -> Result<()> {
+        self.print_str(name)?;
+        if let Some(version_suffix) = version_suffix {
+            self.result.write_str(" ")?;
+            self.print_str(version_suffix)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn print_component_type<'a>(
         &mut self,
         states: &mut Vec<State>,
@@ -377,7 +390,7 @@ impl Printer<'_, '_> {
                     self.start_group("export ")?;
                     self.print_component_kind_name(states.last_mut().unwrap(), ty.kind())?;
                     self.result.write_str(" ")?;
-                    self.print_str(name.0)?;
+                    self.print_canonical_name(name.name, name.version_suffix)?;
                     self.result.write_str(" ")?;
                     self.print_component_import_ty(states.last_mut().unwrap(), &ty, false)?;
                     self.end_group()?;
@@ -412,7 +425,7 @@ impl Printer<'_, '_> {
                     self.start_group("export ")?;
                     self.print_component_kind_name(states.last_mut().unwrap(), ty.kind())?;
                     self.result.write_str(" ")?;
-                    self.print_str(name.0)?;
+                    self.print_canonical_name(name.name, name.version_suffix)?;
                     self.result.write_str(" ")?;
                     self.print_component_import_ty(states.last_mut().unwrap(), &ty, false)?;
                     self.end_group()?;
@@ -589,7 +602,7 @@ impl Printer<'_, '_> {
         index: bool,
     ) -> Result<()> {
         self.start_group("import ")?;
-        self.print_str(import.name.0)?;
+        self.print_canonical_name(import.name.name, import.name.version_suffix)?;
         self.result.write_str(" ")?;
         self.print_component_import_ty(state, &import.ty, index)?;
         self.end_group()?;
@@ -705,7 +718,7 @@ impl Printer<'_, '_> {
             self.print_component_kind_name(state, export.kind)?;
             self.result.write_str(" ")?;
         }
-        self.print_str(export.name.0)?;
+        self.print_canonical_name(export.name.name, export.name.version_suffix)?;
         self.result.write_str(" ")?;
         self.print_component_external_kind(state, export.kind, export.index)?;
         if let Some(ty) = &export.ty {

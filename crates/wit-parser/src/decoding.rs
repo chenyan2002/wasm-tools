@@ -97,8 +97,8 @@ impl ComponentInfo {
                     for import in s {
                         let import = import?;
                         externs.push((
-                            import.name.0.to_string(),
-                            Extern::Import(import.name.0.to_string()),
+                            import.name.name.to_string(),
+                            Extern::Import(import.name.name.to_string()),
                         ));
                     }
                 }
@@ -106,9 +106,9 @@ impl ComponentInfo {
                     for export in s {
                         let export = export?;
                         externs.push((
-                            export.name.0.to_string(),
+                            export.name.name.to_string(),
                             Extern::Export(DecodingExport {
-                                name: export.name.0.to_string(),
+                                name: export.name.name.to_string(),
                                 kind: export.kind,
                                 index: export.index,
                             }),

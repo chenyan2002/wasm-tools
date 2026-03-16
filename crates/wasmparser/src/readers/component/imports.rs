@@ -111,35 +111,44 @@ pub type ComponentImportSectionReader<'a> = SectionLimited<'a, ComponentImport<'
 
 /// Represents the name of a component import.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[allow(missing_docs)]
-pub struct ComponentImportName<'a>(pub &'a str);
+pub struct ComponentImportName<'a> {
+    /// The import name. When `version_suffix` is present, this is the
+    /// canonical interface name (e.g. `ns:pkg/iface@0.2`).
+    pub name: &'a str,
+    /// An optional semver version suffix that, when concatenated with the
+    /// canonical version in `name`, produces the full semver version.
+    /// For example if `name` is `ns:pkg/iface@0.2` and `version_suffix`
+    /// is `.6`, the full version is `0.2.6`.
+    pub version_suffix: Option<&'a str>,
+}
 
 impl<'a> FromReader<'a> for ComponentImportName<'a> {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
-        match reader.read_u8()? {
-            // This is the spec-required byte as of this time.
-            0x00 => {}
-
-            // Prior to WebAssembly/component-model#263 export names used a
-            // discriminator byte of 0x01 to indicate an "interface" of the
-            // form `a:b/c` but nowadays that's inferred from string syntax.
-            // Ignore 0-vs-1 to continue to parse older binaries. Eventually
-            // this will go away.
-            //
-            // This logic to ignore 0x01 was landed on 2023-10-28 in
-            // bytecodealliance/wasm-tools#1262 and the encoder at the time
-            // still emitted 0x01 to have better compatibility with prior
-            // validators.
-            //
-            // On 2024-09-03 in bytecodealliance/wasm-tools#TODO the encoder
-            // was updated to always emit 0x00 as a leading byte. After enough
-            // time has passed this case may be able to be removed. When
-            // removing this it's probably best to do it with a `WasmFeatures`
-            // flag first to ensure there's an opt-in way of fixing things.
-            0x01 => {}
-
+        let use_canonical_name = match reader.read_u8()? {
+            0x00 => false,
+            0x01 => {
+                #[cfg(feature = "features")]
+                {
+                    reader.features().cm_canonical_interface_names()
+                }
+                #[cfg(not(feature = "features"))]
+                false
+            }
             x => return reader.invalid_leading_byte(x, "import name"),
+        };
+        let name = reader.read_string()?;
+        if use_canonical_name {
+            let version_suffix = reader.read_string()?;
+            Ok(ComponentImportName {
+                name,
+                version_suffix: Some(version_suffix),
+            })
+        } else {
+            // TODO: try to parse version_suffix
+            Ok(ComponentImportName {
+                name,
+                version_suffix: None,
+            })
         }
-        Ok(ComponentImportName(reader.read_string()?))
     }
 }

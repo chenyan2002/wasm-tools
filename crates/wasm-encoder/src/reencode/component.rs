@@ -661,7 +661,7 @@ pub mod component_utils {
             }
             wasmparser::InstanceTypeDeclaration::Export { name, ty } => {
                 let ty = reencoder.component_type_ref(ty)?;
-                instance.export(name.0, ty);
+                instance.export_with_versionsuffix(name.name, name.version_suffix, ty);
                 Ok(())
             }
         }
@@ -715,12 +715,16 @@ pub mod component_utils {
             }
             wasmparser::ComponentTypeDeclaration::Export { name, ty } => {
                 let ty = reencoder.component_type_ref(ty)?;
-                component.export(name.0, ty);
+                component.export_with_versionsuffix(name.name, name.version_suffix, ty);
                 Ok(())
             }
             wasmparser::ComponentTypeDeclaration::Import(import) => {
                 let ty = reencoder.component_type_ref(import.ty)?;
-                component.import(import.name.0, ty);
+                component.import_with_versionsuffix(
+                    import.name.name,
+                    import.name.version_suffix,
+                    ty,
+                );
                 Ok(())
             }
         }
@@ -903,7 +907,11 @@ pub mod component_utils {
     ) -> Result<(), Error<T::Error>> {
         for import in section {
             let import = import?;
-            imports.import(import.name.0, reencoder.component_type_ref(import.ty)?);
+            imports.import_with_versionsuffix(
+                import.name.name,
+                import.name.version_suffix,
+                reencoder.component_type_ref(import.ty)?,
+            );
         }
         Ok(())
     }
@@ -1181,9 +1189,10 @@ pub mod component_utils {
                 );
             }
             wasmparser::ComponentInstance::FromExports(exports) => {
-                instances.export_items(exports.iter().map(|export| {
+                instances.export_items_with_versionsuffix(exports.iter().map(|export| {
                     (
-                        export.name.0,
+                        export.name.name,
+                        export.name.version_suffix,
                         export.kind.into(),
                         reencoder.component_external_index(export.kind, export.index),
                     )
@@ -1265,8 +1274,9 @@ pub mod component_utils {
         exports: &mut crate::ComponentExportSection,
         export: wasmparser::ComponentExport<'_>,
     ) -> Result<(), Error<T::Error>> {
-        exports.export(
-            export.name.0,
+        exports.export_with_versionsuffix(
+            export.name.name,
+            export.name.version_suffix,
             export.kind.into(),
             reencoder.component_external_index(export.kind, export.index),
             export

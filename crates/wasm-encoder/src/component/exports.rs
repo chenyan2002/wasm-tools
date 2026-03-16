@@ -109,6 +109,38 @@ impl ComponentExportSection {
         self.num_added += 1;
         self
     }
+
+    /// Define an export with canonical interface name encoding.
+    ///
+    /// When `version_suffix` is `Some`, uses the `0x01` discriminator to
+    /// encode the canonical name and version suffix separately.
+    pub fn export_with_versionsuffix(
+        &mut self,
+        name: &str,
+        version_suffix: Option<&str>,
+        kind: ComponentExportKind,
+        index: u32,
+        ty: Option<ComponentTypeRef>,
+    ) -> &mut Self {
+        crate::encode_component_export_name_with_versionsuffix(
+            &mut self.bytes,
+            name,
+            version_suffix,
+        );
+        kind.encode(&mut self.bytes);
+        index.encode(&mut self.bytes);
+        match ty {
+            Some(ty) => {
+                self.bytes.push(0x01);
+                ty.encode(&mut self.bytes);
+            }
+            None => {
+                self.bytes.push(0x00);
+            }
+        }
+        self.num_added += 1;
+        self
+    }
 }
 
 impl Encode for ComponentExportSection {
@@ -127,4 +159,20 @@ impl ComponentSection for ComponentExportSection {
 pub(crate) fn encode_component_export_name(bytes: &mut Vec<u8>, name: &str) {
     bytes.push(0x00);
     name.encode(bytes);
+}
+
+/// For more information on this see `encode_component_import_name_with_versionsuffix`.
+pub(crate) fn encode_component_export_name_with_versionsuffix(
+    bytes: &mut Vec<u8>,
+    name: &str,
+    version_suffix: Option<&str>,
+) {
+    match version_suffix {
+        Some(suffix) => {
+            bytes.push(0x01);
+            name.encode(bytes);
+            suffix.encode(bytes);
+        }
+        None => encode_component_export_name(bytes, name),
+    }
 }

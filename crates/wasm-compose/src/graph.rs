@@ -144,14 +144,14 @@ impl<'a> Component<'a> {
                                 Payload::ComponentImportSection(s) => {
                                     for import in s {
                                         let import = import?;
-                                        let name = import.name.0.to_string();
+                                        let name = import.name.name.to_string();
                                         imports.insert(name, import.ty);
                                     }
                                 }
                                 Payload::ComponentExportSection(s) => {
                                     for export in s {
                                         let export = export?;
-                                        let name = export.name.0.to_string();
+                                        let name = export.name.name.to_string();
                                         exports.insert(name, (export.kind, export.index));
                                     }
                                 }

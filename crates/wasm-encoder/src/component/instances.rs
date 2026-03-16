@@ -185,6 +185,29 @@ impl ComponentInstanceSection {
         self.num_added += 1;
         self
     }
+
+    /// Define an instance by exporting items with canonical interface name
+    /// encoding support.
+    pub fn export_items_with_versionsuffix<'a, E>(&mut self, exports: E) -> &mut Self
+    where
+        E: IntoIterator<Item = (&'a str, Option<&'a str>, ComponentExportKind, u32)>,
+        E::IntoIter: ExactSizeIterator,
+    {
+        let exports = exports.into_iter();
+        self.bytes.push(0x01);
+        exports.len().encode(&mut self.bytes);
+        for (name, version_suffix, kind, index) in exports {
+            crate::encode_component_export_name_with_versionsuffix(
+                &mut self.bytes,
+                name,
+                version_suffix,
+            );
+            kind.encode(&mut self.bytes);
+            index.encode(&mut self.bytes);
+        }
+        self.num_added += 1;
+        self
+    }
 }
 
 impl Encode for ComponentInstanceSection {

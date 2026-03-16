@@ -137,6 +137,22 @@ impl ComponentImportSection {
         self.num_added += 1;
         self
     }
+
+    /// Define an import with canonical interface name encoding.
+    ///
+    /// When `version_suffix` is `Some`, uses the `0x01` discriminator to
+    /// encode the canonical name and version suffix separately.
+    pub fn import_with_versionsuffix(
+        &mut self,
+        name: &str,
+        version_suffix: Option<&str>,
+        ty: ComponentTypeRef,
+    ) -> &mut Self {
+        encode_component_import_name_with_versionsuffix(&mut self.bytes, name, version_suffix);
+        ty.encode(&mut self.bytes);
+        self.num_added += 1;
+        self
+    }
 }
 
 impl Encode for ComponentImportSection {
@@ -151,20 +167,31 @@ impl ComponentSection for ComponentImportSection {
     }
 }
 
-/// Prior to WebAssembly/component-model#263 import and export names were
-/// discriminated with a leading byte indicating what kind of import they are.
-/// After that PR though names are always prefixed with a 0x00 byte.
+/// Encodes a component import name per the `importname'` production in the
+/// component model specification.
 ///
-/// On 2023-10-28 in bytecodealliance/wasm-tools#1262 was landed to start
-/// transitioning to "always lead with 0x00". That updated the validator/parser
-/// to accept either 0x00 or 0x01 but the encoder wasn't updated at the time.
-///
-/// On 2024-09-03 in bytecodealliance/wasm-tools#TODO this encoder was updated
-/// to always emit 0x00 as a leading byte.
-///
-/// This function corresponds with the `importname'` production in the
-/// specification.
+/// This function always uses the `0x00` discriminator.
 pub(crate) fn encode_component_import_name(bytes: &mut Vec<u8>, name: &str) {
     bytes.push(0x00);
     name.encode(bytes);
+}
+
+/// Encodes a component import name with an optional version suffix.
+///
+/// When `version_suffix` is `Some`, the `0x01` discriminator is used followed
+/// by the canonical name and the version suffix string. When `None`, this
+/// falls back to the standard `0x00` encoding.
+pub(crate) fn encode_component_import_name_with_versionsuffix(
+    bytes: &mut Vec<u8>,
+    name: &str,
+    version_suffix: Option<&str>,
+) {
+    match version_suffix {
+        Some(suffix) => {
+            bytes.push(0x01);
+            name.encode(bytes);
+            suffix.encode(bytes);
+        }
+        None => encode_component_import_name(bytes, name),
+    }
 }

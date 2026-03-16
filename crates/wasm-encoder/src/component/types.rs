@@ -238,10 +238,56 @@ impl ComponentType {
         self
     }
 
+    /// Defines an import with canonical interface name encoding.
+    pub fn import_with_versionsuffix(
+        &mut self,
+        name: &str,
+        version_suffix: Option<&str>,
+        ty: ComponentTypeRef,
+    ) -> &mut Self {
+        self.bytes.push(0x03);
+        crate::encode_component_import_name_with_versionsuffix(
+            &mut self.bytes,
+            name,
+            version_suffix,
+        );
+        ty.encode(&mut self.bytes);
+        self.num_added += 1;
+        match ty {
+            ComponentTypeRef::Type(..) => self.types_added += 1,
+            ComponentTypeRef::Instance(..) => self.instances_added += 1,
+            _ => {}
+        }
+        self
+    }
+
     /// Defines an export in this component type.
     pub fn export(&mut self, name: &str, ty: ComponentTypeRef) -> &mut Self {
         self.bytes.push(0x04);
         crate::encode_component_export_name(&mut self.bytes, name);
+        ty.encode(&mut self.bytes);
+        self.num_added += 1;
+        match ty {
+            ComponentTypeRef::Type(..) => self.types_added += 1,
+            ComponentTypeRef::Instance(..) => self.instances_added += 1,
+            _ => {}
+        }
+        self
+    }
+
+    /// Defines an export with canonical interface name encoding.
+    pub fn export_with_versionsuffix(
+        &mut self,
+        name: &str,
+        version_suffix: Option<&str>,
+        ty: ComponentTypeRef,
+    ) -> &mut Self {
+        self.bytes.push(0x04);
+        crate::encode_component_export_name_with_versionsuffix(
+            &mut self.bytes,
+            name,
+            version_suffix,
+        );
         ty.encode(&mut self.bytes);
         self.num_added += 1;
         match ty {
@@ -312,6 +358,17 @@ impl InstanceType {
     /// Defines an export in this instance type.
     pub fn export(&mut self, name: &str, ty: ComponentTypeRef) -> &mut Self {
         self.0.export(name, ty);
+        self
+    }
+
+    /// Defines an export with canonical interface name encoding.
+    pub fn export_with_versionsuffix(
+        &mut self,
+        name: &str,
+        version_suffix: Option<&str>,
+        ty: ComponentTypeRef,
+    ) -> &mut Self {
+        self.0.export_with_versionsuffix(name, version_suffix, ty);
         self
     }
 

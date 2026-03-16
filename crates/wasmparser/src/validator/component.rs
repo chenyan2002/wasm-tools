@@ -634,12 +634,12 @@ impl ComponentState {
         let mut entity = self.check_type_ref(&import.ty, types, offset)?;
         self.add_entity(
             &mut entity,
-            Some((import.name.0, ExternKind::Import)),
+            Some((import.name.name, ExternKind::Import)),
             types,
             offset,
         )?;
         self.toplevel_imported_resources.validate_extern(
-            import.name.0,
+            import.name.name,
             ExternKind::Import,
             &entity,
             types,
@@ -1135,9 +1135,14 @@ impl ComponentState {
         if check_limit {
             check_max(self.exports.len(), 1, MAX_WASM_EXPORTS, "exports", offset)?;
         }
-        self.add_entity(&mut ty, Some((name.0, ExternKind::Export)), types, offset)?;
+        self.add_entity(
+            &mut ty,
+            Some((name.name, ExternKind::Export)),
+            types,
+            offset,
+        )?;
         self.toplevel_exported_resources.validate_extern(
-            name.0,
+            name.name,
             ExternKind::Export,
             &ty,
             types,
@@ -3504,7 +3509,7 @@ impl ComponentState {
             };
 
             names.validate_extern(
-                export.name.0,
+                export.name.name,
                 ExternKind::Export,
                 &ty,
                 types,

@@ -116,20 +116,44 @@ impl<'a> FromReader<'a> for ComponentExternalKind {
 
 /// Represents the name of a component export.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[allow(missing_docs)]
-pub struct ComponentExportName<'a>(pub &'a str);
+pub struct ComponentExportName<'a> {
+    /// The export name. When `version_suffix` is present, this is the
+    /// canonical interface name (e.g. `ns:pkg/iface@0.2`).
+    pub name: &'a str,
+    /// An optional semver version suffix that, when concatenated with the
+    /// canonical version in `name`, produces the full semver version.
+    /// For example if `name` is `ns:pkg/iface@0.2` and `version_suffix`
+    /// is `.6`, the full version is `0.2.6`.
+    pub version_suffix: Option<&'a str>,
+}
 
 impl<'a> FromReader<'a> for ComponentExportName<'a> {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
-        match reader.read_u8()? {
-            0x00 => {}
-            // Historically export names used a discriminator byte of 0x01 to
-            // indicate an "interface" of the form `a:b/c` but nowadays that's
-            // inferred from string syntax. Ignore 0-vs-1 to continue to parse
-            // older binaries. Eventually this will go away.
-            0x01 => {}
+        let use_canonical_name = match reader.read_u8()? {
+            0x00 => false,
+            0x01 => {
+                #[cfg(feature = "features")]
+                {
+                    reader.features().cm_canonical_interface_names()
+                }
+                #[cfg(not(feature = "features"))]
+                false
+            }
             x => return reader.invalid_leading_byte(x, "export name"),
+        };
+        let name = reader.read_string()?;
+        if use_canonical_name {
+            let version_suffix = reader.read_string()?;
+            Ok(ComponentExportName {
+                name,
+                version_suffix: Some(version_suffix),
+            })
+        } else {
+            // TODO: try to parse version_suffix
+            Ok(ComponentExportName {
+                name,
+                version_suffix: None,
+            })
         }
-        Ok(ComponentExportName(reader.read_string()?))
     }
 }
