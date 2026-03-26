@@ -364,8 +364,10 @@ impl Printer<'_, '_> {
     ) -> Result<()> {
         self.print_str(name)?;
         if let Some(version_suffix) = version_suffix {
+            self.start_group("version_suffix")?;
             self.result.write_str(" ")?;
             self.print_str(version_suffix)?;
+            self.end_group()?;
         }
         Ok(())
     }

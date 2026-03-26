@@ -122,33 +122,124 @@ pub struct ComponentImportName<'a> {
     pub version_suffix: Option<&'a str>,
 }
 
+/// Tries to parse a canonical interface name by splitting a full semver
+/// version into its canonical prefix and remaining suffix.
+///
+/// The split point is chosen per the component model spec:
+/// - If `major > 0`, split after major: `1.2.3` → `1` / `.2.3`
+/// - Else if `minor > 0`, split after minor: `0.2.6-rc.1` → `0.2` / `.6-rc.1`
+/// - Else, split after patch: `0.0.1-alpha` → `0.0.1` / `-alpha`
+///
+/// Returns `None` if the name has no `@`, or the version can't be parsed,
+pub(crate) fn try_parse_canonical_name(name: &str) -> Option<(&str, &str)> {
+    let at = name.rfind('@')?;
+    let version_str = &name[at + 1..];
+    let version = semver::Version::parse(version_str).ok()?;
+
+    // Determine how many version components form the canonical prefix
+    // by counting characters in the original string rather than allocating.
+    let canon_len = if version.major > 0 {
+        digit_count(version.major)
+    } else if version.minor > 0 {
+        // "0." + minor digits
+        2 + digit_count(version.minor)
+    } else {
+        // "0.0." + patch digits
+        4 + digit_count(version.patch)
+    };
+
+    let split = at + 1 + canon_len;
+    let suffix = &name[split..];
+    Some((&name[..split], suffix))
+}
+
+fn digit_count(n: u64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    let mut n = n;
+    while n > 0 {
+        count += 1;
+        n /= 10;
+    }
+    count
+}
+
 impl<'a> FromReader<'a> for ComponentImportName<'a> {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
-        let use_canonical_name = match reader.read_u8()? {
-            0x00 => false,
-            0x01 => {
-                #[cfg(feature = "features")]
-                {
-                    reader.features().cm_canonical_interface_names()
-                }
-                #[cfg(not(feature = "features"))]
-                false
-            }
-            x => return reader.invalid_leading_byte(x, "import name"),
-        };
-        let name = reader.read_string()?;
-        if use_canonical_name {
-            let version_suffix = reader.read_string()?;
-            Ok(ComponentImportName {
-                name,
-                version_suffix: Some(version_suffix),
-            })
-        } else {
-            // TODO: try to parse version_suffix
-            Ok(ComponentImportName {
-                name,
-                version_suffix: None,
-            })
+        #[cfg(feature = "features")]
+        let parse_canonical_name = reader.features().cm_canonical_interface_names();
+        #[cfg(not(feature = "features"))]
+        let parse_canonical_name = false;
+        let prefix = reader.read_u8()?;
+        if !matches!(prefix, 0x00 | 0x01) {
+            return reader.invalid_leading_byte(prefix, "import name");
         }
+        let name = reader.read_string()?;
+        if parse_canonical_name {
+            match prefix {
+                0x00 => {
+                    if let Some((name, version_suffix)) = try_parse_canonical_name(name) {
+                        return Ok(ComponentImportName {
+                            name,
+                            version_suffix: Some(version_suffix),
+                        });
+                    }
+                    return Ok(ComponentImportName {
+                        name,
+                        version_suffix: None,
+                    });
+                }
+                0x01 => {
+                    let version_suffix = reader.read_string()?;
+                    return Ok(ComponentImportName {
+                        name,
+                        version_suffix: Some(version_suffix),
+                    });
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            match prefix {
+                0x00 | 0x01 => {
+                    let name = reader.read_string()?;
+                    return Ok(ComponentImportName {
+                        name,
+                        version_suffix: None,
+                    });
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_parse_canonical_name_test() {
+        let result = try_parse_canonical_name("ns:pkg/iface@1.2.3");
+        assert_eq!(result, Some(("ns:pkg/iface@1", ".2.3")));
+        let result = try_parse_canonical_name("ns:pkg/iface@2.0.0");
+        assert_eq!(result, Some(("ns:pkg/iface@2", ".0.0")));
+        let result = try_parse_canonical_name("ns:pkg/iface@1.0.0-beta.1");
+        assert_eq!(result, Some(("ns:pkg/iface@1", ".0.0-beta.1")));
+        let result = try_parse_canonical_name("ns:pkg/iface@0.2.6");
+        assert_eq!(result, Some(("ns:pkg/iface@0.2", ".6")));
+        let result = try_parse_canonical_name("ns:pkg/iface@0.10.6-rc.1");
+        assert_eq!(result, Some(("ns:pkg/iface@0.10", ".6-rc.1")));
+        let result = try_parse_canonical_name("ns:pkg/iface@0.0.1-alpha");
+        assert_eq!(result, Some(("ns:pkg/iface@0.0.1", "-alpha")));
+        let result = try_parse_canonical_name("ns:pkg/iface@0.0.1");
+        assert_eq!(result, Some(("ns:pkg/iface@0.0.1", "")));
+        let result = try_parse_canonical_name("ns:pkg/iface@0.0.0+build");
+        assert_eq!(result, Some(("ns:pkg/iface@0.0.0", "+build")));
+
+        assert_eq!(try_parse_canonical_name("ns:pkg/iface"), None);
+        assert_eq!(try_parse_canonical_name("ns:pkg/iface@notaversion"), None);
+        assert_eq!(try_parse_canonical_name("ns:pkg/iface@1.2"), None);
     }
 }

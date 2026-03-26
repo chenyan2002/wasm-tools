@@ -129,31 +129,51 @@ pub struct ComponentExportName<'a> {
 
 impl<'a> FromReader<'a> for ComponentExportName<'a> {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
-        let use_canonical_name = match reader.read_u8()? {
-            0x00 => false,
-            0x01 => {
-                #[cfg(feature = "features")]
-                {
-                    reader.features().cm_canonical_interface_names()
-                }
-                #[cfg(not(feature = "features"))]
-                false
-            }
-            x => return reader.invalid_leading_byte(x, "export name"),
-        };
+        #[cfg(feature = "features")]
+        let parse_canonical_name = reader.features().cm_canonical_interface_names();
+        #[cfg(not(feature = "features"))]
+        let parse_canonical_name = false;
+        let prefix = reader.read_u8()?;
+        if !matches!(prefix, 0x00 | 0x01) {
+            return reader.invalid_leading_byte(prefix, "export name");
+        }
         let name = reader.read_string()?;
-        if use_canonical_name {
-            let version_suffix = reader.read_string()?;
-            Ok(ComponentExportName {
-                name,
-                version_suffix: Some(version_suffix),
-            })
+        if parse_canonical_name {
+            match prefix {
+                0x00 => {
+                    if let Some((name, version_suffix)) =
+                        super::imports::try_parse_canonical_name(name)
+                    {
+                        return Ok(ComponentExportName {
+                            name,
+                            version_suffix: Some(version_suffix),
+                        });
+                    }
+                    return Ok(ComponentExportName {
+                        name,
+                        version_suffix: None,
+                    });
+                }
+                0x01 => {
+                    let version_suffix = reader.read_string()?;
+                    return Ok(ComponentExportName {
+                        name,
+                        version_suffix: Some(version_suffix),
+                    });
+                }
+                _ => unreachable!(),
+            }
         } else {
-            // TODO: try to parse version_suffix
-            Ok(ComponentExportName {
-                name,
-                version_suffix: None,
-            })
+            match prefix {
+                0x00 | 0x01 => {
+                    let name = reader.read_string()?;
+                    return Ok(ComponentExportName {
+                        name,
+                        version_suffix: None,
+                    });
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }
