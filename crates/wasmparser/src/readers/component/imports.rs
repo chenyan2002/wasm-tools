@@ -201,16 +201,10 @@ impl<'a> FromReader<'a> for ComponentImportName<'a> {
                 _ => unreachable!(),
             }
         } else {
-            match prefix {
-                0x00 | 0x01 => {
-                    let name = reader.read_string()?;
-                    return Ok(ComponentImportName {
-                        name,
-                        version_suffix: None,
-                    });
-                }
-                _ => unreachable!(),
-            }
+            return Ok(ComponentImportName {
+                name,
+                version_suffix: None,
+            });
         }
     }
 }

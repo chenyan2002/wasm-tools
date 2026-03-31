@@ -550,6 +550,11 @@ impl<'a> InterfaceName<'a> {
         let at = self.0.find('@')?;
         Some(Version::parse(&self.0[at + 1..]).unwrap())
     }
+    /// Returns the version string
+    pub fn version_str(&self) -> Option<&str> {
+        let at = self.0.find('@')?;
+        Some(&self.0[at + 1..])
+    }
 }
 
 /// A dependency on an implementation either as `locked-dep=...` or
