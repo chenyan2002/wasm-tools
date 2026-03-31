@@ -640,6 +640,7 @@ impl ComponentState {
         )?;
         self.toplevel_imported_resources.validate_extern(
             import.name.name,
+            import.name.version_suffix,
             ExternKind::Import,
             &entity,
             types,
@@ -1143,6 +1144,7 @@ impl ComponentState {
         )?;
         self.toplevel_exported_resources.validate_extern(
             name.name,
+            name.version_suffix,
             ExternKind::Export,
             &ty,
             types,
@@ -3510,6 +3512,7 @@ impl ComponentState {
 
             names.validate_extern(
                 export.name.name,
+                export.name.version_suffix,
                 ExternKind::Export,
                 &ty,
                 types,
@@ -4523,6 +4526,7 @@ impl ComponentNameContext {
     fn validate_extern(
         &self,
         name: &str,
+        version_suffix: Option<&str>,
         kind: ExternKind,
         ty: &ComponentEntityType,
         types: &TypeAlloc,
@@ -4532,10 +4536,20 @@ impl ComponentNameContext {
         info: &mut TypeInfo,
         features: &WasmFeatures,
     ) -> Result<()> {
+        let fullname = match version_suffix {
+            Some(suffix) => format!("{name}{suffix}"),
+            None => name.to_string(),
+        };
         // First validate that `name` is even a valid kebab name, meaning it's
         // in kebab-case, is an ID, etc.
-        let kebab = ComponentName::new_with_features(name, offset, *features)
-            .with_context(|| format!("{} name `{name}` is not a valid extern name", kind.desc()))?;
+        // TODO: <pkgname> currently takes <valid semver> only. Check if we need to update the spec.
+        let kebab =
+            ComponentName::new_with_features(&fullname, offset, *features).with_context(|| {
+                format!(
+                    "{} name `{fullname}` is not a valid extern name",
+                    kind.desc()
+                )
+            })?;
 
         if let ExternKind::Export = kind {
             match kebab.kind() {
@@ -4548,7 +4562,7 @@ impl ComponentNameContext {
                 ComponentNameKind::Hash(_)
                 | ComponentNameKind::Url(_)
                 | ComponentNameKind::Dependency(_) => {
-                    bail!(offset, "name `{name}` is not a valid export name")
+                    bail!(offset, "name `{fullname}` is not a valid export name")
                 }
             }
         }
