@@ -155,7 +155,13 @@ impl<'a> FromReader<'a> for ComponentExportName<'a> {
                     });
                 }
                 0x01 => {
-                    let version_suffix = reader.read_string()?;
+                    let version_suffix = match reader.read_string() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return reader
+                                .invalid_leading_byte(prefix, "missing export version suffix");
+                        }
+                    };
                     return Ok(ComponentExportName {
                         name,
                         version_suffix: Some(version_suffix),
