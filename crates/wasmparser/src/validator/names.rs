@@ -716,13 +716,15 @@ impl<'a> ComponentNameParser<'a> {
             self.next = "";
             return Ok(());
         }
+        if !self.features.cm_canonical_interface_names() {
+            bail!(self.offset, "not a valid semver: `{}`", self.next);
+        }
         let major = self.take_number()?;
         if major == 0 {
             self.expect_str(".")?;
             let minor = self.take_number()?;
             if minor == 0 {
                 self.expect_str(".")?;
-                // TODO: fix spec for canonversion rule: '0.0.' [0-9]+
                 self.take_number()?;
             }
         }
@@ -935,7 +937,7 @@ impl<'a> ComponentNameParser<'a> {
         }
         Ok(kebab)
     }
-    fn take_number(&mut self) -> Result<u32> {
+    fn take_number(&mut self) -> Result<u64> {
         let num_str = self
             .next
             .find(|c| !matches!(c, '0'..='9'))
@@ -945,6 +947,9 @@ impl<'a> ComponentNameParser<'a> {
                 num_str
             })
             .unwrap_or_else(|| self.take_rest());
+        if num_str.starts_with('0') && num_str.len() > 1 {
+            bail!(self.offset, "number cannot have leading zeros: `{num_str}`");
+        }
         match num_str.parse() {
             Ok(num) => Ok(num),
             Err(_) => bail!(self.offset, "expected number, found `{num_str}`"),
