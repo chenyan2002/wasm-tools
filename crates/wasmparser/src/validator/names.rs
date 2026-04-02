@@ -659,7 +659,7 @@ impl<'a> ComponentNameParser<'a> {
         }
 
         if self.next.contains(':') {
-            self.pkg_name(true)?;
+            self.interfacename()?;
             Ok(ParsedComponentNameKind::Interface)
         } else {
             self.expect_kebab()?;
@@ -698,6 +698,34 @@ impl<'a> ComponentNameParser<'a> {
             self.semver(version)?;
         }
 
+        Ok(())
+    }
+
+    // interfacename ::= <namespace>+ <label> <projection>* <interfaceversion>?
+    fn interfacename(&mut self) -> Result<()> {
+        self.pkg_path(true)?;
+        if self.eat_str("@") {
+            self.interfaceversion()?;
+        }
+        Ok(())
+    }
+    // interfaceversion ::= <valid semver>
+    //                    | <canonversion>
+    fn interfaceversion(&mut self) -> Result<()> {
+        if let Ok(_) = Version::parse(self.next) {
+            self.next = "";
+            return Ok(());
+        }
+        let major = self.take_number()?;
+        if major == 0 {
+            self.expect_str(".")?;
+            let minor = self.take_number()?;
+            if minor == 0 {
+                self.expect_str(".")?;
+                // TODO: fix spec for canonversion rule: '0.0.' [0-9]+
+                self.take_number()?;
+            }
+        }
         Ok(())
     }
 
@@ -906,6 +934,21 @@ impl<'a> ComponentNameParser<'a> {
             );
         }
         Ok(kebab)
+    }
+    fn take_number(&mut self) -> Result<u32> {
+        let num_str = self
+            .next
+            .find(|c| !matches!(c, '0'..='9'))
+            .map(|i| {
+                let (num_str, next) = self.next.split_at(i);
+                self.next = next;
+                num_str
+            })
+            .unwrap_or_else(|| self.take_rest());
+        match num_str.parse() {
+            Ok(num) => Ok(num),
+            Err(_) => bail!(self.offset, "expected number, found `{num_str}`"),
+        }
     }
 
     fn expect_kebab(&mut self) -> Result<&'a KebabStr> {
