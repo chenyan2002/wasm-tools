@@ -324,6 +324,12 @@ define_wasm_features! {
         /// Corresponds to the 🏷️ character in
         /// <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Explainer.md>.
         pub cm_implements: CM_IMPLEMENTS(1 << 40) = false;
+
+        /// Support for canonical interface names in the component model proposal.
+        ///
+        /// Corresponds to the 🔗 character in
+        /// <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Explainer.md>.
+        pub cm_canonical_interface_names: CM_CANONICAL_INTERFACE_NAMES(1 << 41) = false;
     }
 }
 

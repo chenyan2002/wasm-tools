@@ -1052,6 +1052,7 @@ impl<'a> From<ComponentExternName<'a>> for wasm_encoder::ComponentExternName<'a>
         wasm_encoder::ComponentExternName {
             name: name.name.into(),
             implements: name.implements.map(|i| i.into()),
+            version_suffix: name.version_suffix.map(|s| s.into()),
         }
     }
 }

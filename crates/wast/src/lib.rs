@@ -455,6 +455,7 @@ pub mod kw {
     custom_keyword!(i8x16);
     custom_keyword!(import);
     custom_keyword!(implements);
+    custom_keyword!(versionsuffix);
     custom_keyword!(instance);
     custom_keyword!(instantiate);
     custom_keyword!(interface);

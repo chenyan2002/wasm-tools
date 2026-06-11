@@ -398,7 +398,13 @@ impl Printer<'_, '_> {
             self.result.write_str(" ")?;
             self.start_group("implements ")?;
             self.print_str(implements)?;
+            if let Some(version_suffix) = name.version_suffix {
+                // merge back the version suffix into implements to get the full semver
+                self.print_str(version_suffix)?;
+            }
             self.end_group()?;
+        } else if let Some(version_suffix) = name.version_suffix {
+            self.print_str(version_suffix)?;
         }
         Ok(())
     }

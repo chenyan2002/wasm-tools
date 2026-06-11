@@ -165,6 +165,9 @@ pub struct ComponentExternName<'a> {
     /// An optional `(implements ...)` directive (See 🏷️ in the component model
     /// explainer).
     pub implements: Option<Cow<'a, str>>,
+    /// An optional version suffix (See 🔗 in the component model explainer).
+    /// When implements is present, version_suffix refers to the interface name from implements.
+    pub version_suffix: Option<Cow<'a, str>>,
 }
 
 impl Encode for ComponentExternName<'_> {
@@ -213,6 +216,8 @@ impl<'a> From<&'a str> for ComponentExternName<'a> {
         ComponentExternName {
             name: Cow::Borrowed(name),
             implements: None,
+            // TODO: extract suffix
+            version_suffix: None,
         }
     }
 }
@@ -222,6 +227,8 @@ impl<'a> From<&'a String> for ComponentExternName<'a> {
         ComponentExternName {
             name: Cow::Borrowed(name),
             implements: None,
+            // TODO: extract suffix
+            version_suffix: None,
         }
     }
 }
@@ -231,6 +238,8 @@ impl<'a> From<String> for ComponentExternName<'a> {
         ComponentExternName {
             name: Cow::Owned(name),
             implements: None,
+            // TODO: extract suffix
+            version_suffix: None,
         }
     }
 }
@@ -238,10 +247,15 @@ impl<'a> From<String> for ComponentExternName<'a> {
 #[cfg(feature = "wasmparser")]
 impl<'a> From<wasmparser::ComponentExternName<'a>> for ComponentExternName<'a> {
     fn from(name: wasmparser::ComponentExternName<'a>) -> Self {
-        let wasmparser::ComponentExternName { name, implements } = name;
+        let wasmparser::ComponentExternName {
+            name,
+            implements,
+            version_suffix,
+        } = name;
         ComponentExternName {
             name: name.into(),
             implements: implements.map(|s| s.into()),
+            version_suffix: version_suffix.map(|s| s.into()),
         }
     }
 }

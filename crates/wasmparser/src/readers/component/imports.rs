@@ -115,6 +115,7 @@ pub type ComponentImportSectionReader<'a> = SectionLimited<'a, ComponentImport<'
 pub struct ComponentExternName<'a> {
     pub name: &'a str,
     pub implements: Option<&'a str>,
+    pub version_suffix: Option<&'a str>,
 }
 
 impl<'a> FromReader<'a> for ComponentExternName<'a> {
@@ -142,12 +143,12 @@ impl<'a> FromReader<'a> for ComponentExternName<'a> {
             0x01 => false,
 
             0x02 => {
-                if reader.cm_implements() {
+                if reader.cm_implements() || reader.cm_canonical_interface_names() {
                     true
                 } else {
                     bail!(
                         reader.original_position() - 1,
-                        "the `cm-implements` feature is not active"
+                        "the `cm-implements` or `cm-canonical-interface-names` feature is not active"
                     )
                 }
             }
@@ -157,6 +158,7 @@ impl<'a> FromReader<'a> for ComponentExternName<'a> {
         let mut ret = ComponentExternName {
             name: reader.read_string()?,
             implements: None,
+            version_suffix: None,
         };
         if has_options {
             for _ in 0..reader.read_var_u32()? {
@@ -168,6 +170,12 @@ impl<'a> FromReader<'a> for ComponentExternName<'a> {
                         }
                         ret.implements = Some(name);
                     }
+                    ComponentNameOpt::VersionSuffix(name) => {
+                        if ret.version_suffix.is_some() {
+                            bail!(pos, "duplicate 'version-suffix' option in name");
+                        }
+                        ret.version_suffix = Some(name);
+                    }
                 }
             }
         }
@@ -177,12 +185,14 @@ impl<'a> FromReader<'a> for ComponentExternName<'a> {
 
 enum ComponentNameOpt<'a> {
     Implements(&'a str),
+    VersionSuffix(&'a str),
 }
 
 impl<'a> FromReader<'a> for ComponentNameOpt<'a> {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
         match reader.read_u8()? {
             0x00 => Ok(ComponentNameOpt::Implements(reader.read()?)),
+            0x01 => Ok(ComponentNameOpt::VersionSuffix(reader.read()?)),
             x => return reader.invalid_leading_byte(x, "name option"),
         }
     }
