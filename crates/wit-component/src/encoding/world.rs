@@ -50,6 +50,7 @@ pub struct ImportedInterface {
     pub lowerings: IndexMap<(String, AbiVariant), Lowering>,
     pub interface: Option<InterfaceId>,
     pub implements: Option<String>,
+    pub version_suffix: Option<String>,
 }
 
 #[derive(Debug)]
@@ -260,12 +261,14 @@ impl<'a> ComponentWorld<'a> {
                 WorldItem::Interface { id, .. } => Some(*id),
             };
             let implements = resolve.implements_value(key, item);
+            let version_suffix = resolve.version_suffix_value(key, item);
             let interface = import_map
                 .entry(import_map_key)
                 .or_insert_with(|| ImportedInterface {
                     interface: interface_id,
                     lowerings: Default::default(),
                     implements: implements.clone(),
+                    version_suffix: version_suffix.clone(),
                 });
             assert_eq!(interface.interface, interface_id);
             assert_eq!(interface.implements, implements);

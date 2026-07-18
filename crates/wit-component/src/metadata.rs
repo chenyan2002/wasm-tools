@@ -78,6 +78,7 @@ impl Default for Bindgen {
                 namespace: "root".to_string(),
                 name: "root".to_string(),
                 version: None,
+                version_suffix: None,
             },
             docs: Default::default(),
             interfaces: Default::default(),

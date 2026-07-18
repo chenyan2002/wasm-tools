@@ -4746,6 +4746,7 @@ impl ComponentNameContext {
                 e.insert(ComponentItem {
                     ty: *ty,
                     implements: name.implements.map(|s| s.to_string()),
+                    version_suffix: name.version_suffix.map(|s| s.to_string()),
                 });
                 info.combine(ty.info(types), offset)?;
             }

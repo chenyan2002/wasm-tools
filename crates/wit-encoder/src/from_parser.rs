@@ -50,7 +50,7 @@ impl<'a> Converter<'a> {
         PackageName::new(
             package.namespace.clone(),
             package.name.clone(),
-            package.version.clone(),
+            package.full_version(),
         )
     }
 

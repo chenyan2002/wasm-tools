@@ -565,6 +565,7 @@ impl<'a> EncodingState<'a> {
             wasm_encoder::ComponentExternName {
                 name: name.into(),
                 implements: info.implements.as_deref().map(|s| s.into()),
+                version_suffix: info.version_suffix.as_deref().map(|s| s.into()),
             },
             ComponentTypeRef::Instance(instance_type_idx),
         );
@@ -950,6 +951,7 @@ impl<'a> EncodingState<'a> {
             wasm_encoder::ComponentExternName {
                 name: export_name.into(),
                 implements: resolve.implements_value(key, item).map(|s| s.into()),
+                version_suffix: resolve.version_suffix_value(key, item).map(|s| s.into()),
             },
             ComponentExportKind::Instance,
             instance_index,
@@ -3125,6 +3127,7 @@ pub struct ComponentEncoder {
     merge_imports_based_on_semver: Option<bool>,
     pub(super) reject_legacy_names: bool,
     debug_names: bool,
+    use_canonical_version: bool,
 }
 
 impl ComponentEncoder {
@@ -3182,6 +3185,22 @@ impl ComponentEncoder {
     /// This is enabled by default.
     pub fn merge_imports_based_on_semver(mut self, merge: bool) -> Self {
         self.merge_imports_based_on_semver = Some(merge);
+        self
+    }
+
+    /// Sets whether to use canonical versions for interface names.
+    ///
+    /// When enabled, interface names use only the canonical version 
+    /// and version suffixes are stored separately. Dedup
+    /// of interfaces on the same canonical version happens at Resolve construction time
+    /// rather than as a post-pass.
+    ///
+    /// This is disabled by default.
+    pub fn use_canonical_version(mut self, use_it: bool) -> Self {
+        self.use_canonical_version = use_it;
+        if use_it {
+            self.merge_imports_based_on_semver = Some(false);
+        }
         self
     }
 
@@ -3319,7 +3338,7 @@ impl ComponentEncoder {
             bail!("a module is required when encoding a component");
         }
 
-        if self.merge_imports_based_on_semver.unwrap_or(true) {
+        if !self.use_canonical_version && self.merge_imports_based_on_semver.unwrap_or(true) {
             self.metadata
                 .resolve
                 .merge_world_imports_based_on_semver(self.metadata.world)?;

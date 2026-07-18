@@ -310,11 +310,11 @@ impl<'a> PackageName<'a> {
     }
 
     fn package_name(&self) -> crate::PackageName {
-        crate::PackageName {
-            namespace: self.namespace.name.to_string(),
-            name: self.name.name.to_string(),
-            version: self.version.as_ref().map(|(_, v)| v.clone()),
-        }
+        crate::PackageName::new(
+            self.namespace.name.to_string(),
+            self.name.name.to_string(),
+            self.version.as_ref().map(|(_, v)| v.clone()),
+        )
     }
 }
 
@@ -2024,7 +2024,8 @@ pub fn parse_use_path(s: &str) -> anyhow::Result<ParsedUsePath> {
 ///         package: Some(PackageName {
 ///             namespace: "foo".to_owned(),
 ///             name: "bar".to_owned(),
-///             version: None
+///             version: None,
+///             version_suffix: None,
 ///         }),
 ///         interface: None,
 ///         name: "baz".to_owned()
@@ -2036,7 +2037,8 @@ pub fn parse_use_path(s: &str) -> anyhow::Result<ParsedUsePath> {
 ///         package: Some(PackageName {
 ///             namespace: "foo".to_owned(),
 ///             name: "bar".to_owned(),
-///             version: Some("0.1.0".parse().unwrap())
+///             version: Some("0.1.0".to_owned()),
+///             version_suffix: None,
 ///         }),
 ///         interface: None,
 ///         name: "baz".to_owned()
@@ -2048,7 +2050,8 @@ pub fn parse_use_path(s: &str) -> anyhow::Result<ParsedUsePath> {
 ///         package: Some(PackageName {
 ///             namespace: "foo".to_owned(),
 ///             name: "bar".to_owned(),
-///             version: None
+///             version: None,
+///             version_suffix: None,
 ///         }),
 ///         interface: Some("baz".to_owned()),
 ///         name: "bat".to_owned()
@@ -2060,7 +2063,8 @@ pub fn parse_use_path(s: &str) -> anyhow::Result<ParsedUsePath> {
 ///         package: Some(PackageName {
 ///             namespace: "foo".to_owned(),
 ///             name: "bar".to_owned(),
-///             version: Some("0.1.0".parse().unwrap()),
+///             version: Some("0.1.0".to_owned()),
+///             version_suffix: None,
 ///         }),
 ///         interface: Some("baz".to_owned()),
 ///         name: "bat".to_owned()
@@ -2212,7 +2216,7 @@ impl From<ItemName> for String {
 
 #[cfg(test)]
 mod item_name_test {
-    use super::{ItemName, Version};
+    use super::ItemName;
     use crate::PackageName;
     use alloc::borrow::ToOwned;
 
@@ -2258,7 +2262,8 @@ mod item_name_test {
                 package: Some(PackageName {
                     namespace: "foo".to_owned(),
                     name: "bar".to_owned(),
-                    version: None
+                    version: None,
+                    version_suffix: None,
                 }),
                 interface: Some("baz".to_owned()),
                 name: "bat".to_owned()
@@ -2271,7 +2276,8 @@ mod item_name_test {
                 package: Some(PackageName {
                     namespace: "foo".to_owned(),
                     name: "bar".to_owned(),
-                    version: Some(Version::parse("0.1.0").unwrap()),
+                    version: Some("0.1.0".to_owned()),
+                    version_suffix: None,
                 }),
                 interface: Some("baz".to_owned()),
                 name: "bat".to_owned()
@@ -2284,7 +2290,8 @@ mod item_name_test {
                 package: Some(PackageName {
                     namespace: "foo".to_owned(),
                     name: "bar".to_owned(),
-                    version: None
+                    version: None,
+                    version_suffix: None,
                 }),
                 interface: None,
                 name: "baz".to_owned()
@@ -2297,7 +2304,8 @@ mod item_name_test {
                 package: Some(PackageName {
                     namespace: "foo".to_owned(),
                     name: "bar".to_owned(),
-                    version: Some(Version::parse("0.1.0").unwrap()),
+                    version: Some("0.1.0".to_owned()),
+                    version_suffix: None,
                 }),
                 interface: None,
                 name: "baz".to_owned()

@@ -233,7 +233,7 @@ pub enum AstItem {
 ///
 /// This is directly encoded as an "ID" in the binary component representation
 /// with an interfaced tacked on as well.
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(into = "String"))]
 pub struct PackageName {
@@ -241,8 +241,16 @@ pub struct PackageName {
     pub namespace: String,
     /// The kebab-name of this package, which is always specified.
     pub name: String,
-    /// Optional major/minor version information.
-    pub version: Option<Version>,
+    /// Optional canonical version string (the semver compatibility track).
+    ///
+    /// For example, for a package versioned `1.2.3`, this stores `"1"`.
+    pub version: Option<String>,
+    /// Optional version suffix beyond the canonical version.
+    ///
+    /// For example, for a package versioned `1.2.3` with canonical track
+    /// `"1"`, this stores `".2.3"`. When concatenated with the canonical
+    /// version string, it reproduces the full version.
+    pub version_suffix: Option<String>,
 }
 
 impl From<PackageName> for String {
@@ -252,69 +260,165 @@ impl From<PackageName> for String {
 }
 
 impl PackageName {
+    /// Creates a `PackageName` storing the full version string (no split).
+    pub fn new(namespace: String, name: String, version: Option<Version>) -> Self {
+        PackageName {
+            namespace,
+            name,
+            version: version.map(|v| v.to_string()),
+            version_suffix: None,
+        }
+    }
+
+    /// Creates a `PackageName` splitting the full version into canonical
+    /// version string and suffix. Used when canonical version mode is enabled.
+    pub fn new_canonical(namespace: String, name: String, version: Option<Version>) -> Self {
+        match version {
+            None => PackageName {
+                namespace,
+                name,
+                version: None,
+                version_suffix: None,
+            },
+            Some(full_version) => {
+                let (canonical, suffix) = Self::version_canon_and_suffix(&full_version);
+                PackageName {
+                    namespace,
+                    name,
+                    version: Some(canonical),
+                    version_suffix: suffix,
+                }
+            }
+        }
+    }
+
+    /// Converts this `PackageName` in-place to canonical form by splitting the
+    /// version into canonical prefix and suffix. No-op if already canonical or
+    /// if no version is set.
+    pub fn canonicalize(&mut self) {
+        let version_str = match &self.version {
+            Some(v) => v.clone(),
+            None => return,
+        };
+        let version = match Version::parse(&version_str) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let (canonical, suffix) = Self::version_canon_and_suffix(&version);
+        self.version = Some(canonical);
+        self.version_suffix = suffix;
+    }
+
+    /// Returns the full version string (canonical + suffix) for display.
+    ///
+    /// Returns the full version by combining canonical + suffix.
+    ///
+    /// For example, if canonical version is `"1"` and suffix is `".2.3"`,
+    /// this returns `Version` for `1.2.3`.
+    pub fn full_version(&self) -> Option<Version> {
+        let canonical = self.version.as_ref()?;
+        let full_str = match &self.version_suffix {
+            Some(suffix) => format!("{canonical}{suffix}"),
+            None => canonical.clone(),
+        };
+        Version::parse(&full_str).ok()
+    }
+
     /// Returns the ID that this package name would assign the `interface` name
-    /// specified.
+    /// specified. Uses the full version for human-readable display.
     pub fn interface_id(&self, interface: &str) -> String {
         let mut s = String::new();
         s.push_str(&format!("{}:{}/{interface}", self.namespace, self.name));
-        if let Some(version) = &self.version {
+        if let Some(version) = self.full_version() {
             s.push_str(&format!("@{version}"));
         }
         s
     }
 
-    /// Determines the "semver compatible track" for the given version.
+    /// Splits a version into its canonical prefix and optional suffix.
     ///
-    /// This method implements the logic from the component model where semver
-    /// versions can be compatible with one another. For example versions 1.2.0
-    /// and 1.2.1 would be considered both compatible with one another because
-    /// they're on the same semver compatible track.
+    /// The canonical prefix is the shortest string that identifies the
+    /// semver compatibility track (e.g., `"1"` for `1.2.3`). The suffix is
+    /// the remaining portion of the full version string (e.g., `".2.3"`).
     ///
-    /// This predicate is used during
-    /// [`Resolve::merge_world_imports_based_on_semver`] for example to
-    /// determine whether two imports can be merged together. This is
-    /// additionally used when creating components to match up imports in
-    /// core wasm to imports in worlds.
-    pub fn version_compat_track(version: &Version) -> Version {
-        let mut version = version.clone();
-        version.build = semver::BuildMetadata::EMPTY;
-        if !version.pre.is_empty() {
-            return version;
-        }
-        if version.major != 0 {
-            version.minor = 0;
-            version.patch = 0;
-            return version;
-        }
-        if version.minor != 0 {
-            version.patch = 0;
-            return version;
-        }
-        version
-    }
+    /// Returns `(canonical, Some(suffix))` when the full version extends
+    /// beyond the canonical track, or `(full, None)` when they are equal.
+    ///
+    /// Rules for the canonical prefix:
+    /// - Pre-release versions: the full version string (pre-release is part
+    ///   of the identity)
+    /// - Major > 0: just the major number (e.g., `"1"`)
+    /// - Major == 0, minor > 0: `"0.minor"` (e.g., `"0.1"`)
+    /// - `0.0.x`: the full version string
+    pub fn version_canon_and_suffix(version: &Version) -> (String, Option<String>) {
+        let full = version.to_string();
 
-    /// Returns the string corresponding to
-    /// [`PackageName::version_compat_track`]. This is done to match the
-    /// component model's expected naming scheme of imports and exports.
-    pub fn version_compat_track_string(version: &Version) -> String {
-        let version = Self::version_compat_track(version);
-        if !version.pre.is_empty() {
-            return version.to_string();
+        let canonical = if !version.pre.is_empty() {
+            full.clone()
+        } else if version.major != 0 {
+            format!("{}", version.major)
+        } else if version.minor != 0 {
+            format!("{}.{}", version.major, version.minor)
+        } else {
+            full.clone()
+        };
+
+        if full == canonical {
+            (full, None)
+        } else {
+            let suffix = full[canonical.len()..].to_string();
+            (canonical, Some(suffix))
         }
-        if version.major != 0 {
-            return format!("{}", version.major);
-        }
-        if version.minor != 0 {
-            return format!("{}.{}", version.major, version.minor);
-        }
-        version.to_string()
+    }
+}
+
+impl PartialEq for PackageName {
+    fn eq(&self, other: &Self) -> bool {
+        self.namespace == other.namespace
+            && self.name == other.name
+            && self.version == other.version
+    }
+}
+
+impl Eq for PackageName {}
+
+impl Hash for PackageName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.namespace.hash(state);
+        self.name.hash(state);
+        self.version.hash(state);
+    }
+}
+
+impl PartialOrd for PackageName {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PackageName {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.namespace
+            .cmp(&other.namespace)
+            .then_with(|| self.name.cmp(&other.name))
+            .then_with(|| match (&self.version, &other.version) {
+                (None, None) => core::cmp::Ordering::Equal,
+                (None, Some(_)) => core::cmp::Ordering::Less,
+                (Some(_), None) => core::cmp::Ordering::Greater,
+                (Some(a), Some(b)) => {
+                    match (Version::parse(a), Version::parse(b)) {
+                        (Ok(va), Ok(vb)) => va.cmp(&vb),
+                        _ => a.cmp(b),
+                    }
+                }
+            })
     }
 }
 
 impl fmt::Display for PackageName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.namespace, self.name)?;
-        if let Some(version) = &self.version {
+        if let Some(version) = self.full_version() {
             write!(f, "@{version}")?;
         }
         Ok(())

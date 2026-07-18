@@ -104,6 +104,12 @@ pub struct Resolve {
     /// Source map for converting spans to file locations.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub source_map: SourceMap,
+
+    /// When true, `PackageName.version` stores only the canonical version
+    /// (semver compatibility track) and `version_suffix` stores the remainder.
+    /// Interfaces are deduplicated by canonical version at insertion time.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub use_canonical_version: bool,
 }
 
 /// A WIT package within a `Resolve`.
@@ -1105,15 +1111,6 @@ impl Resolve {
         Some(self.id_of_name(interface.package.unwrap(), interface.name.as_ref()?))
     }
 
-    /// Returns the "canonicalized interface name" of `interface`.
-    ///
-    /// Returns `None` for unnamed interfaces. See `BuildTargets.md` in the
-    /// upstream component model repository for more information about this.
-    pub fn canonicalized_id_of(&self, interface: InterfaceId) -> Option<String> {
-        let interface = &self.interfaces[interface];
-        Some(self.canonicalized_id_of_name(interface.package.unwrap(), interface.name.as_ref()?))
-    }
-
     /// Helper to rename a world and update the package's world map.
     ///
     /// Used by both [`Resolve::importize`] and [`Resolve::exportize`] to
@@ -1259,11 +1256,13 @@ impl Resolve {
         base
     }
 
-    /// Returns the "canonicalized interface name" of the specified `name`
-    /// within the `pkg`.
-    ///
-    /// See `BuildTargets.md` in the upstream component model repository for
-    /// more information about this.
+    /// Like `id_of` but outputs the canonical (compatibility track) version.
+    pub fn canonicalized_id_of(&self, interface: InterfaceId) -> Option<String> {
+        let interface = &self.interfaces[interface];
+        Some(self.canonicalized_id_of_name(interface.package.unwrap(), interface.name.as_ref()?))
+    }
+
+    /// Like `id_of_name` but outputs the canonical (compatibility track) version.
     pub fn canonicalized_id_of_name(&self, pkg: PackageId, name: &str) -> String {
         let package = &self.packages[pkg];
         let mut base = String::new();
@@ -1272,12 +1271,22 @@ impl Resolve {
         base.push_str(&package.name.name);
         base.push_str("/");
         base.push_str(name);
-        if let Some(version) = &package.name.version {
-            base.push_str("@");
-            let string = PackageName::version_compat_track_string(version);
-            base.push_str(&string);
+        if let Some(version) = package.name.full_version() {
+            let (canonical, _) = PackageName::version_canon_and_suffix(&version);
+            base.push_str(&format!("@{canonical}"));
         }
         base
+    }
+
+    /// Same as [`Resolve::name_world_key`] except that `WorldKey::Interface`
+    /// uses [`Resolve::canonicalized_id_of`].
+    pub fn name_canonicalized_world_key(&self, key: &WorldKey) -> String {
+        match key {
+            WorldKey::Name(s) => s.to_string(),
+            WorldKey::Interface(i) => self
+                .canonicalized_id_of(*i)
+                .expect("unexpected anonymous interface"),
+        }
     }
 
     /// Selects a world from among the packages in a `Resolve`.
@@ -1520,17 +1529,6 @@ impl Resolve {
         }
     }
 
-    /// Same as [`Resolve::name_world_key`] except that `WorldKey::Interfaces`
-    /// uses [`Resolve::canonicalized_id_of`].
-    pub fn name_canonicalized_world_key(&self, key: &WorldKey) -> String {
-        match key {
-            WorldKey::Name(s) => s.to_string(),
-            WorldKey::Interface(i) => self
-                .canonicalized_id_of(*i)
-                .expect("unexpected anonymous interface"),
-        }
-    }
-
     /// Returns the component model `implements` value for the world import of
     /// `key` and `item`.
     ///
@@ -1539,11 +1537,35 @@ impl Resolve {
         if let WorldKey::Name(_) = key {
             if let WorldItem::Interface { id, .. } = item {
                 if self.interfaces[*id].name.is_some() {
-                    return Some(self.id_of(*id).unwrap().into());
+                    return Some(self.id_of(*id).unwrap());
                 }
             }
         }
         None
+    }
+
+    /// Returns the component model `version-suffix` value for the world
+    /// import/export of `key` and `item`.
+    ///
+    /// The version suffix is the portion of the full semver version that
+    /// extends beyond the canonical compatibility track. For example, if the
+    /// full version is `1.2.3`, the canonical track is `1`, so the suffix is
+    /// `.2.3`.
+    ///
+    /// When `implements` is present, the version suffix refers to the
+    /// interface named in implements. Otherwise it refers to the interface
+    /// in the key itself.
+    pub fn version_suffix_value(&self, key: &WorldKey, item: &WorldItem) -> Option<String> {
+        let id = match item {
+            WorldItem::Interface { id, .. } => *id,
+            _ => match key {
+                WorldKey::Interface(id) => *id,
+                _ => return None,
+            },
+        };
+        let iface = &self.interfaces[id];
+        let pkg_id = iface.package?;
+        self.packages[pkg_id].name.version_suffix.clone()
     }
 
     /// Returns the interface that `id` uses a type from, if it uses a type from
@@ -1983,7 +2005,7 @@ impl Resolve {
 
                 // Use of feature gating with version specifiers inside a
                 // package that is not versioned is not allowed
-                let package_version = p.name.version.as_ref().ok_or_else(|| {
+                let package_version = p.name.full_version().ok_or_else(|| {
                     ResolveError::new_semantic(
                         span,
                         format!(
@@ -1997,7 +2019,7 @@ impl Resolve {
                 // If the version on the feature gate is:
                 // - released, then we can include it
                 // - unreleased, then we must check the feature (if present)
-                if since > package_version {
+                if since > &package_version {
                     return Err(ResolveError::new_semantic(
                         span,
                         format!(
@@ -2343,14 +2365,6 @@ impl Resolve {
     pub fn merge_world_imports_based_on_semver(&mut self, world_id: WorldId) -> anyhow::Result<()> {
         let world = &self.worlds[world_id];
 
-        // The first pass here is to build a map of "semver tracks" where they
-        // key is per-interface and the value is the maximal version found in
-        // that semver-compatible-track plus the interface which is the maximal
-        // version.
-        //
-        // At the same time a `to_remove` set is maintained to remember what
-        // interfaces are being removed from `from` and `into`. All of
-        // `to_remove` are placed with a known other version.
         let mut semver_tracks = HashMap::new();
         let mut to_remove = HashSet::new();
         for (key, _) in world.imports.iter() {
@@ -2362,12 +2376,6 @@ impl Resolve {
                 Some(track) => track,
                 None => continue,
             };
-            log::debug!(
-                "{} is on track {}/{}",
-                self.id_of(iface_id).unwrap(),
-                track.0,
-                track.1,
-            );
             match semver_tracks.entry(track.clone()) {
                 Entry::Vacant(e) => {
                     e.insert((version, iface_id));
@@ -2385,8 +2393,6 @@ impl Resolve {
             }
         }
 
-        // Build a map of "this interface is replaced with this interface" using
-        // the results of the loop above.
         let mut replacements = HashMap::new();
         for id in to_remove {
             let (track, _) = self.semver_track(id).unwrap();
@@ -2394,14 +2400,8 @@ impl Resolve {
             let prev = replacements.insert(id, latest);
             assert!(prev.is_none());
         }
-        // Explicit drop needed for hashbrown compatibility - hashbrown's HashMap
-        // destructor may access stored references, extending the borrow.
         drop(semver_tracks);
 
-        // Validate that `merge_world_item` succeeds for merging all removed
-        // interfaces with their replacement. This is a double-check that the
-        // semver version is actually correct and all items present in the old
-        // interface are in the new.
         for (to_replace, replace_with) in replacements.iter() {
             self.merge_world_item(
                 &WorldItem::Interface {
@@ -2425,31 +2425,13 @@ impl Resolve {
             })?;
         }
 
-        for (to_replace, replace_with) in replacements.iter() {
-            log::debug!(
-                "REPLACE {} => {}",
-                self.id_of(*to_replace).unwrap(),
-                self.id_of(*replace_with).unwrap(),
-            );
-        }
-
-        // Finally perform the actual transformation of the imports/exports.
-        // Here all imports are removed if they're replaced and otherwise all
-        // imports have their dependencies updated, possibly transitively, to
-        // point to the new interfaces in `replacements`.
-        //
-        // Afterwards exports are additionally updated, but only their
-        // dependencies on imports which were remapped. Exports themselves are
-        // not deduplicated and/or removed.
         for (key, item) in mem::take(&mut self.worlds[world_id].imports) {
             if let WorldItem::Interface { id, .. } = item {
                 if replacements.contains_key(&id) {
                     continue;
                 }
             }
-
             self.update_interface_deps_of_world_item(&item, &replacements);
-
             let prev = self.worlds[world_id].imports.insert(key, item);
             assert!(prev.is_none());
         }
@@ -2459,11 +2441,6 @@ impl Resolve {
             assert!(prev.is_none());
         }
 
-        // Run through `elaborate_world` to reorder imports as appropriate and
-        // fill anything back in if it's actually required by exports. For now
-        // this doesn't tamper with exports at all. Also note that this is
-        // applied to all worlds in this `Resolve` because interfaces were
-        // modified directly.
         let ids = self.worlds.iter().map(|(id, _)| id).collect::<Vec<_>>();
         for world_id in ids {
             let world_span = self.worlds[world_id].span;
@@ -2497,28 +2474,20 @@ impl Resolve {
         }
     }
 
-    /// Returns the "semver track" of an interface plus the interface's version.
-    ///
-    /// This function returns `None` if the interface `id` has a package without
-    /// a version. If the version is present, however, the first element of the
-    /// tuple returned is a "semver track" for the specific interface. The
-    /// version listed in `PackageName` will be modified so all
-    /// semver-compatible versions are listed the same way.
-    ///
-    /// The second element in the returned tuple is this interface's package's
-    /// version.
-    fn semver_track(&self, id: InterfaceId) -> Option<((PackageName, String), &Version)> {
+    fn semver_track(&self, id: InterfaceId) -> Option<((PackageName, String), Version)> {
         let iface = &self.interfaces[id];
         let pkg = &self.packages[iface.package?];
-        let version = pkg.name.version.as_ref()?;
-        let mut name = pkg.name.clone();
-        name.version = Some(PackageName::version_compat_track(version));
-        Some(((name, iface.name.clone()?), version))
+        let full_version = pkg.name.full_version()?;
+        let (canonical, _) = PackageName::version_canon_and_suffix(&full_version);
+        let track_name = PackageName {
+            namespace: pkg.name.namespace.clone(),
+            name: pkg.name.name.clone(),
+            version: Some(canonical),
+            version_suffix: None,
+        };
+        Some(((track_name, iface.name.clone()?), full_version))
     }
 
-    /// If `ty` is a definition where it's a `use` from another interface, then
-    /// change what interface it's using from according to the pairs in the
-    /// `replacements` map.
     fn update_interface_dep_of_type(
         &mut self,
         ty: TypeId,
@@ -2537,8 +2506,6 @@ impl Resolve {
             _ => return,
         };
         let name = self.types[dep].name.as_ref().unwrap();
-        // Note the infallible name indexing happening here. This should be
-        // previously validated with `merge_world_item` to succeed.
         let replacement_id = self.interfaces[*replace_with].types[name];
         self.types[ty].kind = TypeDefKind::Type(Type::Id(replacement_id));
     }
@@ -2558,7 +2525,9 @@ impl Resolve {
             ManglingAndAbi::Standard32 => match import {
                 WasmImport::Func { interface, func } => {
                     let module = match interface {
-                        Some(key) => format!("cm32p2|{}", self.name_canonicalized_world_key(key)),
+                        Some(key) => {
+                            format!("cm32p2|{}", self.name_canonicalized_world_key(key))
+                        }
                         None => format!("cm32p2"),
                     };
                     (module, func.name.clone())
@@ -2577,7 +2546,10 @@ impl Resolve {
                     };
                     let module = match interface {
                         Some(key) => {
-                            format!("cm32p2|{prefix}{}", self.name_canonicalized_world_key(key))
+                            format!(
+                                "cm32p2|{prefix}{}",
+                                self.name_canonicalized_world_key(key)
+                            )
                         }
                         None => {
                             assert_eq!(prefix, "");
@@ -2762,7 +2734,7 @@ impl Resolve {
                 } => {
                     let mut name = String::from("cm32p2|");
                     if let Some(interface) = interface {
-                        let s = self.name_canonicalized_world_key(interface);
+                        let s = self.name_world_key(interface);
                         name.push_str(&s);
                     }
                     name.push_str("|");
@@ -2782,7 +2754,7 @@ impl Resolve {
                     resource,
                 } => {
                     let name = self.types[resource].name.as_ref().unwrap();
-                    let interface = self.name_canonicalized_world_key(interface);
+                    let interface = self.name_world_key(interface);
                     format!("cm32p2|{interface}|{name}_dtor")
                 }
                 WasmExport::Memory => "cm32p2_memory".to_string(),
@@ -3412,18 +3384,22 @@ impl Remap {
         resolve: &mut Resolve,
         unresolved: UnresolvedPackage,
     ) -> ResolveResult<PackageId> {
+        let mut pkg_name = unresolved.name.clone();
+        if resolve.use_canonical_version {
+            pkg_name.canonicalize();
+        }
         let pkgid = resolve.packages.alloc(Package {
-            name: unresolved.name.clone(),
+            name: pkg_name.clone(),
             docs: unresolved.docs.clone(),
             interfaces: Default::default(),
             worlds: Default::default(),
         });
         assert!(
-            !resolve.package_names.contains_key(&unresolved.name),
+            !resolve.package_names.contains_key(&pkg_name),
             "attempting to re-add package `{}` when it's already present in this `Resolve`",
-            unresolved.name,
+            pkg_name,
         );
-        resolve.package_names.insert(unresolved.name.clone(), pkgid);
+        resolve.package_names.insert(pkg_name, pkgid);
         self.process_foreign_deps(resolve, pkgid, &unresolved)?;
 
         let foreign_types = self.types.len();

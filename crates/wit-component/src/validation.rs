@@ -2419,7 +2419,8 @@ impl NameMangling for Legacy {
         let pkgname = PackageName {
             namespace: name.namespace().to_string(),
             name: name.package().to_string(),
-            version: name.version(),
+            version: name.version().map(|s| s.to_string()),
+            version_suffix: None,
         };
         if let Some(pkg) = resolve.package_names.get(&pkgname) {
             if let Some(id) = resolve.packages[*pkg]
@@ -2475,15 +2476,24 @@ impl NameMangling for Legacy {
                 Some(version) => version,
                 None => continue,
             };
-            let pkg_version = match &pkg.name.version {
+            let pkg_version = match pkg.name.full_version() {
                 Some(version) => version,
                 None => continue,
             };
 
-            // Test if the two semver versions are compatible
-            let module_compat = PackageName::version_compat_track(&module_version);
-            let pkg_compat = PackageName::version_compat_track(pkg_version);
-            if module_compat == pkg_compat {
+            // Check if the two versions are on the same compatibility track.
+            // The module version may already be canonical (not parseable as
+            // full semver), in which case compare it directly against the
+            // package's canonical track.
+            let module_track = match semver::Version::parse(module_version) {
+                Ok(v) => {
+                    let (track, _) = PackageName::version_canon_and_suffix(&v);
+                    track
+                }
+                Err(_) => module_version.to_string(),
+            };
+            let (pkg_track, _) = PackageName::version_canon_and_suffix(&pkg_version);
+            if module_track == pkg_track {
                 return Ok((key.clone(), id));
             }
         }

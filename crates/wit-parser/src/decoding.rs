@@ -319,8 +319,9 @@ impl ComponentInfo {
             // shouldn't cause issues, however.
             name: PackageName {
                 namespace: "root".to_string(),
-                version: None,
                 name: "component".to_string(),
+                version: None,
+                version_suffix: None,
             },
             docs: Default::default(),
             worlds: [(world_name.to_string(), world)].into_iter().collect(),
@@ -524,18 +525,29 @@ struct WitPackageDecoder<'a> {
 
     /// A map from a type id to what it's been translated to.
     type_map: HashMap<ComponentAnyTypeId, TypeId>,
+
+    /// When true, interface names use only the canonical version and
+    /// version suffixes are tracked separately for dedup.
+    use_canonical_version: bool,
 }
 
 impl WitPackageDecoder<'_> {
     fn new<'a>(types: &'a Types) -> WitPackageDecoder<'a> {
+        Self::new_with_options(types, false)
+    }
+
+    fn new_with_options<'a>(types: &'a Types, use_canonical_version: bool) -> WitPackageDecoder<'a> {
+        let mut resolve = Resolve::default();
+        resolve.use_canonical_version = use_canonical_version;
         WitPackageDecoder {
-            resolve: Resolve::default(),
+            resolve,
             types,
             type_map: HashMap::new(),
             foreign_packages: Default::default(),
             iface_to_package_index: Default::default(),
             named_interfaces: Default::default(),
             resources: Default::default(),
+            use_canonical_version,
         }
     }
 
@@ -651,7 +663,7 @@ impl WitPackageDecoder<'_> {
         let (name, item) = match item.ty {
             ComponentEntityType::Instance(i) => {
                 let ty = &self.types[i];
-                self.decode_world_instance(name, item.implements.as_deref(), ty, package)
+                self.decode_world_instance(name, item.implements.as_deref(), item.version_suffix.as_deref(), ty, package)
                     .with_context(|| format!("failed to decode WIT from import `{name}`"))?
             }
             ComponentEntityType::Func(i) => {
@@ -704,7 +716,7 @@ impl WitPackageDecoder<'_> {
             }
             ComponentEntityType::Instance(i) => {
                 let ty = &types[i];
-                self.decode_world_instance(name, item.implements.as_deref(), ty, package)
+                self.decode_world_instance(name, item.implements.as_deref(), item.version_suffix.as_deref(), ty, package)
                     .with_context(|| format!("failed to decode WIT from export `{name}`"))?
             }
             _ => {
@@ -723,25 +735,56 @@ impl WitPackageDecoder<'_> {
     /// - `plain-name` — unqualified name for an inline or local interface
     /// - `plain-name (implements "...")` - reference to a preexisting interface
     ///   elsewhere
+    ///
+    /// The `version_suffix` is appended to the interface name (either from
+    /// `implements` or from `name` itself) to reconstruct the full semver
+    /// version for the package.
     fn decode_world_instance<'a>(
         &mut self,
         name: &str,
         implements: Option<&str>,
+        version_suffix: Option<&str>,
         ty: &ComponentInstanceType,
         package: &mut PackageFields<'a>,
     ) -> Result<(WorldKey, WorldItem)> {
-        let (key, id) = match implements {
-            Some(i) => {
-                let id = self.register_import(i, ty)?;
-                (WorldKey::Name(name.to_string()), id)
-            }
-            None => match self.parse_component_name(name)?.kind() {
-                ComponentNameKind::Interface(i) => {
-                    let id = self.register_import(i.as_str(), ty)?;
-                    (WorldKey::Interface(id), id)
+        let (key, id) = if self.use_canonical_version {
+            match implements {
+                Some(i) => {
+                    let id = self.register_import(i, ty)?;
+                    self.update_foreign_package_suffix(i, version_suffix);
+                    (WorldKey::Name(name.to_string()), id)
                 }
-                _ => self.register_interface(name, ty, package)?,
-            },
+                None => match self.parse_component_name(name)?.kind() {
+                    ComponentNameKind::Interface(i) => {
+                        let id = self.register_import(i.as_str(), ty)?;
+                        self.update_foreign_package_suffix(i.as_str(), version_suffix);
+                        (WorldKey::Interface(id), id)
+                    }
+                    _ => self.register_interface(name, ty, package)?,
+                },
+            }
+        } else {
+            match implements {
+                Some(i) => {
+                    let full_name = match version_suffix {
+                        Some(suffix) => format!("{i}{suffix}"),
+                        None => i.to_string(),
+                    };
+                    let id = self.register_import(&full_name, ty)?;
+                    (WorldKey::Name(name.to_string()), id)
+                }
+                None => match self.parse_component_name(name)?.kind() {
+                    ComponentNameKind::Interface(i) => {
+                        let full_name = match version_suffix {
+                            Some(suffix) => format!("{}{suffix}", i.as_str()),
+                            None => i.as_str().to_string(),
+                        };
+                        let id = self.register_import(&full_name, ty)?;
+                        (WorldKey::Interface(id), id)
+                    }
+                    _ => self.register_interface(name, ty, package)?,
+                },
+            }
         };
         Ok((
             key,
@@ -751,6 +794,39 @@ impl WitPackageDecoder<'_> {
                 span: Default::default(),
             },
         ))
+    }
+
+    /// Updates the version suffix of a foreign package identified by its
+    /// interface name string, keeping the largest suffix when duplicates on
+    /// the same canonical track are encountered.
+    fn update_foreign_package_suffix(&mut self, name_string: &str, version_suffix: Option<&str>) {
+        let suffix = match version_suffix {
+            Some(s) => s,
+            None => return,
+        };
+        let name = match ComponentName::new(name_string, 0) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        let iface_name = match name.kind() {
+            ComponentNameKind::Interface(name) => name,
+            _ => return,
+        };
+        let pkg_key = iface_name.to_package_name().to_string();
+        let pkg = match self.foreign_packages.get_mut(&pkg_key) {
+            Some(pkg) => pkg,
+            None => return,
+        };
+        match &pkg.name.version_suffix {
+            None => {
+                pkg.name.version_suffix = Some(suffix.to_string());
+            }
+            Some(existing) => {
+                if suffix > existing.as_str() {
+                    pkg.name.version_suffix = Some(suffix.to_string());
+                }
+            }
+        }
     }
 
     /// Registers that the `name` provided is either imported interface from a
@@ -1129,7 +1205,7 @@ impl WitPackageDecoder<'_> {
             let (name, item) = match ty.ty {
                 ComponentEntityType::Instance(idx) => {
                     let t = &self.types[idx];
-                    self.decode_world_instance(name, ty.implements.as_deref(), t, package)?
+                    self.decode_world_instance(name, ty.implements.as_deref(), ty.version_suffix.as_deref(), t, package)?
                 }
                 ComponentEntityType::Type {
                     created,
@@ -1159,7 +1235,7 @@ impl WitPackageDecoder<'_> {
             let (name, item) = match item.ty {
                 ComponentEntityType::Instance(idx) => {
                     let ty = &self.types[idx];
-                    self.decode_world_instance(name, item.implements.as_deref(), ty, package)?
+                    self.decode_world_instance(name, item.implements.as_deref(), item.version_suffix.as_deref(), ty, package)?
                 }
 
                 ComponentEntityType::Func(idx) => {
@@ -1874,10 +1950,26 @@ pub(crate) trait InterfaceNameExt {
 
 impl InterfaceNameExt for wasmparser::names::InterfaceName<'_> {
     fn to_package_name(&self) -> PackageName {
-        PackageName {
-            namespace: self.namespace().to_string(),
-            name: self.package().to_string(),
-            version: self.version(),
+        match self.version() {
+            None => PackageName {
+                namespace: self.namespace().to_string(),
+                name: self.package().to_string(),
+                version: None,
+                version_suffix: None,
+            },
+            Some(s) => match Version::parse(s) {
+                Ok(v) => PackageName::new(
+                    self.namespace().to_string(),
+                    self.package().to_string(),
+                    Some(v),
+                ),
+                Err(_) => PackageName {
+                    namespace: self.namespace().to_string(),
+                    name: self.package().to_string(),
+                    version: Some(s.to_string()),
+                    version_suffix: None,
+                },
+            },
         }
     }
 }

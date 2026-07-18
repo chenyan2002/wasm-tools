@@ -545,10 +545,12 @@ impl<'a> InterfaceName<'a> {
         KebabStr::new_unchecked(&self.0[slash + 1..at])
     }
 
-    /// Returns the `1.2.3` in `a:b:c/d/e@1.2.3`
-    pub fn version(&self) -> Option<Version> {
+    /// Returns the version string after `@` in `a:b:c/d/e@1.2.3`.
+    /// When cm-canonical-interface-names is enabled, this will return the canonical version string
+    /// When cm-canonical-interface-names is disabled, this will return the full version string
+    pub fn version(&self) -> Option<&'a str> {
         let at = self.0.find('@')?;
-        Some(Version::parse(&self.0[at + 1..]).unwrap())
+        Some(&self.0[at + 1..])
     }
 }
 

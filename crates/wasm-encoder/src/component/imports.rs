@@ -177,6 +177,9 @@ impl Encode for ComponentExternName<'_> {
         if let Some(s) = &self.implements {
             options.push((0x00, s.as_bytes()));
         }
+        if let Some(s) = &self.version_suffix {
+            options.push((0x01, s.as_bytes()));
+        }
 
         if options.is_empty() {
             // Prior to WebAssembly/component-model#263 import and export names

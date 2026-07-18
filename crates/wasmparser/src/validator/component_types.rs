@@ -1023,6 +1023,8 @@ pub struct ComponentItem {
     pub ty: ComponentEntityType,
     /// The optional `(implements "...")` metadata, if specified.
     pub implements: Option<String>,
+    /// The optional version suffix metadata, if specified.
+    pub version_suffix: Option<String>,
 }
 
 impl TypeData for ComponentType {

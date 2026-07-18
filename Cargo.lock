@@ -3165,6 +3165,7 @@ dependencies = [
  "libtest-mimic",
  "log",
  "pretty_assertions",
+ "semver",
  "serde",
  "serde_derive",
  "serde_json",
