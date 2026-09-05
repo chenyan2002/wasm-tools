@@ -4695,9 +4695,9 @@ impl ComponentNameContext {
                 .with_context(|| format!("`{implements}` is not a valid name"))?;
             match implements.kind() {
                 ComponentNameKind::Interface(_) => {
-                    if let Some(version) = version_suffix {
+                    if let Some(suffix) = version_suffix {
                         if let ComponentNameKind::Interface(iface) = implements.kind() {
-                            if let Err(e) = iface.version(Some(version)) {
+                            if let Err(e) = iface.version(Some(suffix)) {
                                 bail!(offset, "invalid interface version: {e}");
                             }
                         }

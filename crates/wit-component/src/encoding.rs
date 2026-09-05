@@ -72,6 +72,7 @@
 //! component model.
 
 use crate::StringEncoding;
+use crate::encoding::wit::component_extern_name;
 use crate::metadata::{self, Bindgen, ModuleMetadata};
 use crate::validation::{
     Export, ExportMap, Import, ImportInstance, ImportMap, PayloadInfo, PayloadType,
@@ -1021,22 +1022,8 @@ impl<'a> EncodingState<'a> {
             component_index,
             imports,
         );
-        let implements = resolve.implements_interface(key, item);
-        let extern_name = if self.info.encoder.emit_canonical_names {
-            wasm_encoder::ComponentExternName {
-                name: export_name.into(),
-                implements: implements.map(|id| resolve.canonicalized_id_of(id).unwrap().into()),
-                external_id: resolve.external_id_value(key, item).map(|s| s.into()),
-                version_suffix: resolve.version_suffix_value(key, item).map(|s| s.into()),
-            }
-        } else {
-            wasm_encoder::ComponentExternName {
-                name: export_name.into(),
-                implements: implements.map(|id| resolve.id_of(id).unwrap().into()),
-                external_id: resolve.external_id_value(key, item).map(|s| s.into()),
-                version_suffix: None,
-            }
-        };
+        let extern_name =
+            component_extern_name(resolve, key, item, self.info.encoder.emit_canonical_names);
         let idx = self.component.export(
             extern_name,
             ComponentExportKind::Instance,

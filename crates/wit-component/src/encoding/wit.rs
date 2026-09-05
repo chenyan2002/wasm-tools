@@ -132,7 +132,7 @@ pub fn encode_world(
     Ok(component.outer)
 }
 
-fn component_extern_name(
+pub(crate) fn component_extern_name(
     resolve: &Resolve,
     key: &WorldKey,
     item: &WorldItem,
@@ -221,14 +221,7 @@ impl Encoder<'_> {
             encoder.interface = Some(interface);
             let iface = &self.resolve.interfaces[interface];
             let extern_name = if self.canonical_names {
-                let name = self.resolve.canonicalized_id_of(interface).unwrap();
-                let version_suffix = self.resolve.version_suffix_of(interface);
-                ComponentExternName {
-                    name: name.into(),
-                    implements: None,
-                    external_id: None,
-                    version_suffix: version_suffix.map(|s| s.into()),
-                }
+                ComponentExternName::from(self.resolve.canonicalized_id_of(interface).unwrap())
             } else {
                 ComponentExternName::from(self.resolve.id_of(interface).unwrap())
             };
