@@ -416,6 +416,59 @@ impl_tuple!(
     )
 );
 
+// Streams, futures and error contexts are not tied to a WIT resource type,
+// so they are represented as handles with a fixed type name.
+#[cfg(feature = "wit-bindgen")]
+mod async_handles {
+    use alloc::format;
+
+    use wit_bindgen::rt::async_support::ErrorContext;
+    use wit_bindgen::{FutureReader, StreamReader};
+
+    use super::{ToValue, ValueTyped};
+    use crate::{
+        WasmValue,
+        value::{Type, Value},
+    };
+
+    fn handle_value(name: &str, handle: u32) -> Value {
+        Value::make_handle(format!("{name}-{handle}").into())
+    }
+
+    impl<T: 'static> ValueTyped for StreamReader<T> {
+        fn value_type() -> Type {
+            Type::handle("stream")
+        }
+    }
+    impl<T: 'static> ToValue for StreamReader<T> {
+        fn to_value(&self) -> Value {
+            handle_value("stream", self.handle())
+        }
+    }
+
+    impl<T: 'static> ValueTyped for FutureReader<T> {
+        fn value_type() -> Type {
+            Type::handle("future")
+        }
+    }
+    impl<T: 'static> ToValue for FutureReader<T> {
+        fn to_value(&self) -> Value {
+            handle_value("future", self.handle())
+        }
+    }
+
+    impl ValueTyped for ErrorContext {
+        fn value_type() -> Type {
+            Type::handle("error-context")
+        }
+    }
+    impl ToValue for ErrorContext {
+        fn to_value(&self) -> Value {
+            handle_value("error-context", self.handle())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::String;
@@ -471,3 +524,4 @@ mod tests {
         }
     }
 }
+

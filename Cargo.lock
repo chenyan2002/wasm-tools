@@ -430,7 +430,7 @@ version = "0.0.0"
 dependencies = [
  "wasmprinter 0.263.0",
  "wat",
- "wit-bindgen",
+ "wit-bindgen 0.63.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2084,7 +2084,7 @@ name = "test-programs"
 version = "0.1.0"
 dependencies = [
  "rand",
- "wit-bindgen",
+ "wit-bindgen 0.63.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "wit-dylib-ffi",
 ]
 
@@ -2556,6 +2556,7 @@ dependencies = [
  "anyhow",
  "logos",
  "thiserror 2.0.20",
+ "wit-bindgen 0.63.0 (git+https://github.com/chenyan2002/wit-bindgen?branch=fix-async)",
  "wit-parser 0.263.0",
 ]
 
@@ -2927,6 +2928,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen"
+version = "0.63.0"
+source = "git+https://github.com/chenyan2002/wit-bindgen?branch=fix-async#9c6884072c5975883b419351080be4bfa09cf4a2"
+
+[[package]]
 name = "wit-bindgen-core"
 version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3075,7 +3081,7 @@ dependencies = [
 name = "wit-dylib-ffi"
 version = "0.1.0"
 dependencies = [
- "wit-bindgen",
+ "wit-bindgen 0.63.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]

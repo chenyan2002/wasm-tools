@@ -17,12 +17,14 @@ workspace = true
 default = ["std", "wit"]
 std = []
 wit = ["dep:wit-parser", "dep:anyhow", "std"]
+wit-bindgen = ["dep:wit-bindgen"]
 
 [dependencies]
 logos = { version = "0.16.1", default-features = false, features = ["export_derive", "forbid_unsafe"] }
 thiserror = { workspace = true }
 wit-parser = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
+wit-bindgen = { git = "https://github.com/chenyan2002/wit-bindgen", branch = "fix-async", default-features = false, optional = true, features = ["async"] }
 
 [dev-dependencies]
 anyhow.workspace = true
