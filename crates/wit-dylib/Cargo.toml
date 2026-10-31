@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository = "https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-dylib"
-homepage = "https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-dylib"
 documentation = "https://docs.rs/wit-dylib"
 description = """
 Generate an dynamic wasm library from a WIT world.
@@ -17,17 +16,21 @@ workspace = true
 [dependencies]
 wit-parser = { workspace = true }
 wasm-encoder = { workspace = true }
-indexmap = { workspace = true }
+indexmap = { workspace = true, features = ["std"] }
 clap = { workspace = true, optional = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 artifacts = { path = './test-programs/artifacts' }
 libtest-mimic = { workspace = true }
 anyhow = { workspace = true }
-wit-component = { workspace = true }
-wasi-preview1-component-adapter-provider = "36.0.2"
 tempfile = { workspace = true }
-wasm-compose = { workspace = true }
+wit-smith = { workspace = true }
+arbitrary = { workspace = true }
+arbtest = "0.3.2"
+indexmap = { workspace = true, features = ["std"] }
+wit-component = { workspace = true }
+env_logger = { workspace = true }
 wasmparser = { workspace = true }
 
 [lib]

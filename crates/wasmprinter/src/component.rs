@@ -145,12 +145,6 @@ impl Printer<'_, '_> {
                 self.print_component_val_type(state, &ty)?;
             }
 
-            if let Some(refines) = case.refines {
-                self.result.write_str(" ")?;
-                self.start_group("refines ")?;
-                write!(&mut self.result, "{refines}")?;
-                self.end_group()?;
-            }
             self.end_group()?;
         }
         self.end_group()?;
@@ -169,7 +163,21 @@ impl Printer<'_, '_> {
         Ok(())
     }
 
-    pub(crate) fn print_fixed_size_list_type(
+    pub(crate) fn print_map_type(
+        &mut self,
+        state: &State,
+        key_ty: &ComponentValType,
+        value_ty: &ComponentValType,
+    ) -> Result<()> {
+        self.start_group("map ")?;
+        self.print_component_val_type(state, key_ty)?;
+        self.result.write_str(" ")?;
+        self.print_component_val_type(state, value_ty)?;
+        self.end_group()?;
+        Ok(())
+    }
+
+    pub(crate) fn print_fixed_length_list_type(
         &mut self,
         state: &State,
         element_ty: &ComponentValType,
@@ -278,8 +286,9 @@ impl Printer<'_, '_> {
             ComponentDefinedType::Record(fields) => self.print_record_type(state, fields)?,
             ComponentDefinedType::Variant(cases) => self.print_variant_type(state, cases)?,
             ComponentDefinedType::List(ty) => self.print_list_type(state, ty)?,
-            ComponentDefinedType::FixedSizeList(ty, elements) => {
-                self.print_fixed_size_list_type(state, ty, *elements)?
+            ComponentDefinedType::Map(key, value) => self.print_map_type(state, key, value)?,
+            ComponentDefinedType::FixedLengthList(ty, elements) => {
+                self.print_fixed_length_list_type(state, ty, *elements)?
             }
             ComponentDefinedType::Tuple(tys) => self.print_tuple_type(state, tys)?,
             ComponentDefinedType::Flags(names) => self.print_flag_or_enum_type("flags", names)?,
@@ -368,7 +377,7 @@ impl Printer<'_, '_> {
                     self.start_group("export ")?;
                     self.print_component_kind_name(states.last_mut().unwrap(), ty.kind())?;
                     self.result.write_str(" ")?;
-                    self.print_str(name.0)?;
+                    self.print_component_extern_name(&name)?;
                     self.result.write_str(" ")?;
                     self.print_component_import_ty(states.last_mut().unwrap(), &ty, false)?;
                     self.end_group()?;
@@ -380,6 +389,35 @@ impl Printer<'_, '_> {
         }
         self.end_group()?;
         states.pop().unwrap();
+        Ok(())
+    }
+
+    fn print_component_extern_name(&mut self, name: &ComponentExternName<'_>) -> Result<()> {
+        let ComponentExternName {
+            name,
+            implements,
+            version_suffix,
+            external_id,
+        } = name;
+        self.print_str(name)?;
+        if let Some(implements) = implements {
+            self.result.write_str(" ")?;
+            self.start_group("implements ")?;
+            self.print_str(implements)?;
+            self.end_group()?;
+        }
+        if let Some(version_suffix) = version_suffix {
+            self.result.write_str(" ")?;
+            self.start_group("version-suffix ")?;
+            self.print_str(version_suffix)?;
+            self.end_group()?;
+        }
+        if let Some(external_id) = external_id {
+            self.result.write_str(" ")?;
+            self.start_group("external-id ")?;
+            self.print_str(external_id)?;
+            self.end_group()?;
+        }
         Ok(())
     }
 
@@ -403,7 +441,7 @@ impl Printer<'_, '_> {
                     self.start_group("export ")?;
                     self.print_component_kind_name(states.last_mut().unwrap(), ty.kind())?;
                     self.result.write_str(" ")?;
-                    self.print_str(name.0)?;
+                    self.print_component_extern_name(&name)?;
                     self.result.write_str(" ")?;
                     self.print_component_import_ty(states.last_mut().unwrap(), &ty, false)?;
                     self.end_group()?;
@@ -417,11 +455,29 @@ impl Printer<'_, '_> {
 
     pub(crate) fn outer_state(states: &[State], count: u32) -> Result<&State> {
         if count as usize >= states.len() {
-            bail!("invalid outer alias count {}", count);
+            bail!("invalid outer alias count {count}");
         }
 
         let count: usize = std::cmp::min(count as usize, states.len() - 1);
         Ok(&states[states.len() - count - 1])
+    }
+
+    /// Prints the `count` of an outer alias as the identifier of the scope it
+    /// refers to, unless a scope in between has the same identifier, which
+    /// the identifier would refer to instead.
+    fn print_outer_count(&mut self, states: &[State], count: u32) -> Result<()> {
+        if let Some(i) = states.len().checked_sub(count as usize + 1) {
+            if let Some(name) = &states[i].name {
+                let shadowed = states[i + 1..]
+                    .iter()
+                    .any(|s| s.name.as_ref() == Some(name));
+                if !shadowed {
+                    return name.write_identifier(self);
+                }
+            }
+        }
+        write!(self.result, "{count}")?;
+        Ok(())
     }
 
     pub(crate) fn print_outer_alias(
@@ -441,11 +497,7 @@ impl Printer<'_, '_> {
             }
         };
         self.start_group("alias outer ")?;
-        if let Some(name) = outer.name.as_ref() {
-            name.write(self)?;
-        } else {
-            write!(self.result, "{count}")?;
-        }
+        self.print_outer_count(states, count)?;
         self.result.write_str(" ")?;
         match kind {
             OuterAliasKind::Type => {
@@ -472,6 +524,9 @@ impl Printer<'_, '_> {
         ty: &ComponentFuncType,
     ) -> Result<()> {
         self.start_group("func")?;
+        if ty.async_ {
+            self.print_type_keyword(" async")?;
+        }
         for (name, ty) in ty.params.iter() {
             self.result.write_str(" ")?;
             self.start_group("param ")?;
@@ -527,9 +582,7 @@ impl Printer<'_, '_> {
                 if let Some(dtor) = dtor {
                     self.result.write_str(" ")?;
                     self.start_group("dtor ")?;
-                    self.start_group("func ")?;
                     self.print_idx(&states.last().unwrap().core.func_names, dtor)?;
-                    self.end_group()?;
                     self.end_group()?;
                 }
                 self.end_group()?;
@@ -577,7 +630,7 @@ impl Printer<'_, '_> {
         index: bool,
     ) -> Result<()> {
         self.start_group("import ")?;
-        self.print_str(import.name.0)?;
+        self.print_component_extern_name(&import.name)?;
         self.result.write_str(" ")?;
         self.print_component_import_ty(state, &import.ty, index)?;
         self.end_group()?;
@@ -693,7 +746,7 @@ impl Printer<'_, '_> {
             self.print_component_kind_name(state, export.kind)?;
             self.result.write_str(" ")?;
         }
-        self.print_str(export.name.0)?;
+        self.print_component_extern_name(&export.name)?;
         self.result.write_str(" ")?;
         self.print_component_external_kind(state, export.kind, export.index)?;
         if let Some(ty) = &export.ty {
@@ -911,19 +964,13 @@ impl Printer<'_, '_> {
                         me.print_idx(&state.component.type_names, resource)
                     })?;
                 }
-                CanonicalFunction::ResourceDropAsync { resource } => {
-                    self.print_intrinsic(state, "canon resource.drop ", &|me, state| {
-                        me.print_idx(&state.component.type_names, resource)?;
-                        me.print_type_keyword(" async")
-                    })?;
-                }
                 CanonicalFunction::ResourceRep { resource } => {
                     self.print_intrinsic(state, "canon resource.rep ", &|me, state| {
                         me.print_idx(&state.component.type_names, resource)
                     })?;
                 }
                 CanonicalFunction::ThreadSpawnRef { func_ty_index } => {
-                    self.print_intrinsic(state, "canon thread.spawn_ref ", &|me, state| {
+                    self.print_intrinsic(state, "canon thread.spawn-ref ", &|me, state| {
                         me.print_idx(&state.core.type_names, func_ty_index)
                     })?;
                 }
@@ -931,21 +978,16 @@ impl Printer<'_, '_> {
                     func_ty_index,
                     table_index,
                 } => {
-                    self.print_intrinsic(state, "canon thread.spawn_indirect ", &|me, state| {
+                    self.print_intrinsic(state, "canon thread.spawn-indirect ", &|me, state| {
                         me.print_idx(&state.core.type_names, func_ty_index)?;
                         me.result.write_str(" ")?;
-                        me.start_group("table ")?;
-                        me.print_idx(&state.core.table_names, table_index)?;
-                        me.end_group()
+                        me.print_idx(&state.core.table_names, table_index)
                     })?;
                 }
                 CanonicalFunction::ThreadAvailableParallelism => {
                     self.print_intrinsic(state, "canon thread.available_parallelism", &|_, _| {
                         Ok(())
                     })?;
-                }
-                CanonicalFunction::BackpressureSet => {
-                    self.print_intrinsic(state, "canon backpressure.set", &|_, _| Ok(()))?;
                 }
                 CanonicalFunction::BackpressureInc => {
                     self.print_intrinsic(state, "canon backpressure.inc", &|_, _| Ok(()))?;
@@ -968,25 +1010,24 @@ impl Printer<'_, '_> {
                 CanonicalFunction::TaskCancel => {
                     self.print_intrinsic(state, "canon task.cancel", &|_, _| Ok(()))?;
                 }
-                CanonicalFunction::ContextGet(i) => {
-                    self.print_intrinsic(state, "canon context.get", &|me, _state| {
-                        write!(me.result, " i32 {i}")?;
+                CanonicalFunction::ContextGet { ty, slot } => {
+                    self.print_intrinsic(state, "canon context.get", &|me, state| {
+                        me.result.write_str(" ")?;
+                        me.print_valtype(state, ty)?;
+                        write!(me.result, " {slot}")?;
                         Ok(())
                     })?;
                 }
-                CanonicalFunction::ContextSet(i) => {
-                    self.print_intrinsic(state, "canon context.set", &|me, _state| {
-                        write!(me.result, " i32 {i}")?;
+                CanonicalFunction::ContextSet { ty, slot } => {
+                    self.print_intrinsic(state, "canon context.set", &|me, state| {
+                        me.result.write_str(" ")?;
+                        me.print_valtype(state, ty)?;
+                        write!(me.result, " {slot}")?;
                         Ok(())
                     })?;
                 }
-                CanonicalFunction::ThreadYield { cancellable } => {
-                    self.print_intrinsic(state, "canon thread.yield", &|me, _| {
-                        if cancellable {
-                            me.print_type_keyword(" cancellable")?;
-                        }
-                        Ok(())
-                    })?;
+                CanonicalFunction::ThreadYield => {
+                    self.print_intrinsic(state, "canon thread.yield", &|_me, _| Ok(()))?;
                 }
                 CanonicalFunction::SubtaskDrop => {
                     self.print_intrinsic(state, "canon subtask.drop", &|_, _| Ok(()))?;
@@ -1014,6 +1055,11 @@ impl Printer<'_, '_> {
                     self.print_intrinsic(state, "canon stream.write ", &|me, state| {
                         me.print_idx(&state.component.type_names, ty)?;
                         me.print_canonical_options(state, &options)
+                    })?;
+                }
+                CanonicalFunction::StreamForward { ty } => {
+                    self.print_intrinsic(state, "canon stream.forward ", &|me, state| {
+                        me.print_idx(&state.component.type_names, ty)
                     })?;
                 }
                 CanonicalFunction::StreamCancelRead { ty, async_ } => {
@@ -1059,6 +1105,11 @@ impl Printer<'_, '_> {
                     self.print_intrinsic(state, "canon future.write ", &|me, state| {
                         me.print_idx(&state.component.type_names, ty)?;
                         me.print_canonical_options(state, &options)
+                    })?;
+                }
+                CanonicalFunction::FutureForward { ty } => {
+                    self.print_intrinsic(state, "canon future.forward ", &|me, state| {
+                        me.print_idx(&state.component.type_names, ty)
                     })?;
                 }
                 CanonicalFunction::FutureCancelRead { ty, async_ } => {
@@ -1107,27 +1158,15 @@ impl Printer<'_, '_> {
                 CanonicalFunction::WaitableSetNew => {
                     self.print_intrinsic(state, "canon waitable-set.new", &|_, _| Ok(()))?;
                 }
-                CanonicalFunction::WaitableSetWait {
-                    cancellable,
-                    memory,
-                } => {
+                CanonicalFunction::WaitableSetWait { memory } => {
                     self.print_intrinsic(state, "canon waitable-set.wait ", &|me, state| {
-                        if cancellable {
-                            me.result.write_str("cancellable ")?;
-                        }
                         me.start_group("memory ")?;
                         me.print_idx(&state.core.memory_names, memory)?;
                         me.end_group()
                     })?;
                 }
-                CanonicalFunction::WaitableSetPoll {
-                    cancellable,
-                    memory,
-                } => {
+                CanonicalFunction::WaitableSetPoll { memory } => {
                     self.print_intrinsic(state, "canon waitable-set.poll ", &|me, state| {
-                        if cancellable {
-                            me.result.write_str("cancellable ")?;
-                        }
                         me.start_group("memory ")?;
                         me.print_idx(&state.core.memory_names, memory)?;
                         me.end_group()
@@ -1146,38 +1185,37 @@ impl Printer<'_, '_> {
                     func_ty_index,
                     table_index,
                 } => {
-                    self.print_intrinsic(state, "canon thread.new_indirect ", &|me, state| {
+                    self.print_intrinsic(state, "canon thread.new-indirect ", &|me, state| {
                         me.print_idx(&state.core.type_names, func_ty_index)?;
                         me.result.write_str(" ")?;
-                        me.start_group("table ")?;
-                        me.print_idx(&state.core.table_names, table_index)?;
-                        me.end_group()
-                    })?;
-                }
-                CanonicalFunction::ThreadSwitchTo { cancellable } => {
-                    self.print_intrinsic(state, "canon thread.switch-to", &|me, _| {
-                        if cancellable {
-                            me.result.write_str(" cancellable")?;
-                        }
-                        Ok(())
-                    })?;
-                }
-                CanonicalFunction::ThreadSuspend { cancellable } => {
-                    self.print_intrinsic(state, "canon thread.suspend", &|me, _| {
-                        if cancellable {
-                            me.result.write_str(" cancellable")?;
-                        }
-                        Ok(())
+                        me.print_idx(&state.core.table_names, table_index)
                     })?;
                 }
                 CanonicalFunction::ThreadResumeLater => {
                     self.print_intrinsic(state, "canon thread.resume-later", &|_, _| Ok(()))?;
                 }
-                CanonicalFunction::ThreadYieldTo { cancellable } => {
-                    self.print_intrinsic(state, "canon thread.yield-to", &|me, _| {
-                        if cancellable {
-                            me.result.write_str(" cancellable")?;
-                        }
+                CanonicalFunction::ThreadSuspend => {
+                    self.print_intrinsic(state, "canon thread.suspend", &|_me, _| Ok(()))?;
+                }
+                CanonicalFunction::ThreadSuspendThenResume => {
+                    self.print_intrinsic(state, "canon thread.suspend-then-resume", &|_me, _| {
+                        Ok(())
+                    })?;
+                }
+                CanonicalFunction::ThreadYieldThenResume => {
+                    self.print_intrinsic(
+                        state,
+                        "canon thread.yield-then-resume",
+                        &|_me, _| Ok(()),
+                    )?;
+                }
+                CanonicalFunction::ThreadSuspendThenPromote => {
+                    self.print_intrinsic(state, "canon thread.suspend-then-promote", &|_me, _| {
+                        Ok(())
+                    })?;
+                }
+                CanonicalFunction::ThreadYieldThenPromote => {
+                    self.print_intrinsic(state, "canon thread.yield-then-promote", &|_me, _| {
                         Ok(())
                     })?;
                 }
@@ -1294,10 +1332,10 @@ impl Printer<'_, '_> {
     pub(crate) fn print_component_start(
         &mut self,
         state: &mut State,
-        pos: usize,
+        offset: u64,
         start: ComponentStartFunction,
     ) -> Result<()> {
-        self.newline(pos)?;
+        self.newline(offset)?;
         self.start_group("start ")?;
         self.print_idx(&state.component.func_names, start.func_index)?;
 
@@ -1371,7 +1409,7 @@ impl Printer<'_, '_> {
                 self.print_str(name)?;
                 self.result.write_str(" ")?;
                 match kind {
-                    ExternalKind::Func => {
+                    ExternalKind::Func | ExternalKind::FuncExact => {
                         self.start_group("core func ")?;
                         self.print_name(&state.core.func_names, state.core.funcs)?;
                         self.end_group()?;
@@ -1420,11 +1458,7 @@ impl Printer<'_, '_> {
                     }
                 };
                 self.start_group("alias outer ")?;
-                if let Some(name) = outer.name.as_ref() {
-                    name.write(self)?;
-                } else {
-                    write!(self.result, "{count}")?;
-                }
+                self.print_outer_count(states, count)?;
                 self.result.write_str(" ")?;
                 match kind {
                     ComponentOuterAliasKind::CoreModule => {

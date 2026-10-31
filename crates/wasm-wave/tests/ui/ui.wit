@@ -1,4 +1,4 @@
-package ui:tests;
+package ui:tests@0.1.0;
 
 interface ui {
     nullary: func();
@@ -61,6 +61,14 @@ interface ui {
     flags permissions {
         read,
         write,
+        execute,
     }
     permission-flags: func(flgs: permissions);
+
+    map-string-u32: func(m: map<string, u32>);
+    map-s32-string: func(m: map<s32, string>);
+    map-char-option-u8: func(m: map<char, option<u8>>);
+    map-bool-list-u8: func(m: map<bool, list<u8>>);
+    map-u8-hand: func(m: map<u8, hand>);
+    nested-maps: func(m: map<string, map<u64, string>>);
 }

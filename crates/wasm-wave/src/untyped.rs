@@ -1,8 +1,13 @@
 //! Untyped value
 
-use std::borrow::Cow;
+use alloc::{borrow::Cow, vec::Vec};
 
-use crate::{Parser, WasmValue, ast::Node, lex::Keyword, parser::ParserError};
+use crate::{
+    Parser, WasmValue,
+    ast::Node,
+    lex::Keyword,
+    parser::{ParserError, ParserErrorKind},
+};
 
 /// An UntypedValue is a parsed but not type-checked WAVE value.
 #[derive(Clone, Debug)]
@@ -48,8 +53,8 @@ impl<'source> UntypedValue<'source> {
     }
 }
 
-impl std::fmt::Display for UntypedValue<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for UntypedValue<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         fmt_node(f, &self.node, &self.source)
     }
 }
@@ -59,14 +64,14 @@ impl std::fmt::Display for UntypedValue<'_> {
 /// WAVE function calls have the form `<name>(<params...>)`.
 pub struct UntypedFuncCall<'source> {
     source: Cow<'source, str>,
-    name: Node,
+    name: logos::Span,
     params: Option<Node>,
 }
 
 impl<'source> UntypedFuncCall<'source> {
     pub(crate) fn new(
         source: impl Into<Cow<'source, str>>,
-        name: Node,
+        name: logos::Span,
         params: Option<Node>,
     ) -> Self {
         Self {
@@ -78,10 +83,7 @@ impl<'source> UntypedFuncCall<'source> {
 
     /// Parses an untyped function call from WAVE.
     pub fn parse(source: &'source str) -> Result<Self, ParserError> {
-        let mut parser = Parser::new(source);
-        let call = parser.parse_raw_func_call()?;
-        parser.finish()?;
-        Ok(call)
+        crate::parser::parse_raw_func_call(source)
     }
 
     /// Creates an owned function call, copying the entire source string if necessary.
@@ -98,11 +100,6 @@ impl<'source> UntypedFuncCall<'source> {
         &self.source
     }
 
-    /// Returns the function name node.
-    pub fn name_node(&self) -> &Node {
-        &self.name
-    }
-
     /// Returns the function parameters node.
     ///
     /// Returns `None` if the function call has no parameters.
@@ -112,7 +109,14 @@ impl<'source> UntypedFuncCall<'source> {
 
     /// Returns the function name.
     pub fn name(&self) -> &str {
-        self.name.slice(&self.source)
+        &self.source[self.name.clone()]
+    }
+
+    /// Returns the function name, as parsed by wit-parser.
+    #[cfg(feature = "wit")]
+    pub fn item_name(&self) -> Result<wit_parser::ItemName, anyhow::Error> {
+        use core::str::FromStr;
+        wit_parser::ItemName::from_str(self.name())
     }
 
     /// Converts the untyped parameters into the given types.
@@ -121,18 +125,28 @@ impl<'source> UntypedFuncCall<'source> {
     /// be returned as `none` values.
     pub fn to_wasm_params<'types, V: WasmValue + 'static>(
         &self,
-        types: impl IntoIterator<Item = &'types V::Type>,
+        types: impl IntoIterator<Item = &'types V::Type, IntoIter: ExactSizeIterator>,
     ) -> Result<Vec<V>, ParserError> {
         match &self.params {
             Some(params) => params.to_wasm_params(types, self.source()),
-            None => Ok(vec![]),
+            None => {
+                let num_params = types.into_iter().len();
+                if num_params > 0 {
+                    return Err(ParserError::with_detail(
+                        ParserErrorKind::InvalidParams,
+                        self.name.clone(),
+                        alloc::format!("no params provided, but {num_params} required"),
+                    ));
+                }
+                Ok(Vec::new())
+            }
         }
     }
 }
 
-impl std::fmt::Display for UntypedFuncCall<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name.slice(&self.source))?;
+impl core::fmt::Display for UntypedFuncCall<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.source[self.name.clone()])?;
         match &self.params {
             Some(params) => fmt_node(f, params, &self.source),
             None => f.write_str("()"),
@@ -140,7 +154,7 @@ impl std::fmt::Display for UntypedFuncCall<'_> {
     }
 }
 
-fn fmt_node(f: &mut impl std::fmt::Write, node: &Node, src: &str) -> std::fmt::Result {
+fn fmt_node(f: &mut impl core::fmt::Write, node: &Node, src: &str) -> core::fmt::Result {
     use crate::ast::NodeType::*;
     match node.ty() {
         BoolTrue | BoolFalse | Number | Char | String | MultilineString | Label => {
@@ -148,21 +162,23 @@ fn fmt_node(f: &mut impl std::fmt::Write, node: &Node, src: &str) -> std::fmt::R
         }
         Tuple => fmt_sequence(f, '(', ')', node.as_tuple()?, src),
         List => fmt_sequence(f, '[', ']', node.as_list()?, src),
-        Record => {
-            let fields = node.as_record(src)?;
-            if fields.len() == 0 {
+        TupleSet => {
+            let entries = node.as_map()?;
+            if entries.len() == 0 {
                 return f.write_str("{:}");
             }
             f.write_char('{')?;
-            for (idx, (name, value)) in node.as_record(src)?.enumerate() {
+            for (idx, (key, value)) in entries.enumerate() {
                 if idx != 0 {
                     f.write_str(", ")?;
                 }
-                write!(f, "{name}: ")?;
+                fmt_node(f, key, src)?;
+                f.write_str(": ")?;
                 fmt_node(f, value, src)?;
             }
             f.write_char('}')
         }
+        EmptySet => f.write_str("{}"),
         VariantWithPayload => {
             let (label, payload) = node.as_variant(src)?;
             if Keyword::decode(label).is_some() {
@@ -189,12 +205,12 @@ fn fmt_node(f: &mut impl std::fmt::Write, node: &Node, src: &str) -> std::fmt::R
 }
 
 fn fmt_sequence<'a>(
-    f: &mut impl std::fmt::Write,
+    f: &mut impl core::fmt::Write,
     open: char,
     close: char,
     nodes: impl Iterator<Item = &'a Node>,
     src: &str,
-) -> std::fmt::Result {
+) -> core::fmt::Result {
     f.write_char(open)?;
     for (idx, node) in nodes.enumerate() {
         if idx != 0 {
@@ -206,11 +222,11 @@ fn fmt_sequence<'a>(
 }
 
 fn fmt_variant(
-    f: &mut impl std::fmt::Write,
+    f: &mut impl core::fmt::Write,
     case: &str,
     payload: Option<&Node>,
     src: &str,
-) -> std::fmt::Result {
+) -> core::fmt::Result {
     f.write_str(case)?;
     if let Some(node) = payload {
         f.write_char('(')?;
@@ -220,7 +236,7 @@ fn fmt_variant(
     Ok(())
 }
 
-impl From<ParserError> for std::fmt::Error {
+impl From<ParserError> for core::fmt::Error {
     fn from(_: ParserError) -> Self {
         Self
     }
@@ -228,6 +244,8 @@ impl From<ParserError> for std::fmt::Error {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]
@@ -249,6 +267,8 @@ mod tests {
             "%inf(inf)",
             "%some",
             "%none(none)",
+            r#"{"a": 1, "b": {2: {true: '3'}}, "a": 4}"#,
+            "{-1: some(x), 0: none, 1: ok(y)}",
         ] {
             let val = UntypedValue::parse(src).unwrap();
             let encoded = val.to_string();

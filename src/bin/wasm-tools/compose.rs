@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use wasm_compose::{composer::ComponentComposer, config::Config};
-use wasmparser::Validator;
+use wasmparser::{Validator, WasmFeatures};
 
 /// WebAssembly component composer.
 ///
@@ -45,6 +45,10 @@ pub struct Opts {
     /// Output the text format of WebAssembly instead of the binary format.
     #[clap(short = 't', long)]
     wat: bool,
+
+    /// Don't print warnings.
+    #[clap(short, long)]
+    quiet: bool,
 }
 
 impl Opts {
@@ -53,11 +57,13 @@ impl Opts {
     }
 
     pub fn run(self) -> Result<()> {
-        eprintln!("WARNING: `wasm-tools compose` has been deprecated.");
-        eprintln!("");
-        eprintln!(
-            "Please use `wac` instead. You can find more information about `wac` at https://github.com/bytecodealliance/wac."
-        );
+        if !self.quiet {
+            eprintln!("WARNING: `wasm-tools compose` has been deprecated.");
+            eprintln!("");
+            eprintln!(
+                "Please use `wac` instead. You can find more information about `wac` at https://github.com/bytecodealliance/wac."
+            );
+        }
         let config = self.create_config()?;
         log::debug!("configuration:\n{config:#?}");
 
@@ -68,19 +74,23 @@ impl Opts {
         if config.skip_validation {
             log::debug!("output validation was skipped");
         } else {
-            Validator::new().validate_all(&bytes).with_context(|| {
-                let output = match self.output.output_path() {
-                    Some(s) => format!(" `{}`", s.display()),
-                    None => String::new(),
-                };
-                format!("failed to validate output component{output}")
-            })?;
+            Validator::new_with_features(WasmFeatures::all())
+                .validate_all(&bytes)
+                .with_context(|| {
+                    let output = match self.output.output_path() {
+                        Some(s) => format!(" `{}`", s.display()),
+                        None => String::new(),
+                    };
+                    format!("failed to validate output component{output}")
+                })?;
 
             log::debug!("output component validated successfully");
         }
 
         if let Some(path) = self.output.output_path() {
-            println!("composed component `{}`", path.display());
+            if !self.quiet {
+                println!("composed component `{}`", path.display());
+            }
         }
 
         Ok(())

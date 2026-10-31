@@ -1,5 +1,5 @@
 use arbitrary::{Arbitrary, Error, Unstructured};
-use rand::RngCore;
+use rand::Rng;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering::SeqCst};
 use wasmtime::*;
@@ -42,7 +42,7 @@ impl State {
             engine: Engine::default(),
             print: true,
             total: AtomicUsize::new(0),
-            remaining: AtomicIsize::new(isize::max_value()),
+            remaining: AtomicIsize::new(isize::MAX),
             instantiate_trap: AtomicUsize::new(0),
             instantiate_oom: AtomicUsize::new(0),
         }
@@ -106,6 +106,7 @@ impl State {
 
         // Wasmtime doesn't support these proposals yet.
         config.gc_enabled = false;
+        config.compact_imports_enabled = false;
 
         let mut wasm = wasm_smith::Module::new(config, &mut u)?;
         wasm.ensure_termination(10_000).unwrap();

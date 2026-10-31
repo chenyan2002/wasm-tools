@@ -1,7 +1,6 @@
-#[allow(warnings)]
-mod bindings;
+#![allow(unsafe_code)]
 
-use bindings::{Guest, PrintPart};
+wit_bindgen::generate!();
 
 struct Component;
 
@@ -60,4 +59,4 @@ impl Guest for Component {
     }
 }
 
-bindings::export!(Component with_types_in bindings);
+export!(Component);

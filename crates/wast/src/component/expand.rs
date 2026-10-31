@@ -436,8 +436,10 @@ impl<'a> Expander<'a> {
                 },
                 ModuleTypeDecl::Rec(_) => {}
                 ModuleTypeDecl::Alias(_) => {}
-                ModuleTypeDecl::Import(ty) => {
-                    expand_sig(&mut ty.item, &mut to_prepend, &mut func_type_to_idx);
+                ModuleTypeDecl::Import(imports) => {
+                    for sig in imports.unique_sigs_mut() {
+                        expand_sig(sig, &mut to_prepend, &mut func_type_to_idx);
+                    }
                 }
                 ModuleTypeDecl::Export(_, item) => {
                     expand_sig(item, &mut to_prepend, &mut func_type_to_idx);
@@ -453,7 +455,9 @@ impl<'a> Expander<'a> {
             func_type_to_idx: &mut HashMap<FuncKey<'a>, Index<'a>>,
         ) {
             match &mut item.kind {
-                core::ItemKind::Func(t) | core::ItemKind::Tag(core::TagType::Exception(t)) => {
+                core::ItemKind::Func(t)
+                | core::ItemKind::FuncExact(t)
+                | core::ItemKind::Tag(core::TagType::Exception(t)) => {
                     // If the index is already filled in then this is skipped.
                     if t.index.is_some() {
                         return;
@@ -494,6 +498,7 @@ impl<'a> Expander<'a> {
     fn expand_component_ty(&mut self, ty: &mut ComponentType<'a>) {
         Expander::default().expand_decls(&mut ty.decls, |e, decl| match decl {
             ComponentTypeDecl::CoreType(t) => e.expand_core_type(t),
+            ComponentTypeDecl::CoreRec(_) => {}
             ComponentTypeDecl::Type(t) => e.expand_type(t),
             ComponentTypeDecl::Alias(_) => {}
             ComponentTypeDecl::Export(t) => e.expand_item_sig(&mut t.item),
@@ -504,6 +509,7 @@ impl<'a> Expander<'a> {
     fn expand_instance_ty(&mut self, ty: &mut InstanceType<'a>) {
         Expander::default().expand_decls(&mut ty.decls, |e, decl| match decl {
             InstanceTypeDecl::CoreType(t) => e.expand_core_type(t),
+            InstanceTypeDecl::CoreRec(_) => {}
             InstanceTypeDecl::Type(t) => e.expand_type(t),
             InstanceTypeDecl::Alias(_) => {}
             InstanceTypeDecl::Export(t) => e.expand_item_sig(&mut t.item),
@@ -549,11 +555,15 @@ impl<'a> Expander<'a> {
                 }
             }
             ComponentDefinedType::List(List { element: t })
-            | ComponentDefinedType::FixedSizeList(FixedSizeList {
+            | ComponentDefinedType::FixedLengthList(FixedLengthList {
                 element: t,
                 elements: _,
             }) => {
                 self.expand_component_val_ty(t);
+            }
+            ComponentDefinedType::Map(Map { key: k, value: v }) => {
+                self.expand_component_val_ty(k);
+                self.expand_component_val_ty(v);
             }
             ComponentDefinedType::Tuple(t) => {
                 for field in t.fields.iter_mut() {

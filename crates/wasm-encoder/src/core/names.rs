@@ -45,6 +45,8 @@ enum Subsection {
     Global = 7,
     Element = 8,
     Data = 9,
+    Parameter = 12,
+    TagParameter = 13,
 
     // https://github.com/WebAssembly/gc/issues/193
     Field = 10,
@@ -181,6 +183,18 @@ impl NameSection {
         names.encode(&mut self.bytes);
     }
 
+    /// Appends a subsection for the names of parameters within function types.
+    pub fn parameters(&mut self, names: &IndirectNameMap) {
+        self.subsection_header(Subsection::Parameter, names.size());
+        names.encode(&mut self.bytes);
+    }
+
+    /// Appends a subsection for the names of parameters within tag types.
+    pub fn tag_parameters(&mut self, names: &IndirectNameMap) {
+        self.subsection_header(Subsection::TagParameter, names.size());
+        names.encode(&mut self.bytes);
+    }
+
     /// Appends a raw subsection with the given id and data.
     pub fn raw(&mut self, id: u8, data: &[u8]) {
         self.bytes.push(id);
@@ -216,7 +230,7 @@ impl Section for NameSection {
 /// A map used to name items in a wasm module, organized by naming each
 /// individual index.
 ///
-/// This is used in conjunction with [`NameSection::functions`] and simlar
+/// This is used in conjunction with [`NameSection::functions`] and similar
 /// methods.
 #[derive(Clone, Debug, Default)]
 pub struct NameMap {

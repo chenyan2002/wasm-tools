@@ -1,10 +1,12 @@
-use crate::Adapter;
 use crate::metadata;
+use crate::{Adapter, ImportedStackPointer};
 use std::collections::HashMap;
 use std::slice;
-use wasm_encoder::{BlockType, Function, InstructionSink, MemArg, ValType};
+use wasm_encoder::{BlockType, Function, InstructionSink, MemArg, MemArgTarget, ValType};
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
-use wit_parser::{FlagsRepr, Handle, Int, Resolve, Type, TypeDefKind, TypeId};
+use wit_parser::{
+    Alignment, ArchitectureSize, FlagsRepr, Handle, Int, Resolve, Type, TypeDefKind, TypeId,
+};
 
 macro_rules! intrinsics {
     ($(
@@ -32,10 +34,12 @@ macro_rules! intrinsics {
 intrinsics! {
     initialize : [ValType::I32] -> [] = "wit_dylib_initialize",
     cabi_realloc : [ValType::I32; 4] -> [ValType::I32] = "cabi_realloc",
-    dealloc_bytes : [ValType::I32; 3] -> [] = "wit_dylib_dealloc_bytes",
+    dealloc_bytes : [ValType::I32; 5] -> [] = "wit_dylib_dealloc_bytes",
 
     export_start : [ValType::I32] -> [ValType::I32] = "wit_dylib_export_start",
     export_call : [ValType::I32; 2] -> [] = "wit_dylib_export_call",
+    export_async_call : [ValType::I32; 2] -> [ValType::I32] = "wit_dylib_export_async_call",
+    export_async_callback : [ValType::I32; 4] -> [ValType::I32] = "wit_dylib_export_async_callback",
     export_finish : [ValType::I32; 2] -> [] = "wit_dylib_export_finish",
     resource_dtor : [ValType::I32; 2] -> [] = "wit_dylib_resource_dtor",
 
@@ -65,8 +69,12 @@ intrinsics! {
     pop_string : [ValType::I32; 2] -> [ValType::I32] = "wit_dylib_pop_string",
 
     pop_list : [ValType::I32; 3] -> [ValType::I32] = "wit_dylib_pop_list",
-    pop_iter_next : [ValType::I32; 2] -> [] = "wit_dylib_pop_iter_next",
-    pop_iter : [ValType::I32; 2] -> [] = "wit_dylib_pop_iter",
+    pop_list_iter_next : [ValType::I32; 2] -> [] = "wit_dylib_pop_list_iter_next",
+    pop_list_iter : [ValType::I32; 2] -> [] = "wit_dylib_pop_list_iter",
+
+    pop_map : [ValType::I32; 2] -> [ValType::I32] = "wit_dylib_pop_map",
+    pop_map_iter_next : [ValType::I32; 2] -> [] = "wit_dylib_pop_map_iter_next",
+    pop_map_iter : [ValType::I32; 2] -> [] = "wit_dylib_pop_map_iter",
 
     push_bool : [ValType::I32; 2] -> [] = "wit_dylib_push_bool",
     push_char : [ValType::I32; 2] -> [] = "wit_dylib_push_char",
@@ -94,6 +102,14 @@ intrinsics! {
     push_result : [ValType::I32; 3] -> [] = "wit_dylib_push_result",
     push_list : [ValType::I32; 4] -> [ValType::I32] = "wit_dylib_push_list",
     list_append : [ValType::I32; 2] -> [] = "wit_dylib_list_append",
+    push_map : [ValType::I32; 3] -> [] = "wit_dylib_push_map",
+    map_append : [ValType::I32; 2] -> [] = "wit_dylib_map_append",
+}
+
+struct ElementInfo {
+    increments: Vec<usize>,
+    size: usize,
+    align: usize,
 }
 
 pub fn import(
@@ -104,20 +120,167 @@ pub fn import(
     import_idx: u32,
 ) -> Function {
     let sig = resolve.wasm_signature(abi, func);
-    let mut c = FunctionCompiler::new(adapter, resolve, 1);
+    let initial_locals = if abi.is_async() { 2 } else { 1 };
+    let mut c = FunctionCompiler::new(adapter, resolve, initial_locals);
     let frame = c.stack_frame(func, &sig, abi);
-    let fp = c.allocate_stack_frame(&frame);
+    c.allocate_stack_frame(&frame);
     c.ctx = Some(TempLocal::new(0, ValType::I32));
 
-    c.lower_import_params(func, &sig, &frame, fp.as_ref());
-    c.ins().call(import_idx);
-    c.lift_import_results(func, &sig, &frame, fp.as_ref());
+    let async_retptr_offset = async_import_retptr_offset(c.adapter, resolve, func);
 
-    c.deallocate_lowered_lists();
-    c.deallocate_stack_frame(&frame, fp);
+    c.lower_import_params(
+        func,
+        &sig,
+        |me| {
+            if abi.is_async() {
+                // Async lowering requires a long-lived pointer meaning that it
+                // must be provided by the caller. It's the second parameter to
+                // the function.
+                Memory {
+                    addr: TempLocal::new(1, ValType::I32),
+                    offset: 0,
+                }
+            } else {
+                // Sync lowering only requires a temporary pointer, so use the
+                // space allocated in `stack_frame` for us.
+                let fp = me.fp.as_ref().unwrap();
+                Memory {
+                    addr: TempLocal::new(fp.idx, fp.ty),
+                    offset: frame.abi_param_offset.unwrap(),
+                }
+            }
+        },
+        |me| {
+            if abi.is_async() {
+                // Async results, like parameters, must be in a long-lived
+                // location. This is in the same allocation as parameters, but
+                // at an offset further in.
+                Memory {
+                    addr: TempLocal::new(1, ValType::I32),
+                    offset: async_retptr_offset.unwrap().try_into().unwrap(),
+                }
+            } else {
+                // Sync results are stored on the stack, also allocated in
+                // `stack_frame` above like with indirect parameters.
+                let fp = me.fp.as_ref().unwrap();
+                let AbiLoc::Memory(mem) = frame.abi_loc(fp).unwrap() else {
+                    unreachable!()
+                };
+                mem
+            }
+        },
+    );
+    c.ins().call(import_idx);
+
+    // Async imports return the result of the raw function directly, the
+    // status code result. Sync imports need to actually lift results and then
+    // clean up any temporary allocations/stack space.
+    if !abi.is_async() {
+        let tmp = if !sig.retptr && func.result.is_some() {
+            let tmp_ty = c.adapter.map_wasm_type(sig.results[0]);
+            Some(c.local_set_new_tmp(tmp_ty))
+        } else {
+            None
+        };
+
+        c.lift_import_results(
+            func,
+            &sig,
+            || AbiLoc::Stack(slice::from_ref(tmp.as_ref().unwrap())),
+            |me| frame.abi_loc(me.fp.as_ref().unwrap()).unwrap(),
+        );
+        if let Some(tmp) = tmp {
+            c.free_temp_local(tmp);
+        }
+    }
+    c.deallocate_stack_frame(&frame);
+    c.finish()
+}
+
+/// Returns the list of types that are going to be stored in the "abi area" that
+/// is long-lived for a function call.
+///
+/// This returns all parameters, if they're passed indirectly, and then always
+/// returns the result if there is one.
+pub fn async_import_abi_area_types<'a>(
+    resolve: &Resolve,
+    func: &'a wit_parser::Function,
+) -> impl Iterator<Item = &'a Type> {
+    let sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
+    let include_params = sig.indirect_params;
+    func.params
+        .iter()
+        .filter_map(move |p| if include_params { Some(&p.ty) } else { None })
+        .chain(func.result.iter())
+}
+
+/// Returns the offset, in bytes, within the async_abi_area allocated for an
+/// async import call, to the return value.
+///
+/// Async parameters, if indirect, and async results, always, are required to be
+/// in a long-lived location outside of the original call itself. This function
+/// returns the offset from the start of this allocation to the return value.
+/// This is plumbed through to the guest in `async_abi_area_{size,align}`.
+fn async_import_retptr_offset(
+    adapter: &mut Adapter,
+    resolve: &Resolve,
+    func: &wit_parser::Function,
+) -> Option<u32> {
+    if !func.result.is_some() {
+        return None;
+    }
+
+    let types = async_import_abi_area_types(resolve, func);
+    let (size, _ty) = adapter.sizes.field_offsets(types).pop().unwrap();
+    Some(size.size_wasm32().try_into().unwrap())
+}
+
+/// Generates a function that is suitable for learning about the results of an
+/// async function call.
+///
+/// This can't be bundled into `import` for async functions because they
+/// complete at a different point of time from when the import is invoked. This
+/// function is passed the `cx` argument plus the "abi area" that was also
+/// passed to `import`. This location in linear memory is where results are
+/// lifted from and converted via `wit_dylib_push_*` into the `cx` argument.
+pub fn lift_async_import_results(
+    adapter: &mut Adapter,
+    resolve: &Resolve,
+    func: &wit_parser::Function,
+    abi: AbiVariant,
+) -> Function {
+    assert!(abi.is_async());
+    let sig = resolve.wasm_signature(abi, func);
+    let mut c = FunctionCompiler::new(adapter, resolve, 2);
+    c.ctx = Some(TempLocal::new(0, ValType::I32));
+
+    let async_retptr_offset = async_import_retptr_offset(c.adapter, resolve, func);
+    c.lift_import_results(
+        func,
+        &sig,
+        // Not possible to lift arguments from the stack for async functions,
+        // it's always through a "retptr"
+        || unreachable!(),
+        // The pointer to results is in the second parameter passed to this
+        // function, and results are located at the offset defined by
+        // `async_import_retptr_offset`.
+        |_| {
+            AbiLoc::Memory(Memory {
+                addr: TempLocal::new(1, ValType::I32),
+                offset: async_retptr_offset.unwrap(),
+            })
+        },
+    );
 
     c.finish()
 }
+
+const MEMARG_32: MemArg = MemArg {
+    target: MemArgTarget::Memory(0),
+    align: 2,
+    offset: 0,
+    ordering: None,
+};
 
 pub fn export(
     adapter: &mut Adapter,
@@ -125,14 +288,13 @@ pub fn export(
     func: &wit_parser::Function,
     abi: AbiVariant,
     func_metadata_index: usize,
-) -> (Function, bool) {
+) -> Function {
     let sig = resolve.wasm_signature(abi, func);
     let mut c = FunctionCompiler::new(adapter, resolve, sig.params.len() as u32);
     let frame = c.stack_frame(func, &sig, abi);
-    let fp = c.allocate_stack_frame(&frame);
+    c.allocate_stack_frame(&frame);
 
     let export_start = c.adapter.intrinsics().export_start;
-    let export_call = c.adapter.intrinsics().export_call;
 
     c.ins().i32_const(func_metadata_index.try_into().unwrap());
     c.ins().call(export_start);
@@ -140,58 +302,59 @@ pub fn export(
 
     c.lift_export_params(func, &sig);
 
-    c.local_get_ctx();
-    c.ins().i32_const(func_metadata_index.try_into().unwrap());
-    c.ins().call(export_call);
+    if abi.is_async() {
+        // Async exports use the lifted params from above, but do not handle the
+        // lowered results. That's the responsibility of the
+        // `task_return`-generated function. Here the `cx` is passed along with
+        // the function index. Notably this has different ownership semantics
+        // around `cx` where the callee gets ownership, unlike sync where
+        // `export_call` does not get ownership.
+        //
+        // Additionally the `export_async_call` function always returns an `i32`
+        // status code, which is plumbed through here to the end.
+        let export_async_call = c.adapter.intrinsics().export_async_call;
+        c.local_get_ctx();
+        let l_ctx = c.ctx.take().unwrap();
+        c.free_temp_local(l_ctx);
+        c.ins().i32_const(func_metadata_index.try_into().unwrap());
+        c.ins().call(export_async_call);
+        c.deallocate_stack_frame(&frame);
+    } else {
+        let export_call = c.adapter.intrinsics().export_call;
+        c.local_get_ctx();
+        c.ins().i32_const(func_metadata_index.try_into().unwrap());
+        c.ins().call(export_call);
 
-    c.lower_export_results(func, &sig, &frame, fp.as_ref());
+        c.lower_export_results(func, &sig, &frame);
 
-    // Note that this function intentionally does not deallocate the stack space
-    // allocated above in `allocate_stack_frame`. That is the responsibility of
-    // the post-return function to ensure that the owned value on the stack, the
-    // return value, can get cleaned up properly. Additionally any dynamically
-    // allocated lists will be stored on the stack and will get cleaned up
-    // during post-return.
-    //
-    // Instead this actually allocates *more* stack space to save off `c.ctx`
-    // into the stack-local memory. This also stores the dynamic number of lists
-    // to deallocate if that was generated during this function.
+        // Note that this function intentionally does not deallocate the stack space
+        // allocated above in `allocate_stack_frame`. That is the responsibility of
+        // the post-return function to ensure that the owned value on the stack, the
+        // return value, can get cleaned up properly. Additionally any dynamically
+        // allocated lists will be stored on the stack and will get cleaned up
+        // during post-return.
+        //
+        // Instead this actually allocates *more* stack space to save off `c.ctx`
+        // into the stack-local memory. This also stores the dynamic number of lists
+        // to deallocate if that was generated during this function.
 
-    let sp = c.adapter.stack_pointer();
-    c.ins().global_get(sp);
-    c.ins().i32_const(8);
-    c.ins().i32_sub();
-    let l_scratch = c.local_tee_new_tmp(ValType::I32);
-    c.ins().global_set(sp);
+        c.get_sp();
+        c.ins().i32_const(8);
+        c.ins().i32_sub();
+        let l_scratch = c.local_tee_new_tmp(ValType::I32);
+        c.set_sp();
 
-    let l_ctx = c.ctx.take().unwrap();
-    c.ins().local_get(l_scratch.idx);
-    c.ins().local_get(l_ctx.idx);
-    c.ins().i32_store(MemArg {
-        memory_index: 0,
-        align: 2,
-        offset: 0,
-    });
-    c.free_temp_local(l_ctx);
-
-    let may_have_dynamic_lists_to_free = c.num_dynamic_lists_to_free.is_some();
-    if let Some(l_num) = c.num_dynamic_lists_to_free.take() {
+        let l_ctx = c.ctx.take().unwrap();
         c.ins().local_get(l_scratch.idx);
-        c.ins().local_get(l_num.idx);
-        c.ins().i32_store(MemArg {
-            memory_index: 0,
-            align: 2,
-            offset: 4,
-        });
-        c.free_temp_local(l_num);
+        c.ins().local_get(l_ctx.idx);
+        c.ins().i32_store(MEMARG_32);
+        c.free_temp_local(l_ctx);
+        c.free_temp_local(l_scratch);
+        if let Some(fp) = c.fp.take() {
+            c.free_temp_local(fp);
+        }
     }
-
-    c.free_temp_local(l_scratch);
-    if let Some(fp) = fp {
-        c.free_temp_local(fp);
-    }
-
-    (c.finish(), may_have_dynamic_lists_to_free)
+    c.finish()
 }
 
 pub fn post_return(
@@ -200,41 +363,20 @@ pub fn post_return(
     func: &wit_parser::Function,
     abi: AbiVariant,
     func_metadata_index: usize,
-    may_have_dynamic_lists_to_free: bool,
 ) -> Function {
+    assert!(!abi.is_async());
     let sig = resolve.wasm_signature(abi, func);
     let mut c = FunctionCompiler::new(adapter, resolve, sig.results.len() as u32);
     let frame = c.stack_frame(func, &sig, abi);
-    let sp = c.adapter.stack_pointer();
 
-    c.ins().global_get(sp);
+    c.get_sp();
     let l_sp = c.local_set_new_tmp(ValType::I32);
 
     // Load the `ctx` pointer for the export allocated during the originally
     // invoked function.
     c.ins().local_get(l_sp.idx);
-    c.ins().i32_load(MemArg {
-        memory_index: 0,
-        align: 2,
-        offset: 0,
-    });
+    c.ins().i32_load(MEMARG_32);
     c.ctx = Some(c.local_set_new_tmp(ValType::I32));
-
-    // If the main exported function may have dynamically allocated lists during
-    // lowering then the metadata for what to deallocate is at the bottom of the
-    // stack. The last element is the number of lists to free, and then there's
-    // N entries of what to free. Load the number here, then use
-    // deallocate_lowered_lists` later to handle the actual deallocation and
-    // restoration of the stack pointer.
-    if may_have_dynamic_lists_to_free {
-        c.ins().local_get(l_sp.idx);
-        c.ins().i32_load(MemArg {
-            memory_index: 0,
-            align: 2,
-            offset: 4,
-        });
-        c.num_dynamic_lists_to_free = Some(c.local_set_new_tmp(ValType::I32));
-    }
 
     // Bump sp by 8 bytes to restore it to just before the end of the export
     // call originally.
@@ -242,13 +384,7 @@ pub fn post_return(
     c.free_temp_local(l_sp);
     c.ins().i32_const(8);
     c.ins().i32_add();
-    c.ins().global_set(sp);
-
-    // Restore the stack by discarding all lists only needed for the canonical
-    // ABI which are no longer necessary.
-    if c.num_dynamic_lists_to_free.is_some() {
-        c.deallocate_lowered_lists();
-    }
+    c.set_sp();
 
     // Tell the interpreter that the export has now finished.
     let export_finish = c.adapter.intrinsics().export_finish;
@@ -261,10 +397,84 @@ pub fn post_return(
 
     // And finally deallocate the stack frame, if present.
     if frame.size > 0 {
-        c.ins().global_get(sp);
-        let fp = c.local_set_new_tmp(ValType::I32);
-        c.deallocate_stack_frame(&frame, Some(fp));
+        c.get_sp();
+        c.fp = Some(c.local_set_new_tmp(ValType::I32));
+        c.deallocate_stack_frame(&frame);
     }
+    c.finish()
+}
+
+/// Generates a function suitable to use as `task.return` for a particular
+/// exported function.
+///
+/// This function takes a single `cx` argument from which languages values are
+/// "popped" and placed into their ABI locations to return from an async export.
+pub fn task_return(
+    adapter: &mut Adapter,
+    resolve: &Resolve,
+    func: &wit_parser::Function,
+    abi: AbiVariant,
+    task_return_import: u32,
+) -> Function {
+    assert!(abi.is_async());
+
+    // The `task.return` intrinsic works as-if the return value of this function
+    // is passed to an imported function. Simulate bindings for it by literally
+    // running the `import` bindings generator with a dummy function that has
+    // its type modified to reflect what the `task.return` intrinsic looks like.
+    let mut dummy_func = func.clone();
+    dummy_func.params = Vec::new();
+    if let Some(ty) = dummy_func.result.take() {
+        dummy_func.params.push(wit_parser::Param {
+            name: "x".to_string(),
+            ty,
+            span: Default::default(),
+        });
+    }
+    import(
+        adapter,
+        resolve,
+        &dummy_func,
+        AbiVariant::GuestImport,
+        task_return_import,
+    )
+}
+
+pub fn lift_payload(adapter: &mut Adapter, resolve: &Resolve, ty: Type) -> Function {
+    let mut c = FunctionCompiler::new(adapter, resolve, 2);
+    c.ctx = Some(TempLocal::new(0, ValType::I32));
+    c.lift(
+        &AbiLoc::Memory(Memory {
+            addr: TempLocal::new(1, ValType::I32),
+            offset: 0,
+        }),
+        ty,
+    );
+    c.finish()
+}
+
+pub fn lower_payload(adapter: &mut Adapter, resolve: &Resolve, ty: Type) -> Function {
+    let mut c = FunctionCompiler::new(adapter, resolve, 2);
+    c.ctx = Some(TempLocal::new(0, ValType::I32));
+    // As of this writing, `FunctionCompiler::lower` calls
+    // `FunctionCompiler::local_get_stack_temp_addr` when lowering a string,
+    // which will panic if no stack frame has been allocated, so we take care of
+    // that here:
+    let frame = StackFrame {
+        size: 16,
+        abi_param_offset: None,
+        retptr_offset: None,
+        stack_temp_offset: Some(0),
+    };
+    c.allocate_stack_frame(&frame);
+    c.lower(
+        ty,
+        &AbiLoc::Memory(Memory {
+            addr: TempLocal::new(1, ValType::I32),
+            offset: 0,
+        }),
+    );
+    c.deallocate_stack_frame(&frame);
     c.finish()
 }
 
@@ -275,9 +485,17 @@ struct FunctionCompiler<'a> {
     locals: Vec<(u32, ValType)>,
     free_locals: HashMap<ValType, Vec<u32>>,
     nlocals: u32,
-    using_temp_stack: u32,
 
-    num_dynamic_lists_to_free: Option<TempLocal>,
+    /// A local which is the "frame pointer" or a pointer to the base of this
+    /// frame's stack allocation.
+    ///
+    /// This is `None` until `allocate_stack_frame` and will continue to be
+    /// `None` if the stack size is 0.
+    fp: Option<TempLocal>,
+
+    /// A static offset from `fp` to the "temp location" on the stack.
+    stack_temp_offset: Option<u32>,
+
     ctx: Option<TempLocal>,
 }
 
@@ -290,9 +508,9 @@ impl<'a> FunctionCompiler<'a> {
             locals: Vec::new(),
             free_locals: HashMap::new(),
             nlocals,
-            num_dynamic_lists_to_free: None,
-            using_temp_stack: 0,
             ctx: None,
+            fp: None,
+            stack_temp_offset: None,
         }
     }
 
@@ -322,6 +540,14 @@ impl<'a> FunctionCompiler<'a> {
     fn local_get_ctx(&mut self) {
         let idx = self.ctx.as_ref().unwrap().idx;
         self.ins().local_get(idx);
+    }
+
+    fn local_get_stack_temp_addr(&mut self) {
+        let fp = self.fp.as_ref().unwrap().idx;
+        self.ins().local_get(fp);
+        let off = self.stack_temp_offset.unwrap();
+        self.ins().i32_const(off.try_into().unwrap());
+        self.ins().i32_add();
     }
 
     fn gen_temp_local(&mut self, ty: ValType) -> TempLocal {
@@ -362,78 +588,22 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn finish(self) -> Function {
-        assert!(self.num_dynamic_lists_to_free.is_none());
-        assert!(self.using_temp_stack == 0);
         let mut func = Function::new(self.locals);
         func.raw(self.bytecode);
         func.instructions().end();
         func
     }
 
-    fn deallocate_lowered_lists(&mut self) {
-        let dealloc_bytes = self.adapter.intrinsics().dealloc_bytes;
-
-        let Some(l_dynamic) = self.num_dynamic_lists_to_free.take() else {
-            return;
-        };
-        let sp = self.adapter.stack_pointer();
-        self.ins().global_get(sp);
-        let l_sp = self.local_set_new_tmp(ValType::I32);
-        let memarg = |offset| MemArg {
-            memory_index: 0,
-            offset,
-            align: 2,
-        };
-        self.ins().loop_(BlockType::Empty);
-        {
-            // if the counter is > 0 then keep going.
-            self.ins().local_get(l_dynamic.idx);
-            self.ins().if_(BlockType::Empty);
-            {
-                // Load ptr/len/align and deallocate
-                self.ins().local_get(l_sp.idx);
-                self.ins().i32_load(memarg(0));
-                self.ins().local_get(l_sp.idx);
-                self.ins().i32_load(memarg(4));
-                self.ins().local_get(l_sp.idx);
-                self.ins().i32_load(memarg(8));
-                self.ins().call(dealloc_bytes);
-
-                // Bump l_sp
-                self.ins().local_get(l_sp.idx);
-                self.ins().i32_const(16);
-                self.ins().i32_add();
-                self.ins().local_set(l_sp.idx);
-
-                // Decrement l_dynamic
-                self.ins().local_get(l_dynamic.idx);
-                self.ins().i32_const(1);
-                self.ins().i32_sub();
-                self.ins().local_set(l_dynamic.idx);
-
-                self.ins().br(1);
-            }
-            self.ins().end();
-        }
-        self.ins().end();
-
-        self.ins().local_get(l_sp.idx);
-        self.ins().global_set(sp);
-
-        self.free_temp_local(l_sp);
-        self.free_temp_local(l_dynamic);
-    }
-
-    fn deallocate_stack_frame(&mut self, frame: &StackFrame, fp: Option<TempLocal>) {
+    fn deallocate_stack_frame(&mut self, frame: &StackFrame) {
         if frame.size == 0 {
             return;
         }
-        let fp = fp.unwrap();
-        let sp = self.adapter.stack_pointer();
+        let fp = self.fp.take().unwrap();
+        self.stack_temp_offset = None;
         self.ins().local_get(fp.idx);
         self.ins().i32_const(frame.size as i32);
         self.ins().i32_add();
-        self.ins().global_set(sp);
+        self.set_sp();
         self.free_temp_local(fp);
     }
 
@@ -447,98 +617,110 @@ impl<'a> FunctionCompiler<'a> {
         // that this is used for both imported and exported functions. The way
         // exports work is that we defer stack cleanup to happening in
         // post-return.
-        let ret_size = if sig.retptr {
+        let (ret_size, ret_align) = if sig.retptr && !abi.is_async() {
             let info = self.adapter.sizes.record(&func.result);
-            assert!(info.align.align_wasm32() <= 8);
-
-            info.size.size_wasm32().try_into().unwrap()
+            (
+                info.size.size_wasm32().try_into().unwrap(),
+                info.align.align_wasm32().try_into().unwrap(),
+            )
         } else {
-            0
+            (0, 1)
         };
 
         // Allocate space for the in-memory abi parameters for imports. Note
         // that exports are heap-allocated by the caller but for imports it's
         // the responsibility of the caller to provide an appropriate parameter.
-        let abi_param_size = match abi {
+        let (abi_param_size, abi_param_align) = match abi {
             AbiVariant::GuestImport if sig.indirect_params => {
-                let info = self
-                    .adapter
-                    .sizes
-                    .params(func.params.iter().map(|(_, ty)| ty));
-                info.size.size_wasm32().try_into().unwrap()
+                let info = self.adapter.sizes.params(func.params.iter().map(|p| &p.ty));
+                (
+                    info.size.size_wasm32().try_into().unwrap(),
+                    info.align.align_wasm32().try_into().unwrap(),
+                )
             }
-            AbiVariant::GuestImport => 0,
-            AbiVariant::GuestExport => 0,
-            AbiVariant::GuestImportAsync => todo!("async"),
-            AbiVariant::GuestExportAsync => todo!("async"),
+            AbiVariant::GuestImport => (0, 1),
+            AbiVariant::GuestExport => (0, 1),
+            AbiVariant::GuestImportAsync => (0, 1),
+            AbiVariant::GuestExportAsync => (0, 1),
             AbiVariant::GuestExportAsyncStackful => todo!("async"),
         };
 
-        let size = align_up(align_up(ret_size, 4) + align_up(abi_param_size, 4), 8);
-        let mut offset = 0;
-        let abi_param_offset = if abi_param_size > 0 {
-            let ret = offset;
-            offset += align_up(abi_param_size, 4);
-            Some(ret.try_into().unwrap())
-        } else {
-            None
-        };
-        let retptr_offset = if ret_size > 0 {
-            let ret = offset;
-            offset += align_up(ret_size, 4);
-            Some(ret.try_into().unwrap())
-        } else {
-            None
-        };
+        // TODO: should look at the operation being done and the types in play
+        // to see if this is actually needed.
+        let (stack_temp_size, stack_temp_align) = (4, 4);
 
-        let _ = offset;
+        // The stack frame is allocated as, in order of lower-to-higher
+        // addresses:
+        //
+        // * The ABI parameter area
+        // * The return pointer area
+        // * The stack temp area
+        //
+        // TODO: should probably sort these areas by alignment to minimize the
+        // size of the allocation.
+
+        let mut offset = 0;
+        let mut bump = |size, align| {
+            // If the natural wasm stack alignment is exceeded we'd need more
+            // instructions here, so defer that to some other time if it's actually
+            // needed.
+            assert!(align <= 16);
+            if size == 0 {
+                None
+            } else {
+                let ret = align_up(offset, align);
+                offset = ret + size;
+                Some(ret.try_into().unwrap())
+            }
+        };
+        let abi_param_offset = bump(abi_param_size, abi_param_align);
+        let retptr_offset = bump(ret_size, ret_align);
+        let stack_temp_offset = bump(stack_temp_size, stack_temp_align);
 
         StackFrame {
-            size: size.try_into().unwrap(),
+            // The entire stack frame must be 16-byte aligned, so apply that
+            // here.
+            size: align_up(offset, 16).try_into().unwrap(),
             abi_param_offset,
             retptr_offset,
+            stack_temp_offset,
         }
     }
 
-    fn allocate_stack_frame(&mut self, frame: &StackFrame) -> Option<TempLocal> {
+    fn allocate_stack_frame(&mut self, frame: &StackFrame) {
+        assert!(self.fp.is_none());
+        assert!(self.stack_temp_offset.is_none());
         if frame.size == 0 {
-            return None;
+            return;
         }
-        assert!(frame.size % 8 == 0);
-        let sp = self.adapter.stack_pointer();
-        self.ins().global_get(sp);
+        // CABI for wasm is 16-byte alignment for stack at all times.
+        assert!(frame.size % 16 == 0);
+        self.get_sp();
         self.ins().i32_const(frame.size as i32);
         self.ins().i32_sub();
-        let ret = self.local_tee_new_tmp(ValType::I32);
-        self.ins().global_set(sp);
-        Some(ret)
+        self.fp = Some(self.local_tee_new_tmp(ValType::I32));
+        self.stack_temp_offset = frame.stack_temp_offset;
+        self.set_sp();
     }
 
     fn lower_import_params(
         &mut self,
         func: &wit_parser::Function,
         sig: &WasmSignature,
-        frame: &StackFrame,
-        fp: Option<&TempLocal>,
+        indirect_params: impl FnOnce(&Self) -> Memory,
+        retptr: impl FnOnce(&Self) -> Memory,
     ) {
-        let tys = func.params.iter().map(|(_, ty)| ty);
+        let tys = func.params.iter().map(|p| &p.ty);
 
         if sig.indirect_params {
-            let fp = fp.unwrap();
-            let offset = frame.abi_param_offset.unwrap();
-            let dsts = self.record_field_locs(
-                &AbiLoc::Memory(Memory {
-                    addr: TempLocal::new(fp.idx, fp.ty),
-                    offset,
-                }),
-                tys.clone(),
-            );
+            let mem = indirect_params(self);
+            let dsts = self.record_field_locs(&AbiLoc::Memory(mem.bump(0)), tys.clone());
             for (param, dst) in tys.zip(dsts) {
                 self.lower(*param, &dst);
             }
 
-            self.ins().local_get(fp.idx);
-            self.ins().i32_const(offset.try_into().unwrap());
+            self.ins().local_get(mem.addr.idx);
+            self.ins().i32_const(mem.offset.try_into().unwrap());
             self.ins().i32_add();
         } else {
             let mut locals = sig
@@ -549,10 +731,8 @@ impl<'a> FunctionCompiler<'a> {
             if sig.retptr {
                 self.free_temp_local(locals.pop().unwrap());
             }
-            let dsts = self.record_field_locs(
-                &AbiLoc::Stack(&locals),
-                func.params.iter().map(|(_, ty)| ty),
-            );
+            let dsts =
+                self.record_field_locs(&AbiLoc::Stack(&locals), func.params.iter().map(|p| &p.ty));
             for (param, dst) in tys.zip(dsts) {
                 self.lower(*param, &dst);
             }
@@ -564,21 +744,19 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         if sig.retptr {
-            let AbiLoc::Memory(mem) = frame.abi_loc(fp.unwrap()).unwrap() else {
-                unreachable!()
-            };
+            let mem = retptr(self);
             self.ins().local_get(mem.addr.idx);
             self.ins().i32_const(mem.offset as i32);
             self.ins().i32_add();
         }
     }
 
-    fn lift_import_results(
+    fn lift_import_results<'b>(
         &mut self,
         func: &wit_parser::Function,
         sig: &WasmSignature,
-        frame: &StackFrame,
-        fp: Option<&TempLocal>,
+        stack_src: impl FnOnce() -> AbiLoc<'b>,
+        retptr_src: impl FnOnce(&Self) -> AbiLoc<'b>,
     ) {
         let ty = match func.result {
             Some(ty) => ty,
@@ -587,18 +765,13 @@ impl<'a> FunctionCompiler<'a> {
                 return;
             }
         };
-        if sig.retptr {
-            assert_eq!(sig.results.len(), 0);
-            let src = frame.abi_loc(fp.unwrap()).unwrap();
-            self.lift(&src, ty);
+        let src = if sig.retptr {
+            retptr_src(self)
         } else {
             assert_eq!(sig.results.len(), 1);
-            let tmp_ty = self.adapter.map_wasm_type(sig.results[0]);
-            let tmp = self.local_set_new_tmp(tmp_ty);
-            let src = AbiLoc::Stack(slice::from_ref(&tmp));
-            self.lift(&src, ty);
-            self.free_temp_local(tmp);
-        }
+            stack_src()
+        };
+        self.lift(&src, ty);
     }
 
     fn lift_export_params(&mut self, func: &wit_parser::Function, sig: &WasmSignature) {
@@ -618,9 +791,9 @@ impl<'a> FunctionCompiler<'a> {
             AbiLoc::Stack(&temps)
         };
 
-        let srcs = self.record_field_locs(&src, func.params.iter().map(|(_, ty)| ty));
-        for ((_, param), src) in func.params.iter().zip(srcs) {
-            self.lift(&src, *param);
+        let srcs = self.record_field_locs(&src, func.params.iter().map(|p| &p.ty));
+        for (param, src) in func.params.iter().zip(srcs) {
+            self.lift(&src, param.ty);
         }
 
         // If parameters were passed indirectly than the caller of this export
@@ -628,16 +801,15 @@ impl<'a> FunctionCompiler<'a> {
         // allocation here after all the parameters were lowered onto the stack.
         if let AbiLoc::Memory(mem) = &src {
             assert!(sig.indirect_params);
-            let info = self
-                .adapter
-                .sizes
-                .record(func.params.iter().map(|(_, ty)| ty));
+            let info = self.adapter.sizes.record(func.params.iter().map(|p| &p.ty));
+            self.local_get_ctx();
             self.ins().local_get(mem.addr.idx);
             assert_eq!(mem.offset, 0);
             self.ins()
                 .i32_const(info.size.size_wasm32().try_into().unwrap());
             self.ins()
                 .i32_const(info.align.align_wasm32().try_into().unwrap());
+            self.ins().i32_const(0);
             let dealloc_bytes = self.adapter.intrinsics().dealloc_bytes;
             self.ins().call(dealloc_bytes);
         }
@@ -648,7 +820,6 @@ impl<'a> FunctionCompiler<'a> {
         func: &wit_parser::Function,
         sig: &WasmSignature,
         frame: &StackFrame,
-        fp: Option<&TempLocal>,
     ) {
         let ty = match func.result {
             Some(ty) => ty,
@@ -660,7 +831,7 @@ impl<'a> FunctionCompiler<'a> {
 
         if sig.retptr {
             assert_eq!(sig.results.len(), 1);
-            let dst = frame.abi_loc(fp.unwrap()).unwrap();
+            let dst = frame.abi_loc(self.fp.as_ref().unwrap()).unwrap();
             self.lower(ty, &dst);
 
             let AbiLoc::Memory(mem) = dst else {
@@ -698,21 +869,15 @@ impl<'a> FunctionCompiler<'a> {
             Type::F64 => self.pop_scalar(dest, ValType::F64, i.pop_f64, 3),
             Type::ErrorContext => todo!("error-context"),
             Type::String => {
-                let pop_string = i.pop_string;
-                self.with_temp_stack(4, |me, addr| {
-                    me.local_get_ctx();
-                    me.ins().local_get(addr.idx);
-                    me.ins().call(pop_string);
-                    me.ins().local_get(addr.idx);
-                    me.ins().i32_load(MemArg {
-                        memory_index: 0,
-                        offset: 0,
-                        align: 2,
-                    });
-                });
                 let (dst_ptr, dst_len) = dest.split_ptr_len();
-                self.store_scalar_from_top_of_stack(&dst_ptr, ValType::I32, 2);
+                let pop_string = i.pop_string;
+                self.local_get_ctx();
+                self.local_get_stack_temp_addr();
+                self.ins().call(pop_string);
                 self.store_scalar_from_top_of_stack(&dst_len, ValType::I32, 2);
+                self.local_get_stack_temp_addr();
+                self.ins().i32_load(MEMARG_32);
+                self.store_scalar_from_top_of_stack(&dst_ptr, ValType::I32, 2);
             }
             Type::Id(id) => self.lower_id(id, dest),
         }
@@ -807,102 +972,28 @@ impl<'a> FunctionCompiler<'a> {
                     unreachable!()
                 };
                 let pop_list = self.adapter.intrinsics().pop_list;
-                let pop_iter_next = self.adapter.intrinsics().pop_iter_next;
-                let pop_iter = self.adapter.intrinsics().pop_iter;
-                let cabi_realloc = self.adapter.intrinsics().cabi_realloc;
-                let size = self.adapter.sizes.size(t).size_wasm32();
-                let align = self.adapter.sizes.align(t).align_wasm32();
+                let pop_iter_next = self.adapter.intrinsics().pop_list_iter_next;
+                let pop_iter = self.adapter.intrinsics().pop_list_iter;
                 let (dst_ptr, dst_len) = dest.split_ptr_len();
 
                 // Load the list ptr/len into locals
-                self.with_temp_stack(4, |me, addr| {
-                    me.local_get_ctx();
-                    me.ins().i32_const(list_index.try_into().unwrap());
-                    me.ins().local_get(addr.idx);
-                    me.ins().call(pop_list);
-                    me.ins().local_get(addr.idx);
-                    me.ins().i32_load(MemArg {
-                        memory_index: 0,
-                        offset: 0,
-                        align: 2,
-                    });
-                });
-                let l_ptr = self.local_set_new_tmp(ValType::I32);
+                self.local_get_ctx();
+                self.ins().i32_const(list_index.try_into().unwrap());
+                self.local_get_stack_temp_addr();
+                self.ins().call(pop_list);
                 let l_len = self.local_set_new_tmp(ValType::I32);
+                self.local_get_stack_temp_addr();
+                self.ins().i32_load(MEMARG_32);
+                let l_ptr = self.local_set_new_tmp(ValType::I32);
 
                 // If the pointer is null then the interpreter doesn't support
                 // the same canonical ABI view of this list so a loop is
                 // required to lower element-by-element.
                 self.ins().local_get(l_ptr.idx);
                 self.ins().i32_eqz();
+
                 self.ins().if_(BlockType::Empty);
-                {
-                    self.ins().i32_const(0);
-                    let l_index = self.local_set_new_tmp(ValType::I32);
-
-                    self.ins().i32_const(0);
-                    self.ins().i32_const(0);
-                    self.ins().i32_const(align.try_into().unwrap());
-                    self.ins().local_get(l_len.idx);
-                    self.ins().i32_const(size.try_into().unwrap());
-                    self.ins().i32_mul();
-                    let l_byte_size = self.local_tee_new_tmp(ValType::I32);
-                    self.ins().call(cabi_realloc);
-                    let l_elem_addr = self.local_tee_new_tmp(ValType::I32);
-                    self.ins().local_set(l_ptr.idx);
-
-                    // Loop over each element of the list.
-                    self.ins().loop_(BlockType::Empty);
-                    {
-                        // Entry loop condition, `l_index != l_len`
-                        self.ins().local_get(l_index.idx);
-                        self.ins().local_get(l_len.idx);
-                        self.ins().i32_ne();
-                        self.ins().if_(BlockType::Empty);
-                        {
-                            // Get the `l_index`th element from `l_list`
-                            self.local_get_ctx();
-                            self.ins().i32_const(list_index.try_into().unwrap());
-                            self.ins().call(pop_iter_next);
-
-                            // Lower the list element
-                            self.lower(
-                                *t,
-                                &AbiLoc::Memory(Memory {
-                                    addr: TempLocal::new(l_elem_addr.idx, ValType::I32),
-                                    offset: 0,
-                                }),
-                            );
-
-                            // Increment the `l_index` counter
-                            self.ins().local_get(l_index.idx);
-                            self.ins().i32_const(1);
-                            self.ins().i32_add();
-                            self.ins().local_set(l_index.idx);
-
-                            // Increment the `l_elem_addr` counter
-                            self.ins().local_get(l_elem_addr.idx);
-                            self.ins().i32_const(size.try_into().unwrap());
-                            self.ins().i32_add();
-                            self.ins().local_set(l_elem_addr.idx);
-
-                            // Continue the loop.
-                            self.ins().br(1);
-                        }
-                        self.ins().end();
-                    }
-                    self.ins().end();
-
-                    self.defer_deallocate_lowered_list(&l_ptr, &l_byte_size, align);
-
-                    self.local_get_ctx();
-                    self.ins().i32_const(list_index.try_into().unwrap());
-                    self.ins().call(pop_iter);
-
-                    self.free_temp_local(l_index);
-                    self.free_temp_local(l_elem_addr);
-                    self.free_temp_local(l_byte_size);
-                }
+                self.lower_list_or_map(list_index, &[*t], &l_ptr, &l_len, pop_iter_next, pop_iter);
                 self.ins().end();
 
                 self.ins().local_get(l_ptr.idx);
@@ -948,15 +1039,159 @@ impl<'a> FunctionCompiler<'a> {
 
             // TODO: expand inline? Use a loop if `len` is too big? How much to
             // share with lowering a list above? Deal with it later.
-            TypeDefKind::FixedSizeList(t, len) => {
+            TypeDefKind::FixedLengthList(t, len) => {
                 let _ = (t, len);
-                todo!("fixed-size-list")
+                todo!("fixed-length-list")
+            }
+
+            TypeDefKind::Map(k, v) => {
+                let metadata::Type::Map(map_index) = ty else {
+                    unreachable!()
+                };
+                let pop_map = self.adapter.intrinsics().pop_map;
+                let pop_map_iter_next = self.adapter.intrinsics().pop_map_iter_next;
+                let pop_map_iter = self.adapter.intrinsics().pop_map_iter;
+                let (dst_ptr, dst_len) = dest.split_ptr_len();
+
+                self.local_get_ctx();
+                self.ins().i32_const(map_index.try_into().unwrap());
+                self.ins().call(pop_map);
+                let l_len = self.local_set_new_tmp(ValType::I32);
+                let l_ptr = self.gen_temp_local(ValType::I32);
+
+                self.lower_list_or_map(
+                    map_index,
+                    &[*k, *v],
+                    &l_ptr,
+                    &l_len,
+                    pop_map_iter_next,
+                    pop_map_iter,
+                );
+
+                self.ins().local_get(l_ptr.idx);
+                self.store_scalar_from_top_of_stack(&dst_ptr, ValType::I32, 2);
+                self.ins().local_get(l_len.idx);
+                self.store_scalar_from_top_of_stack(&dst_len, ValType::I32, 2);
+
+                self.free_temp_local(l_len);
+                self.free_temp_local(l_ptr);
             }
 
             // Should not be possible to hit during lowering.
             TypeDefKind::Resource => unreachable!(),
             TypeDefKind::Unknown => unreachable!(),
         }
+    }
+
+    fn element_info(&self, element_types: &[Type]) -> ElementInfo {
+        let mut increments = Vec::with_capacity(element_types.len());
+        let mut size = ArchitectureSize::default();
+        let mut align = Alignment::default();
+        let mut previous_size = None::<ArchitectureSize>;
+        for element_type in element_types {
+            let element_align = self.adapter.sizes.align(element_type);
+            size = wit_parser::align_to_arch(size, element_align);
+            if let Some(previous_size) = previous_size {
+                increments.push(size.size_wasm32() - previous_size.size_wasm32());
+            }
+            previous_size = Some(size);
+            size += self.adapter.sizes.size(element_type);
+            align = element_align.max(align);
+        }
+        size = wit_parser::align_to_arch(size, align);
+        if let Some(previous_size) = previous_size {
+            increments.push(size.size_wasm32() - previous_size.size_wasm32());
+        }
+        ElementInfo {
+            increments,
+            size: size.size_wasm32(),
+            align: align.align_wasm32(),
+        }
+    }
+
+    fn lower_list_or_map(
+        &mut self,
+        type_index: usize,
+        element_types: &[Type],
+        l_ptr: &TempLocal,
+        l_len: &TempLocal,
+        pop_iter_next: u32,
+        pop_iter: u32,
+    ) {
+        let cabi_realloc = self.adapter.intrinsics().cabi_realloc;
+        let ElementInfo {
+            increments,
+            size,
+            align,
+        } = self.element_info(element_types);
+
+        self.ins().i32_const(0);
+        let l_index = self.local_set_new_tmp(ValType::I32);
+
+        self.ins().i32_const(0);
+        self.ins().i32_const(0);
+        self.ins().i32_const(align.try_into().unwrap());
+        self.ins().local_get(l_len.idx);
+        self.ins().i32_const(size.try_into().unwrap());
+        self.ins().i32_mul();
+        let l_byte_size = self.local_tee_new_tmp(ValType::I32);
+        self.ins().call(cabi_realloc);
+        let l_elem_addr = self.local_tee_new_tmp(ValType::I32);
+        self.ins().local_set(l_ptr.idx);
+
+        // Loop over each element of the list or map.
+        self.ins().loop_(BlockType::Empty);
+        {
+            // Entry loop condition, `l_index != l_len`
+            self.ins().local_get(l_index.idx);
+            self.ins().local_get(l_len.idx);
+            self.ins().i32_ne();
+            self.ins().if_(BlockType::Empty);
+            {
+                // Get the `l_index`th elements from `l_list`
+                self.local_get_ctx();
+                self.ins().i32_const(type_index.try_into().unwrap());
+                self.ins().call(pop_iter_next);
+
+                // Lower the list elements
+                for (&ty, &increment) in element_types.iter().zip(&increments) {
+                    self.lower(
+                        ty,
+                        &AbiLoc::Memory(Memory {
+                            addr: TempLocal::new(l_elem_addr.idx, ValType::I32),
+                            offset: 0,
+                        }),
+                    );
+
+                    // Increment the `l_elem_addr` counter
+                    self.ins().local_get(l_elem_addr.idx);
+                    self.ins().i32_const(increment.try_into().unwrap());
+                    self.ins().i32_add();
+                    self.ins().local_set(l_elem_addr.idx);
+                }
+
+                // Increment the `l_index` counter
+                self.ins().local_get(l_index.idx);
+                self.ins().i32_const(1);
+                self.ins().i32_add();
+                self.ins().local_set(l_index.idx);
+
+                // Continue the loop.
+                self.ins().br(1);
+            }
+            self.ins().end();
+        }
+        self.ins().end();
+
+        self.defer_deallocate_lowered_list(&l_ptr, &l_byte_size, align);
+
+        self.local_get_ctx();
+        self.ins().i32_const(type_index.try_into().unwrap());
+        self.ins().call(pop_iter);
+
+        self.free_temp_local(l_index);
+        self.free_temp_local(l_elem_addr);
+        self.free_temp_local(l_byte_size);
     }
 
     fn pop_record<'b>(
@@ -1181,24 +1416,24 @@ impl<'a> FunctionCompiler<'a> {
     fn lift(&mut self, src: &AbiLoc<'_>, ty: Type) {
         let i = self.adapter.intrinsics();
         match ty {
-            Type::Bool => self.push_scalar(src, ValType::I32, i.push_bool, 0),
-            Type::Char => self.push_scalar(src, ValType::I32, i.push_char, 2),
-            Type::U8 => self.push_scalar(src, ValType::I32, i.push_u8, 0),
-            Type::S8 => self.push_scalar(src, ValType::I32, i.push_s8, 0),
-            Type::U16 => self.push_scalar(src, ValType::I32, i.push_u16, 1),
-            Type::S16 => self.push_scalar(src, ValType::I32, i.push_s16, 1),
-            Type::U32 => self.push_scalar(src, ValType::I32, i.push_u32, 2),
-            Type::S32 => self.push_scalar(src, ValType::I32, i.push_s32, 2),
-            Type::U64 => self.push_scalar(src, ValType::I64, i.push_u64, 3),
-            Type::S64 => self.push_scalar(src, ValType::I64, i.push_s64, 3),
-            Type::F32 => self.push_scalar(src, ValType::F32, i.push_f32, 2),
-            Type::F64 => self.push_scalar(src, ValType::F64, i.push_f64, 3),
+            Type::Bool => self.push_scalar(src, ValType::I32, i.push_bool, 0, false),
+            Type::Char => self.push_scalar(src, ValType::I32, i.push_char, 2, false),
+            Type::U8 => self.push_scalar(src, ValType::I32, i.push_u8, 0, false),
+            Type::S8 => self.push_scalar(src, ValType::I32, i.push_s8, 0, true),
+            Type::U16 => self.push_scalar(src, ValType::I32, i.push_u16, 1, false),
+            Type::S16 => self.push_scalar(src, ValType::I32, i.push_s16, 1, true),
+            Type::U32 => self.push_scalar(src, ValType::I32, i.push_u32, 2, false),
+            Type::S32 => self.push_scalar(src, ValType::I32, i.push_s32, 2, true),
+            Type::U64 => self.push_scalar(src, ValType::I64, i.push_u64, 3, false),
+            Type::S64 => self.push_scalar(src, ValType::I64, i.push_s64, 3, true),
+            Type::F32 => self.push_scalar(src, ValType::F32, i.push_f32, 2, false),
+            Type::F64 => self.push_scalar(src, ValType::F64, i.push_f64, 3, false),
             Type::String => {
                 let push_string = i.push_string;
                 let (src_ptr, src_len) = src.split_ptr_len();
                 self.local_get_ctx();
-                self.load_abi_loc(&src_ptr, ValType::I32, 2);
-                self.load_abi_loc(&src_len, ValType::I32, 2);
+                self.load_abi_loc(&src_ptr, ValType::I32, 2, false);
+                self.load_abi_loc(&src_len, ValType::I32, 2, false);
                 self.ins().call(push_string);
             }
             Type::ErrorContext => todo!("error-context"),
@@ -1286,9 +1521,9 @@ impl<'a> FunctionCompiler<'a> {
 
             // TODO: expand inline? Use a loop if `len` is too big? How much to
             // share with lowering a list above? Deal with it later.
-            TypeDefKind::FixedSizeList(t, len) => {
+            TypeDefKind::FixedLengthList(t, len) => {
                 let _ = (t, len);
-                todo!("fixed-size-list")
+                todo!("fixed-length-list")
             }
 
             // Variant-like items all go through the `lift_variant` helper.
@@ -1327,21 +1562,17 @@ impl<'a> FunctionCompiler<'a> {
                 let metadata::Type::List(list_index) = ty else {
                     unreachable!()
                 };
-                let elem_size = self.adapter.sizes.size(t).size_wasm32();
-                let elem_align = self.adapter.sizes.align(t).align_wasm32();
-                let list_index = i32::try_from(list_index).unwrap();
                 let push_list = i.push_list;
                 let list_append = i.list_append;
-                let dealloc_bytes = i.dealloc_bytes;
                 let (src_ptr, src_len) = src.split_ptr_len();
 
                 // Give the interpreter to lift the list exactly as-is and take
                 // ownership of the allocation.
                 self.local_get_ctx();
-                self.ins().i32_const(list_index);
-                self.load_abi_loc(&src_ptr, ValType::I32, 2);
+                self.ins().i32_const(list_index.try_into().unwrap());
+                self.load_abi_loc(&src_ptr, ValType::I32, 2, false);
                 let l_ptr = self.local_tee_new_tmp(ValType::I32);
-                self.load_abi_loc(&src_len, ValType::I32, 2);
+                self.load_abi_loc(&src_len, ValType::I32, 2, false);
                 let l_len = self.local_tee_new_tmp(ValType::I32);
                 self.ins().call(push_list);
 
@@ -1349,70 +1580,30 @@ impl<'a> FunctionCompiler<'a> {
                 // lifted manually element-by-element.
                 self.ins().i32_eqz();
                 self.ins().if_(BlockType::Empty);
-                {
-                    // Prep deallocation of the list after the loop by saving
-                    // off the pointer/byte size.
-                    self.ins().local_get(l_len.idx);
-                    self.ins().i32_const(elem_size.try_into().unwrap());
-                    self.ins().i32_mul();
-                    let l_byte_size = self.local_set_new_tmp(ValType::I32);
-                    self.ins().local_get(l_ptr.idx);
-                    let l_ptr_to_free = self.local_set_new_tmp(ValType::I32);
-
-                    // Using `l_len` as the loop counter, element-by-element
-                    // lift from the list and push into the list.
-                    self.ins().loop_(BlockType::Empty);
-                    {
-                        self.ins().local_get(l_len.idx);
-                        self.ins().if_(BlockType::Empty);
-                        {
-                            // Lift this list element from memory into a local
-                            let src = AbiLoc::Memory(Memory {
-                                addr: TempLocal::new(l_ptr.idx, l_ptr.ty),
-                                offset: 0,
-                            });
-                            self.lift(&src, *t);
-
-                            // Push the lifted element onto the list. Note that
-                            // this takes and returns the list.
-                            self.local_get_ctx();
-                            self.ins().i32_const(list_index);
-                            self.ins().call(list_append);
-
-                            // decrement the length counter
-                            self.ins().local_get(l_len.idx);
-                            self.ins().i32_const(1);
-                            self.ins().i32_sub();
-                            self.ins().local_set(l_len.idx);
-
-                            // increment the pointer
-                            self.ins().local_get(l_ptr.idx);
-                            self.ins().i32_const(elem_size.try_into().unwrap());
-                            self.ins().i32_add();
-                            self.ins().local_set(l_ptr.idx);
-
-                            self.ins().br(1);
-                        }
-                        self.ins().end();
-                    }
-                    self.ins().end();
-
-                    // The canonical ABI representation of this list is no
-                    // longer needed, so discard it.
-                    self.ins().local_get(l_byte_size.idx);
-                    self.ins().if_(BlockType::Empty);
-                    {
-                        self.ins().local_get(l_ptr_to_free.idx);
-                        self.ins().local_get(l_byte_size.idx);
-                        self.ins().i32_const(elem_align.try_into().unwrap());
-                        self.ins().call(dealloc_bytes);
-                    }
-                    self.ins().end();
-
-                    self.free_temp_local(l_byte_size);
-                    self.free_temp_local(l_ptr_to_free);
-                }
+                self.lift_list_or_map(list_index, &[*t], &l_ptr, &l_len, list_append);
                 self.ins().end();
+
+                self.free_temp_local(l_ptr);
+                self.free_temp_local(l_len);
+            }
+
+            TypeDefKind::Map(k, v) => {
+                let metadata::Type::Map(map_index) = ty else {
+                    unreachable!()
+                };
+                let push_map = i.push_map;
+                let map_append = i.map_append;
+                let (src_ptr, src_len) = src.split_ptr_len();
+
+                self.local_get_ctx();
+                self.ins().i32_const(map_index.try_into().unwrap());
+                self.load_abi_loc(&src_ptr, ValType::I32, 2, false);
+                let l_ptr = self.local_set_new_tmp(ValType::I32);
+                self.load_abi_loc(&src_len, ValType::I32, 2, false);
+                let l_len = self.local_tee_new_tmp(ValType::I32);
+                self.ins().call(push_map);
+
+                self.lift_list_or_map(map_index, &[*k, *v], &l_ptr, &l_len, map_append);
 
                 self.free_temp_local(l_ptr);
                 self.free_temp_local(l_len);
@@ -1422,6 +1613,87 @@ impl<'a> FunctionCompiler<'a> {
             TypeDefKind::Resource => unreachable!(),
             TypeDefKind::Unknown => unreachable!(),
         }
+    }
+
+    fn lift_list_or_map(
+        &mut self,
+        type_index: usize,
+        element_types: &[Type],
+        l_ptr: &TempLocal,
+        l_len: &TempLocal,
+        list_append: u32,
+    ) {
+        let dealloc_bytes = self.adapter.intrinsics().dealloc_bytes;
+        let ElementInfo {
+            increments,
+            size,
+            align,
+        } = self.element_info(element_types);
+
+        // Prep deallocation of the list or map after the loop by saving off the
+        // pointer/byte size.
+        self.ins().local_get(l_len.idx);
+        self.ins().i32_const(size.try_into().unwrap());
+        self.ins().i32_mul();
+        let l_byte_size = self.local_set_new_tmp(ValType::I32);
+        self.ins().local_get(l_ptr.idx);
+        let l_ptr_to_free = self.local_set_new_tmp(ValType::I32);
+
+        // Using `l_len` as the loop counter, element-by-element lift from the
+        // list or map and push into it.
+        self.ins().loop_(BlockType::Empty);
+        {
+            self.ins().local_get(l_len.idx);
+            self.ins().if_(BlockType::Empty);
+            {
+                for (&ty, &increment) in element_types.iter().zip(&increments) {
+                    // Lift this list or map element from memory into a local
+                    let src = AbiLoc::Memory(Memory {
+                        addr: TempLocal::new(l_ptr.idx, l_ptr.ty),
+                        offset: 0,
+                    });
+                    self.lift(&src, ty);
+
+                    // increment the pointer
+                    self.ins().local_get(l_ptr.idx);
+                    self.ins().i32_const(increment.try_into().unwrap());
+                    self.ins().i32_add();
+                    self.ins().local_set(l_ptr.idx);
+                }
+
+                // Push the lifted elements onto the list or map.
+                self.local_get_ctx();
+                self.ins().i32_const(type_index.try_into().unwrap());
+                self.ins().call(list_append);
+
+                // decrement the length counter
+                self.ins().local_get(l_len.idx);
+                self.ins().i32_const(1);
+                self.ins().i32_sub();
+                self.ins().local_set(l_len.idx);
+
+                self.ins().br(1);
+            }
+            self.ins().end();
+        }
+        self.ins().end();
+
+        // The canonical ABI representation of this list or map is no longer
+        // needed, so discard it.
+        self.ins().local_get(l_byte_size.idx);
+        self.ins().if_(BlockType::Empty);
+        {
+            self.local_get_ctx();
+            self.ins().local_get(l_ptr_to_free.idx);
+            self.ins().local_get(l_byte_size.idx);
+            self.ins().i32_const(align.try_into().unwrap());
+            self.ins().i32_const(0);
+            self.ins().call(dealloc_bytes);
+        }
+        self.ins().end();
+
+        self.free_temp_local(l_byte_size);
+        self.free_temp_local(l_ptr_to_free);
     }
 
     fn push_record<'b>(
@@ -1473,7 +1745,7 @@ impl<'a> FunctionCompiler<'a> {
                 let payload0 = iter.next().unwrap();
                 let payload1 = iter.next().unwrap();
 
-                self.load_abi_loc(&discr_src, ValType::I32, tag_size_log2);
+                self.load_abi_loc(&discr_src, ValType::I32, tag_size_log2, false);
                 self.ins().if_(BlockType::Empty);
                 {
                     lift_payload(self, payload1);
@@ -1506,7 +1778,7 @@ impl<'a> FunctionCompiler<'a> {
 
                 // Block to jump out of
                 self.ins().block(BlockType::Empty);
-                self.load_abi_loc(&discr_src, ValType::I32, tag_size_log2);
+                self.load_abi_loc(&discr_src, ValType::I32, tag_size_log2, false);
                 self.ins().br_table(1..(n + 1) as u32, 0);
                 self.ins().end();
 
@@ -1541,17 +1813,24 @@ impl<'a> FunctionCompiler<'a> {
     ) {
         self.local_get_ctx();
         self.ins().i32_const(type_index.try_into().unwrap());
-        self.load_abi_loc(src, ValType::I32, size_log2);
+        self.load_abi_loc(src, ValType::I32, size_log2, false);
         self.ins().call(push_intrinsic);
     }
 
-    fn push_scalar(&mut self, src: &AbiLoc<'_>, ty: ValType, push_intrinsic: u32, size_log2: u32) {
+    fn push_scalar(
+        &mut self,
+        src: &AbiLoc<'_>,
+        ty: ValType,
+        push_intrinsic: u32,
+        size_log2: u32,
+        signed: bool,
+    ) {
         self.local_get_ctx();
-        self.load_abi_loc(src, ty, size_log2);
+        self.load_abi_loc(src, ty, size_log2, signed);
         self.ins().call(push_intrinsic);
     }
 
-    fn load_abi_loc(&mut self, src: &AbiLoc<'_>, ty: ValType, size_log2: u32) {
+    fn load_abi_loc(&mut self, src: &AbiLoc<'_>, ty: ValType, size_log2: u32, signed: bool) {
         match src {
             AbiLoc::Stack([local]) => {
                 self.ins().local_get(local.idx);
@@ -1600,7 +1879,9 @@ impl<'a> FunctionCompiler<'a> {
                 self.ins().local_get(mem.addr.idx);
                 let memarg = mem.memarg(size_log2);
                 match (ty, size_log2) {
+                    (ValType::I32, 0) if signed => self.ins().i32_load8_s(memarg),
                     (ValType::I32, 0) => self.ins().i32_load8_u(memarg),
+                    (ValType::I32, 1) if signed => self.ins().i32_load16_s(memarg),
                     (ValType::I32, 1) => self.ins().i32_load16_u(memarg),
                     (ValType::I32, 2) => self.ins().i32_load(memarg),
                     (ValType::I64, 3) => self.ins().i64_load(memarg),
@@ -1649,77 +1930,42 @@ impl<'a> FunctionCompiler<'a> {
         l_byte_size: &TempLocal,
         align: usize,
     ) {
-        let sp = self.adapter.stack_pointer();
-        assert!(self.using_temp_stack == 0);
-
-        let num_lists = if self.num_dynamic_lists_to_free.is_some() {
-            self.num_dynamic_lists_to_free.as_ref().unwrap().idx
-        } else {
-            self.ins().i32_const(0);
-            let tmp = self.local_set_new_tmp(ValType::I32);
-            let ret = tmp.idx;
-            self.num_dynamic_lists_to_free = Some(tmp);
-            ret
-        };
+        let dealloc_bytes = self.adapter.intrinsics().dealloc_bytes;
 
         // Only defer a cleanup if this list is of nonzero size.
         self.ins().local_get(l_byte_size.idx);
         self.ins().if_(BlockType::Empty);
         {
-            // Increase the number of lists to deallocate
-            self.ins().local_get(num_lists);
-            self.ins().i32_const(1);
-            self.ins().i32_add();
-            self.ins().local_set(num_lists);
-
-            // Store the ptr/size/align onto the stack after allocating 16 more
-            // bytes of stack space. (16 instead of 12 to keep the stack
-            // aligned)
-            self.ins().global_get(sp);
-            self.ins().i32_const(16);
-            self.ins().i32_sub();
-            let addr = self.local_tee_new_tmp(ValType::I32);
-            self.ins().global_set(sp);
-
-            let memarg = |offset| MemArg {
-                memory_index: 0,
-                offset,
-                align: 2,
-            };
-            self.ins().local_get(addr.idx);
+            self.local_get_ctx();
             self.ins().local_get(l_ptr.idx);
-            self.ins().i32_store(memarg(0));
-            self.ins().local_get(addr.idx);
             self.ins().local_get(l_byte_size.idx);
-            self.ins().i32_store(memarg(4));
-            self.ins().local_get(addr.idx);
             self.ins().i32_const(align.try_into().unwrap());
-            self.ins().i32_store(memarg(8));
-
-            self.free_temp_local(addr);
+            self.ins().i32_const(1);
+            self.ins().call(dealloc_bytes);
         }
         self.ins().end();
     }
 
-    fn with_temp_stack(&mut self, size: usize, f: impl FnOnce(&mut Self, &TempLocal)) {
-        self.using_temp_stack += 1;
-        let sp = self.adapter.stack_pointer();
+    fn get_sp(&mut self) {
+        match self.adapter.stack_pointer.unwrap() {
+            ImportedStackPointer::Global(g) => {
+                self.ins().global_get(g);
+            }
+            ImportedStackPointer::TaskContext { get, .. } => {
+                self.ins().call(get);
+            }
+        }
+    }
 
-        self.ins().global_get(sp);
-        self.ins().i32_const(size.try_into().unwrap());
-        self.ins().i32_sub();
-        let tmp = self.local_tee_new_tmp(ValType::I32);
-        self.ins().global_set(sp);
-
-        f(self, &tmp);
-
-        self.ins().local_get(tmp.idx);
-        self.ins().i32_const(size.try_into().unwrap());
-        self.ins().i32_add();
-        self.ins().global_set(sp);
-
-        self.using_temp_stack -= 1;
-        self.free_temp_local(tmp);
+    fn set_sp(&mut self) {
+        match self.adapter.stack_pointer.unwrap() {
+            ImportedStackPointer::Global(g) => {
+                self.ins().global_set(g);
+            }
+            ImportedStackPointer::TaskContext { set, .. } => {
+                self.ins().call(set);
+            }
+        }
     }
 }
 
@@ -1727,6 +1973,7 @@ struct StackFrame {
     size: u32,
     abi_param_offset: Option<u32>,
     retptr_offset: Option<u32>,
+    stack_temp_offset: Option<u32>,
 }
 
 impl StackFrame {
@@ -1822,7 +2069,7 @@ impl Memory {
         MemArg {
             offset: u64::from(self.offset),
             align,
-            memory_index: 0,
+            ..MEMARG_32
         }
     }
 

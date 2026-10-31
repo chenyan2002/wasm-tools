@@ -147,7 +147,7 @@ impl CoreType {
                         ModuleTypeDef::Import(imp) => {
                             enc_mod_ty.import(
                                 &imp.module,
-                                &imp.field,
+                                &imp.name,
                                 crate::core::encode::translate_entity_type(&imp.entity_type),
                             );
                         }
@@ -229,11 +229,7 @@ impl DefinedType {
                 enc.record(ty.fields.iter().map(|(name, ty)| (name.as_str(), *ty)));
             }
             Self::Variant(ty) => {
-                enc.variant(
-                    ty.cases
-                        .iter()
-                        .map(|(name, ty, refines)| (name.as_str(), *ty, *refines)),
-                );
+                enc.variant(ty.cases.iter().map(|(name, ty)| (name.as_str(), *ty)));
             }
             Self::List(ty) => {
                 enc.list(ty.elem_ty);

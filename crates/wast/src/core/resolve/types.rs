@@ -69,8 +69,10 @@ impl<'a> Expander<'a> {
             ModuleField::Type(_) => {}
             ModuleField::Rec(_) => {}
 
-            ModuleField::Import(i) => {
-                self.expand_item_sig(&mut i.item);
+            ModuleField::Import(imports) => {
+                for sig in imports.unique_sigs_mut() {
+                    self.expand_item_sig(sig);
+                }
             }
             ModuleField::Func(f) => {
                 self.expand_type_use(&mut f.ty);
@@ -122,7 +124,7 @@ impl<'a> Expander<'a> {
 
     fn expand_item_sig(&mut self, item: &mut ItemSig<'a>) {
         match &mut item.kind {
-            ItemKind::Func(t) | ItemKind::Tag(TagType::Exception(t)) => {
+            ItemKind::Func(t) | ItemKind::FuncExact(t) | ItemKind::Tag(TagType::Exception(t)) => {
                 self.expand_type_use(t);
             }
             ItemKind::Global(_) | ItemKind::Table(_) | ItemKind::Memory(_) => {}
@@ -137,11 +139,11 @@ impl<'a> Expander<'a> {
 
     fn expand_instr(&mut self, instr: &mut Instruction<'a>) {
         match instr {
-            Instruction::Block(bt)
-            | Instruction::If(bt)
-            | Instruction::Loop(bt)
-            | Instruction::Try(bt)
-            | Instruction::TryTable(TryTable { block: bt, .. }) => {
+            Instruction::block(bt)
+            | Instruction::if_(bt)
+            | Instruction::loop_(bt)
+            | Instruction::try_(bt)
+            | Instruction::try_table(TryTable { block: bt, .. }) => {
                 // No expansion necessary, a type reference is already here.
                 // We'll verify that it's the same as the inline type, if any,
                 // later.
@@ -174,7 +176,7 @@ impl<'a> Expander<'a> {
                 }
                 self.expand_type_use(&mut bt.ty);
             }
-            Instruction::CallIndirect(c) | Instruction::ReturnCallIndirect(c) => {
+            Instruction::call_indirect(c) | Instruction::return_call_indirect(c) => {
                 self.expand_type_use(&mut c.ty);
             }
             _ => {}
@@ -263,7 +265,9 @@ impl<'a> TypeKey<'a> for FuncKey<'a> {
                 results: self.1.clone(),
             }),
             shared,
-            parent: None,
+            parents: Vec::new(),
+            descriptor: None,
+            describes: None,
             final_type: None,
         }
     }

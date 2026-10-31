@@ -7,8 +7,8 @@
     "\07"           ;; size of section
     "\01"           ;; number of segments
     "\00"           ;; flags=active
-    "\2e"           ;; i32.load16_s
-    "\3f"           ;; alignment
+    "\28"           ;; i32.load
+    "\0f"           ;; alignment
     "\00"           ;; offset
     "\0b"           ;; end
     "\00"           ;; data size

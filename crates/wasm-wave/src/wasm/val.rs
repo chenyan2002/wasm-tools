@@ -1,6 +1,5 @@
-use std::borrow::Cow;
-
 use crate::wasm::{WasmType, WasmTypeKind, WasmValueError};
+use alloc::{borrow::Cow, boxed::Box};
 
 /// The WasmValue trait may be implemented to represent values to be
 /// (de)serialized with WAVE, notably [`value::Value`](crate::value::Value).
@@ -179,6 +178,21 @@ pub trait WasmValue: Clone + Sized {
     ) -> Result<Self, WasmValueError> {
         unimplemented!()
     }
+    /// Returns a new WasmValue of the given type.
+    ///
+    /// The key-value pairs provided by `entries` are in their encoded order,
+    /// which the callee should preserve if it can. When parsing, keys are
+    /// unique: duplicate keys have already been merged, keeping the last
+    /// value at the position where the key first appears.
+    ///
+    /// # Panics
+    /// Panics if the type is not implemented (the trait default).
+    fn make_map(
+        ty: &Self::Type,
+        entries: impl IntoIterator<Item = (Self, Self)>,
+    ) -> Result<Self, WasmValueError> {
+        unimplemented!()
+    }
 
     /// Returns a new WasmValue of the given type.
     /// # Panics
@@ -187,61 +201,61 @@ pub trait WasmValue: Clone + Sized {
         unimplemented!()
     }
 
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_bool(&self) -> bool {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_s8(&self) -> i8 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_s16(&self) -> i16 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_s32(&self) -> i32 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_s64(&self) -> i64 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_u8(&self) -> u8 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_u16(&self) -> u16 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_u32(&self) -> u32 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_u64(&self) -> u64 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     ///
     /// The Rust `f32` type has many distinct NaN bitpatterns, however the
     /// component-model `f64` type only has a single NaN value, so this
@@ -252,7 +266,7 @@ pub trait WasmValue: Clone + Sized {
     fn unwrap_f32(&self) -> f32 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     ///
     /// The Rust `f64` type has many distinct NaN bitpatterns, however the
     /// component-model `f64` type only has a single NaN value, so this
@@ -263,13 +277,13 @@ pub trait WasmValue: Clone + Sized {
     fn unwrap_f64(&self) -> f64 {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_char(&self) -> char {
         unimplemented!()
     }
-    /// Returns the underlying value of the WasmValue, panicing if it's the wrong type.
+    /// Returns the underlying value of the WasmValue, panicking if it's the wrong type.
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_string(&self) -> Cow<'_, str> {
@@ -328,6 +342,17 @@ pub trait WasmValue: Clone + Sized {
     /// # Panics
     /// Panics if `self` is not of the right type.
     fn unwrap_handle(&self) -> Cow<'_, str> {
+        unimplemented!()
+    }
+
+    /// Returns an iterator of the key and value WasmValues of the map's
+    /// entries, in order.
+    ///
+    /// Entries may repeat keys; the writer merges them like parsing does.
+    ///
+    /// # Panics
+    /// Panics if `self` is not of the right type.
+    fn unwrap_map(&self) -> Box<dyn Iterator<Item = (Cow<'_, Self>, Cow<'_, Self>)> + '_> {
         unimplemented!()
     }
 }

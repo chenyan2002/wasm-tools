@@ -52,10 +52,10 @@
 //! The design and implementation strategy of wasm-smith is outlined in
 //! [this article](https://fitzgeraldnick.com/2020/08/24/writing-a-test-case-generator.html).
 
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs, missing_debug_implementations)]
 // Needed for the `instructions!` macro in `src/code_builder.rs`.
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 #[cfg(feature = "component-model")]
 mod component;
@@ -68,15 +68,9 @@ use arbitrary::{Result, Unstructured};
 pub use component::Component;
 pub use config::{Config, MemoryOffsetChoices};
 use std::{collections::HashSet, fmt::Write, str};
-use wasm_encoder::MemoryType;
 
 #[doc(hidden)]
 pub use config::InternalOptionalConfig;
-
-pub(crate) fn page_size(mem: &MemoryType) -> u32 {
-    const DEFAULT_WASM_PAGE_SIZE_LOG2: u32 = 16;
-    1 << mem.page_size_log2.unwrap_or(DEFAULT_WASM_PAGE_SIZE_LOG2)
-}
 
 /// Do something an arbitrary number of times.
 ///
@@ -150,27 +144,27 @@ pub(crate) fn unique_kebab_string(
 ) -> Result<String> {
     let size = std::cmp::min(u.arbitrary_len::<u8>()?, max_size);
     let mut name = String::with_capacity(size);
-    let mut require_alpha = true;
-    for _ in 0..size {
+    let mut empty_segment = true;
+    for i in 0..size {
         name.push(match u.int_in_range::<u8>(0..=36)? {
             x if (0..26).contains(&x) => {
-                require_alpha = false;
+                empty_segment = false;
                 (b'a' + x) as char
             }
             x if (26..36).contains(&x) => {
-                if require_alpha {
-                    require_alpha = false;
+                empty_segment = false;
+                if i == 0 {
                     (b'a' + (x - 26)) as char
                 } else {
                     (b'0' + (x - 26)) as char
                 }
             }
             x if x == 36 => {
-                if require_alpha {
-                    require_alpha = false;
+                if empty_segment {
+                    empty_segment = false;
                     'a'
                 } else {
-                    require_alpha = true;
+                    empty_segment = true;
                     '-'
                 }
             }

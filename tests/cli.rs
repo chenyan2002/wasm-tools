@@ -112,18 +112,35 @@ fn run_test_directive(
     exe: &Path,
     tempdir: &TempDir,
 ) -> Result<()> {
-    let mut cmd = Command::new(exe);
+    let mut cmd = new_command(exe, should_fail);
     let mut stdin = None;
+    let mut saw_subcommand = false;
     for arg in line.split_whitespace() {
         let arg = arg.replace("%tmpdir", tempdir.path().to_str().unwrap());
         if arg == "|" {
             let output = execute(&mut cmd, stdin.as_deref(), false)?;
             stdin = Some(output.stdout);
-            cmd = Command::new(exe);
+            cmd = new_command(exe, should_fail);
+            saw_subcommand = false;
+        } else if !saw_subcommand
+            && arg
+                .split_once('=')
+                .is_some_and(|(key, _)| !key.is_empty() && key.chars().all(is_env_var_char))
+        {
+            // Like a POSIX shell, `KEY=VALUE` arguments before the
+            // subcommand name set environment variables for this command
+            // only, e.g. `RUN: WAST_STRICT_COMPONENT_INDICES=0 wast %`.
+            let (key, value) = arg.split_once('=').unwrap();
+            cmd.env(key, value);
         } else if arg == "%" {
-            cmd.arg(test);
+            // Pass the test path with forward slashes so a command that echoes
+            // it back (such as `json-from-wast`'s `source_filename`) produces
+            // the same output on windows and unix.
+            cmd.arg(test.to_str().unwrap().replace("\\", "/"));
+            saw_subcommand = true;
         } else {
             cmd.arg(arg);
+            saw_subcommand = true;
         }
     }
 
@@ -151,11 +168,35 @@ fn run_test_directive(
     Ok(())
 }
 
+fn new_command(exe: &Path, should_fail: bool) -> Command {
+    let mut cmd = Command::new(exe);
+    // This test suite runs in strict component-model index syntax mode by
+    // default to ensure that all tests are ready for when strictness becomes
+    // the default. Tests exercising the legacy syntax opt out with an
+    // explicit `WAST_STRICT_COMPONENT_INDICES=0` prefix in their directive.
+    // Note that this is unconditionally set, rather than inherited, so test
+    // results don't depend on the environment variables of the shell that
+    // spawned the test suite.
+    cmd.env("WAST_STRICT_COMPONENT_INDICES", "1");
+
+    // When a test should fail we don't want to insert backtraces into blessed
+    // output so forcibly remove this env var.
+    if should_fail {
+        cmd.env_remove("RUST_BACKTRACE");
+    }
+    cmd
+}
+
+fn is_env_var_char(c: char) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'
+}
+
 fn execute(cmd: &mut Command, stdin: Option<&[u8]>, should_fail: bool) -> Result<Output> {
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let mut p = cmd
+        .env("COLUMNS", "80")
         .spawn()
         .with_context(|| format!("failed to spawn {cmd:?}"))?;
 
@@ -206,6 +247,7 @@ fn assert_output(bless: bool, output: &[u8], path: &Path, tempdir: &TempDir) -> 
     let mut output = String::from_utf8_lossy(output)
         .replace(tempdir, "%tmpdir")
         .replace("\\", "/")
+        .replace("wasm-tools.exe", "wasm-tools")
         .lines()
         .map(|line| {
             if let Some(start) = line.find("(processed-by \"wit-component\"") {

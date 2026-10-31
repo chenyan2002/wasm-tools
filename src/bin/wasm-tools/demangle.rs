@@ -9,6 +9,37 @@ use wasmparser::{KnownCustom, Name, NameSectionReader, Parser, Payload::*};
 /// module which otherwise uses the `name` section but doesn't run a demangler
 /// will use the demangled names since the `name` section will be replaced.
 #[derive(clap::Parser)]
+#[clap(after_help = "\
+Examples:
+
+Suppose foo.wasm has the following textual representation:
+
+(module
+  (func $do_not_demangle_me)
+  (func $_ZN4rustE)
+  (func $_Z3food)
+)
+
+The second two functions are mangled Rust symbol names.
+
+    # Demangle symbol names in foo.wasm and print the textual form of
+    # the output to stdout.
+    $ wasm-tools demangle -t foo.wasm
+(module
+  (type (;0;) (func))
+  (func $do_not_demangle_me (;0;) (type 0))
+  (func $rust (;1;) (type 0))
+  (func $\"foo(double)\" (;2;) (type 0))
+)
+
+    # Demangle symbol names in foo.wasm and save the binary output
+    # to foo-demangled.wasm.
+    $ wasm-tools demangle foo.wasm -o foo-demangled.wasm
+
+Exit status:
+    0 on success,
+    nonzero if the input file fails to parse.
+")]
 pub struct Opts {
     #[clap(flatten)]
     io: wasm_tools::InputOutput,
@@ -49,7 +80,7 @@ impl Opts {
             if let Some((id, range)) = payload.as_section() {
                 module.section(&RawSection {
                     id,
-                    data: &input[range],
+                    data: &input[range.start as usize..range.end as usize],
                 });
             }
         }
@@ -74,6 +105,10 @@ impl Opts {
                 Name::Label(names) => new_section.labels(&self.indirect_name_map(names)?),
                 Name::Field(names) => new_section.fields(&self.indirect_name_map(names)?),
                 Name::Tag(names) => new_section.tags(&self.name_map(names)?),
+                Name::Parameter(names) => new_section.parameters(&self.indirect_name_map(names)?),
+                Name::TagParameter(names) => {
+                    new_section.tag_parameters(&self.indirect_name_map(names)?)
+                }
                 Name::Unknown { .. } => bail!("unknown name section"),
             }
         }
@@ -86,10 +121,10 @@ impl Opts {
             let naming = naming?;
             let name = match rustc_demangle::try_demangle(naming.name) {
                 Ok(name) => name.to_string(),
-                Err(_) => match cpp_demangle::Symbol::new(naming.name) {
-                    Ok(name) => name.to_string(),
-                    Err(_) => naming.name.to_string(),
-                },
+                Err(_) => cpp_demangle::Symbol::new(naming.name)
+                    .ok()
+                    .and_then(|s| s.demangle().ok())
+                    .unwrap_or_else(|| naming.name.to_string()),
             };
             ret.append(naming.index, &name);
         }

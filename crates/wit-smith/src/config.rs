@@ -19,6 +19,22 @@ pub struct Config {
     pub max_files_per_package: usize,
     #[cfg_attr(feature = "clap", clap(long, default_value_t = Config::default().max_resource_items))]
     pub max_resource_items: usize,
+    #[cfg_attr(feature = "clap", clap(long = "async", default_value_t = Config::default().async_))]
+    pub async_: bool,
+    #[cfg_attr(feature = "clap", clap(long, default_value_t = Config::default().futures))]
+    pub futures: bool,
+    #[cfg_attr(feature = "clap", clap(long, default_value_t = Config::default().streams))]
+    pub streams: bool,
+    #[cfg_attr(feature = "clap", clap(long, default_value_t = Config::default().error_context))]
+    pub error_context: bool,
+    #[cfg_attr(feature = "clap", clap(long, default_value_t = Config::default().fixed_length_lists))]
+    pub fixed_length_lists: bool,
+    #[cfg_attr(feature = "clap", clap(long, default_value_t = Config::default().world_include))]
+    pub world_include: bool,
+    #[cfg_attr(feature = "clap", clap(long, default_value_t = Config::default().implements))]
+    pub implements: bool,
+    #[cfg_attr(feature = "clap", clap(long, default_value_t = Config::default().canonical_names))]
+    pub canonical_names: bool,
 }
 
 impl Default for Config {
@@ -32,6 +48,14 @@ impl Default for Config {
             max_type_parts: 10,
             max_files_per_package: 10,
             max_resource_items: 10,
+            async_: false,
+            futures: false,
+            streams: false,
+            error_context: false,
+            fixed_length_lists: false,
+            world_include: false,
+            implements: false,
+            canonical_names: false,
         }
     }
 }
@@ -47,6 +71,14 @@ impl Arbitrary<'_> for Config {
             max_pkg_items: u.int_in_range(1..=10)?,
             max_type_parts: u.int_in_range(1..=10)?,
             max_resource_items: u.int_in_range(0..=10)?,
+            async_: u.arbitrary()?,
+            futures: u.arbitrary()?,
+            streams: u.arbitrary()?,
+            error_context: u.arbitrary()?,
+            fixed_length_lists: u.arbitrary()?,
+            world_include: false,
+            implements: u.arbitrary()?,
+            canonical_names: u.arbitrary()?,
         })
     }
 }

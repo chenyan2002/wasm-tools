@@ -152,14 +152,14 @@
       "line": 104,
       "filename": "custom-page-sizes-invalid.20.wasm",
       "module_type": "binary",
-      "text": "memory types incompatible"
+      "text": "incompatible import type"
     },
     {
       "type": "assert_unlinkable",
       "line": 111,
       "filename": "custom-page-sizes-invalid.21.wasm",
       "module_type": "binary",
-      "text": "memory types incompatible"
+      "text": "incompatible import type"
     }
   ]
 }

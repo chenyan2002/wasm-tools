@@ -1,3 +1,10 @@
+use alloc::{
+    borrow::ToOwned,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+
 use crate::{
     WasmValue,
     value::ValueEnum,
@@ -34,6 +41,10 @@ pub fn from_wasm_type(ty: &impl WasmType) -> Option<Type> {
             Type::result(from_optional_wasm_type(ok)?, from_optional_wasm_type(err)?)
         }
         WasmTypeKind::Flags => Type::flags(ty.flags_names())?,
+        WasmTypeKind::Map => {
+            let (key, value) = ty.map_key_value_types()?;
+            Type::map(from_wasm_type(&key)?, from_wasm_type(&value)?)?
+        }
         _ => return None,
     })
 }
@@ -344,7 +355,7 @@ macro_rules! impl_tuple {
         $(
             impl<$($var: ValueTyped),*> ValueTyped for ($($var),*,) {
                 fn value_type() -> Type {
-                    Type::tuple(vec![$($var::value_type()),*]).unwrap()
+                    Type::tuple([$($var::value_type()),*].to_vec()).unwrap()
                 }
             }
 
@@ -355,7 +366,7 @@ macro_rules! impl_tuple {
                     $(
                         let $var = $var.into();
                     )*
-                    Value::make_tuple(&ty, vec![$($var),*]).unwrap()
+                    Value::make_tuple(&ty, [$($var),*].to_vec()).unwrap()
                 }
             }
             #[allow(non_snake_case)]
@@ -407,6 +418,8 @@ impl_tuple!(
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+
     use crate::value::{Type, Value};
 
     #[test]
@@ -424,6 +437,7 @@ mod tests {
             Type::option(Type::BOOL),
             Type::result(Some(Type::BOOL), None),
             Type::flags(["read", "write"]).unwrap(),
+            Type::map(Type::STRING, Type::list(Type::BOOL)).unwrap(),
         ] {
             let got = Type::from_wasm_type(&ty).unwrap();
             assert_eq!(got, ty);
@@ -440,7 +454,7 @@ mod tests {
             (f64::NEG_INFINITY.into(), "-inf"),
             ('x'.into(), "'x'"),
             ("str".into(), "\"str\""),
-            (vec![1, 2, 3].into(), "[1, 2, 3]"),
+            ([1, 2, 3].to_vec().into(), "[1, 2, 3]"),
             ([1, 2, 3].into(), "[1, 2, 3]"),
             (['a'; 3].into(), "['a', 'a', 'a']"),
             (Some(1).into(), "some(1)"),

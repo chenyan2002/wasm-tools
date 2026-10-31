@@ -1,4 +1,3 @@
-use crate::validate::CliFeatures;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rayon::prelude::*;
@@ -9,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str;
 use wasm_encoder::reencode::{Reencode, ReencodeComponent, RoundtripReencoder};
+use wasm_tools::CliFeatures;
 use wasm_tools::parse_binary_wasm;
 use wasmprinter::PrintFmtWrite;
 use wast::component::{Component, ComponentKind};
@@ -138,7 +138,7 @@ impl Opts {
             s.push_str("\n\n--------------------------------\n\n");
             s.push_str(&format!("{error:?}"));
         }
-        bail!("{}", s)
+        bail!("{s}")
     }
 
     fn read_wast(&self) -> Result<(&Path, String)> {
@@ -157,6 +157,10 @@ impl Opts {
     }
 
     fn test_wast_directive(&self, test: &Path, directive: WastDirective, idx: usize) -> Result<()> {
+        let is_custom = matches!(
+            directive,
+            WastDirective::AssertInvalidCustom { .. } | WastDirective::AssertMalformedCustom { .. }
+        );
         match directive {
             WastDirective::Module(mut module) | WastDirective::ModuleDefinition(mut module) => {
                 let actual = module.encode()?;
@@ -182,6 +186,11 @@ impl Opts {
                 span,
                 mut module,
                 message,
+            }
+            | WastDirective::AssertMalformedCustom {
+                span,
+                mut module,
+                message,
             } => {
                 // For `assert_malformed` it means that either converting this
                 // test case to binary should fail, or that parsing the binary
@@ -194,15 +203,20 @@ impl Opts {
                         return Ok(());
                     }
                 };
-                let mut parser = wasmparser::Parser::new(0);
-                parser.set_features(self.features.features());
-                if let Err(e) = parse_binary_wasm(parser, &bytes) {
+                let parser = self.parser();
+                if let Err(e) = parse_binary_wasm(parser, &bytes, is_custom) {
                     self.assert_error_matches(test, &format!("{e:?}"), message)?;
 
-                    // Make sure validator also rejects the module (not necessarily
-                    // with same error).
-                    if self.test_wasm_valid(test, &bytes).is_ok() {
-                        bail!("validator thought malformed example was valid")
+                    match (is_custom, self.test_wasm_valid(test, &bytes, false)) {
+                        // Malformed custom sections should still validate
+                        (true, Ok(_)) => {}
+                        // Malformed modules should not validate
+                        (false, Err(_)) => {}
+                        // Malformed custom sections that cause validation to
+                        // fail should not happen
+                        (true, Err(_)) => bail!("invalid custom section caused validation to fail"),
+                        // Malformed modules which validate should not happen
+                        (false, Ok(_)) => bail!("validator thought malformed module was valid"),
                     }
                     return Ok(());
                 }
@@ -241,16 +255,6 @@ impl Opts {
                     // due to the fact that wasmparser represents the AST
                     // differently.
                     "data count section required",
-                    // The upstream specification's tests have not been
-                    // adjusted for `shared-everything-threads` yet so some
-                    // flags which are valid with `shared-everything-threads`
-                    // are asserted as malformed. While we wait for upstream
-                    // tests to be adjusted to use a different flag bit in
-                    // their `assert_malformed` blocks this makes it easier to
-                    // implement validation in wasmparser. Effectively these
-                    // two error messages are swapped to `assert_invalid`.
-                    "malformed mutability",
-                    "integer too large",
                 ];
                 if self.assert(Assert::Permissive) && permissive_error_messages.contains(&message) {
                     return self.test_wast_directive(
@@ -271,28 +275,46 @@ impl Opts {
                 mut module,
                 message,
                 span: _,
+            }
+            | WastDirective::AssertInvalidCustom {
+                mut module,
+                message,
+                span: _,
             } => {
                 // ensure module parses successfully
                 let binary_wasm = module.encode()?;
-                let mut parser = wasmparser::Parser::new(0);
-                parser.set_features(self.features.features());
-                parse_binary_wasm(parser, &binary_wasm)?;
+                let parser = self.parser();
+
+                // For `assert_invalid` tests it should be the case that
+                // everything parses. If a wasmparser-specific
+                // implementation-limit is reached, however, then don't require
+                // a full parse and instead fall through to `test_wasm_valid`
+                // which will re-parse & validate. Otherwise though any parse
+                // error is a full failure of this test and propagates.
+                let mut test_roundtrip = true;
+                if let Err(e) = parse_binary_wasm(parser, &binary_wasm, true) {
+                    test_roundtrip = false;
+                    if !e.to_string().contains("implementation limit") {
+                        return Err(e);
+                    }
+                }
 
                 // ensure module round-trips successfully (but don't snapshot it)
-                let mut test_path = test.to_path_buf();
-                test_path.push(idx.to_string());
-                self.test_wasm_roundtrip(
-                    &test_path,
-                    &binary_wasm,
-                    expect_binary_roundtrip(&module),
-                    false,
-                )?;
+                if test_roundtrip {
+                    let mut test_path = test.to_path_buf();
+                    test_path.push(idx.to_string());
+                    self.test_wasm_roundtrip(
+                        &test_path,
+                        &binary_wasm,
+                        !is_custom && expect_binary_roundtrip(&module),
+                        false,
+                    )?;
+                }
 
                 // now, ensure that module is invalid
-                match self.test_wasm_valid(test, &binary_wasm) {
+                match self.test_wasm_valid(test, &binary_wasm, is_custom) {
                     Ok(_) => bail!(
-                        "encoded and validated successfully but should have failed with: {}",
-                        message,
+                        "encoded and validated successfully but should have failed with: {message}",
                     ),
                     Err(e) => self.assert_error_matches(test, &format!("{e:?}"), message)?,
                 }
@@ -356,7 +378,7 @@ impl Opts {
     /// If `roundtrip_binary` is `false` then it will not try to compare the
     /// original binary with the result of roundtripping through wasmprinter->wast.
     fn test_wasm(&self, test: &Path, contents: &[u8], roundtrip_binary: bool) -> Result<()> {
-        self.test_wasm_valid(test, contents)
+        self.test_wasm_valid(test, contents, true)
             .context("wasm isn't valid")?;
         self.test_wasm_roundtrip(test, contents, roundtrip_binary, true)
             .context("wasm did not roundtrip")
@@ -370,7 +392,7 @@ impl Opts {
         enable_snapshot: bool,
     ) -> Result<()> {
         // Test that we can print these bytes.
-        let text1 = wasmprinter::print_bytes(contents).context("failed to print wasm")?;
+        let text1 = self.print(contents, false)?;
         if enable_snapshot && self.assert(Assert::SnapshotPrint) {
             self.snapshot("print", test, &text1)
                 .context("failed to validate the `print` snapshot")?;
@@ -379,11 +401,7 @@ impl Opts {
         // Test that we can print these bytes with instructions in folded form.
         let mut text1_folded = String::new();
         if self.assert(Assert::TestFolded) {
-            let mut folding_printer = wasmprinter::Config::new();
-            folding_printer.fold_instructions(true);
-            folding_printer
-                .print(contents, &mut PrintFmtWrite(&mut text1_folded))
-                .context("failed to print wasm in folded form")?;
+            text1_folded = self.print(contents, true)?;
 
             if enable_snapshot && self.assert(Assert::SnapshotFolded) {
                 self.snapshot("print-folded", test, &text1_folded)
@@ -398,7 +416,7 @@ impl Opts {
 
         // Convert the text versions back to binary and compare to original
         let binary2 = wat::parse_str(&text1).context("failed to parse `wat` from `wasmprinter`")?;
-        let text2 = wasmprinter::print_bytes(&binary2).context("failed to print wasm")?;
+        let text2 = self.print(&binary2, false)?;
         if roundtrip_binary {
             self.binary_compare(&binary2, contents)
                 .context("failed to compare original binary with roundtrip through wasmparser->wasmprinter->wat")?;
@@ -412,18 +430,12 @@ impl Opts {
         if self.assert(Assert::TestFolded) {
             let binary2_from_folded = wat::parse_str(&text1_folded)
                 .context("failed to parse folded `wat` from `wasmprinter`")?;
-            let mut text2_folded = String::new();
-            let mut folding_printer = wasmprinter::Config::new();
-            folding_printer.fold_instructions(true);
-            folding_printer
-                .print(contents, &mut PrintFmtWrite(&mut text2_folded))
-                .context("failed to print wasm in folded form")?;
+            let text2_folded = self.print(contents, true)?;
             if roundtrip_binary {
                 self.binary_compare(&binary2_from_folded, contents)
                     .context("failed to compare original `wat` with roundtrip folded `wat`")?;
             }
-            let text3 =
-                wasmprinter::print_bytes(binary2_from_folded).context("failed to print wasm")?;
+            let text3 = self.print(&binary2_from_folded, false)?;
             if text1_folded != text2_folded {
                 anyhow::bail!(
                     "original folded print does not match roundtrip folded print\n{}",
@@ -442,14 +454,14 @@ impl Opts {
             if wasmparser::Parser::is_component(contents) {
                 let mut reencode = Default::default();
                 RoundtripReencoder
-                    .parse_component(&mut reencode, wasmparser::Parser::new(0), contents)
+                    .parse_component(&mut reencode, self.parser(), contents)
                     .context("failed to reencode module")?;
                 self.binary_compare(&reencode.finish(), contents)
                     .context("failed to compare reencoded module with original encoding")?;
             } else {
                 let mut reencode = Default::default();
                 RoundtripReencoder
-                    .parse_core_module(&mut reencode, wasmparser::Parser::new(0), contents)
+                    .parse_core_module(&mut reencode, self.parser(), contents)
                     .context("failed to reencode module")?;
                 self.binary_compare(&reencode.finish(), contents)
                     .context("failed to compare reencoded module with original encoding")?;
@@ -458,12 +470,36 @@ impl Opts {
         Ok(())
     }
 
+    /// Prints `contents` with `wasmprinter`, decoding it with respect to
+    /// `self.features`.
+    fn print(&self, contents: &[u8], fold_instructions: bool) -> Result<String> {
+        let mut config = wasmprinter::Config::new();
+        config.features(self.features.features());
+        config.fold_instructions(fold_instructions);
+        let mut text = String::new();
+        config
+            .print(contents, &mut PrintFmtWrite(&mut text))
+            .with_context(|| {
+                if fold_instructions {
+                    "failed to print wasm in folded form"
+                } else {
+                    "failed to print wasm"
+                }
+            })?;
+        Ok(text)
+    }
+
+    /// Creates a parser which decodes with respect to `self.features`.
+    fn parser(&self) -> wasmparser::Parser {
+        let mut parser = wasmparser::Parser::new(0);
+        parser.set_features(self.features.features());
+        parser
+    }
+
     /// Tests that `contents` is valid wasm binary with respect to
     /// `self.features`.
-    fn test_wasm_valid(&self, _test: &Path, contents: &[u8]) -> Result<()> {
-        let mut validator = wasmparser::Validator::new_with_features(self.features.features());
-        validator.validate_all(contents)?;
-        Ok(())
+    fn test_wasm_valid(&self, _test: &Path, contents: &[u8], validate_custom: bool) -> Result<()> {
+        wasm_tools::validate(self.features.features(), validate_custom, contents)
     }
 
     /// Test that the `wasmprinter`-printed bytes have "pretty" whitespace
@@ -579,7 +615,7 @@ impl Opts {
             msg.push_str("\nfailed to dump actual");
         }
 
-        bail!("{}", msg);
+        bail!("{msg}");
     }
 
     /// Run `wasm-tools dump` over the `bytes` provided.

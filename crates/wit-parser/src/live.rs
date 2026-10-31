@@ -1,8 +1,7 @@
 use crate::{
-    Function, FunctionKind, InterfaceId, Resolve, Type, TypeDef, TypeDefKind, TypeId, WorldId,
-    WorldItem,
+    Function, FunctionKind, IndexSet, InterfaceId, Resolve, Type, TypeDef, TypeDefKind, TypeId,
+    WorldId, WorldItem,
 };
-use indexmap::IndexSet;
 
 #[derive(Default)]
 pub struct LiveTypes {
@@ -95,7 +94,7 @@ pub trait TypeIdVisitor {
         match item {
             WorldItem::Interface { id, .. } => self.visit_interface(resolve, *id),
             WorldItem::Function(f) => self.visit_func(resolve, f),
-            WorldItem::Type(t) => self.visit_type_id(resolve, *t),
+            WorldItem::Type { id, .. } => self.visit_type_id(resolve, *id),
         }
     }
 
@@ -104,21 +103,27 @@ pub trait TypeIdVisitor {
             // This resource is live as it's attached to a static method but
             // it's not guaranteed to be present in either params or results, so
             // be sure to attach it here.
-            FunctionKind::Static(id) | FunctionKind::AsyncStatic(id) => {
-                self.visit_type_id(resolve, id)
-            }
+            FunctionKind::Static(id)
+            | FunctionKind::AsyncStatic(id)
+            | FunctionKind::StaticGetter(id)
+            | FunctionKind::StaticSetter(id) => self.visit_type_id(resolve, id),
 
             // The resource these are attached to is in the params/results, so
             // no need to re-add it here.
             FunctionKind::Method(_)
             | FunctionKind::AsyncMethod(_)
+            | FunctionKind::MethodGetter(_)
+            | FunctionKind::MethodSetter(_)
             | FunctionKind::Constructor(_) => {}
 
-            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {}
+            FunctionKind::Freestanding
+            | FunctionKind::AsyncFreestanding
+            | FunctionKind::Getter
+            | FunctionKind::Setter => {}
         }
 
-        for (_, ty) in func.params.iter() {
-            self.visit_type(resolve, ty);
+        for param in func.params.iter() {
+            self.visit_type(resolve, &param.ty);
         }
         if let Some(ty) = &func.result {
             self.visit_type(resolve, ty);
@@ -136,10 +141,14 @@ pub trait TypeIdVisitor {
         match &ty.kind {
             TypeDefKind::Type(t)
             | TypeDefKind::List(t)
-            | TypeDefKind::FixedSizeList(t, ..)
+            | TypeDefKind::FixedLengthList(t, ..)
             | TypeDefKind::Option(t)
             | TypeDefKind::Future(Some(t))
             | TypeDefKind::Stream(Some(t)) => self.visit_type(resolve, t),
+            TypeDefKind::Map(k, v) => {
+                self.visit_type(resolve, k);
+                self.visit_type(resolve, v);
+            }
             TypeDefKind::Handle(handle) => match handle {
                 crate::Handle::Own(ty) => self.visit_type_id(resolve, *ty),
                 crate::Handle::Borrow(ty) => self.visit_type_id(resolve, *ty),
@@ -189,6 +198,8 @@ pub trait TypeIdVisitor {
 #[cfg(test)]
 mod tests {
     use super::{LiveTypes, Resolve};
+    use alloc::string::String;
+    use alloc::vec::Vec;
 
     fn live(wit: &str, ty: &str) -> Vec<String> {
         let mut resolve = Resolve::default();

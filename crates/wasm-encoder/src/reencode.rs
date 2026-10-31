@@ -3,13 +3,9 @@
 //! The [`RoundtripReencoder`] allows encoding identical wasm to the parsed
 //! input.
 
-#[cfg(all(not(feature = "std"), core_error))]
-use core::error::Error as StdError;
-#[cfg(feature = "std")]
-use std::error::Error as StdError;
-
 use crate::CoreTypeEncoder;
 use core::convert::Infallible;
+use core::error::Error as StdError;
 
 #[cfg(feature = "component-model")]
 mod component;
@@ -69,7 +65,9 @@ pub trait Reencode {
         index: u32,
     ) -> Result<u32, Error<Self::Error>> {
         match kind {
-            wasmparser::ExternalKind::Func => self.function_index(index),
+            wasmparser::ExternalKind::Func | wasmparser::ExternalKind::FuncExact => {
+                self.function_index(index)
+            }
             wasmparser::ExternalKind::Table => self.table_index(index),
             wasmparser::ExternalKind::Memory => self.memory_index(index),
             wasmparser::ExternalKind::Global => self.global_index(index),
@@ -429,6 +427,16 @@ pub trait Reencode {
         utils::parse_import_section(self, imports, section)
     }
 
+    /// Parses a [`wasmparser::Imports`] and adds all of its contents to the
+    /// `import` section.
+    fn parse_imports(
+        &mut self,
+        import_section: &mut crate::ImportSection,
+        imports: wasmparser::Imports<'_>,
+    ) -> Result<(), Error<Self::Error>> {
+        utils::parse_imports(self, import_section, imports)
+    }
+
     /// Parses the single [`wasmparser::Import`] provided and adds it to the
     /// `import` section.
     fn parse_import(
@@ -584,13 +592,13 @@ pub enum Error<E = Infallible> {
     /// A core type definition was found in a component that's not supported.
     UnsupportedCoreTypeInComponent,
     /// There was an error when parsing.
-    ParseError(wasmparser::BinaryReaderError),
+    ParseError(wasmparser::Error),
     /// There was a user-defined error when re-encoding.
     UserError(E),
 }
 
-impl<E> From<wasmparser::BinaryReaderError> for Error<E> {
-    fn from(err: wasmparser::BinaryReaderError) -> Self {
+impl<E> From<wasmparser::Error> for Error<E> {
+    fn from(err: wasmparser::Error) -> Self {
         Self::ParseError(err)
     }
 }
@@ -623,7 +631,6 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
     }
 }
 
-#[cfg(any(feature = "std", core_error))]
 impl<E: 'static + StdError> StdError for Error<E> {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
@@ -651,7 +658,7 @@ impl Reencode for RoundtripReencoder {
 #[allow(missing_docs)] // FIXME
 pub mod utils {
     use super::{Error, Reencode};
-    use crate::{CoreTypeEncoder, Encode};
+    use crate::{CoreTypeEncoder, Encode, Imports};
     use alloc::vec::Vec;
     use core::ops::Range;
 
@@ -672,20 +679,21 @@ pub mod utils {
             reencoder.intersperse_section_hook(module, after, before)
         }
 
-        // Convert from `range` to a byte range within `data` while
-        // accounting for various offsets. Then create a
-        // `CodeSectionReader` (which notably the payload does not
-        // give us here) and recurse with that. This means that
-        // users overriding `parse_code_section` always get that
-        // function called.
-        let orig_offset = parser.offset() as usize;
-        let get_original_section = |range: Range<usize>| {
-            data.get(range.start - orig_offset..range.end - orig_offset)
-                .ok_or(Error::InvalidCodeSectionSize)
-        };
         let mut last_section = None;
 
-        for section in parser.parse_all(data) {
+        let start_offset = parser.offset();
+        // Convert from `range` to a byte range within `data` while
+        // accounting for various offsets.
+        let get_original_section = |range: Range<u64>| {
+            let start = range.start - start_offset;
+            let end = range.end - start_offset;
+            let Ok(end) = usize::try_from(end) else {
+                return Err(Error::InvalidCodeSectionSize);
+            };
+            let data_range = start as usize..end;
+            data.get(data_range).ok_or(Error::InvalidCodeSectionSize)
+        };
+        for section in parser.clone().parse_all(data) {
             match section? {
                 wasmparser::Payload::Version {
                     encoding: wasmparser::Encoding::Module,
@@ -825,7 +833,9 @@ pub mod utils {
                     reencoder.parse_data_section(&mut data, section)?;
                     module.section(&data);
                 }
-                wasmparser::Payload::CodeSectionStart { range, .. } => {
+                wasmparser::Payload::CodeSectionStart {
+                    unchecked_range, ..
+                } => {
                     handle_intersperse_section_hook(
                         reencoder,
                         module,
@@ -834,14 +844,12 @@ pub mod utils {
                     )?;
                     let mut codes = crate::CodeSection::new();
 
-                    // Convert from `range` to a byte range within `data` while
-                    // accounting for various offsets. Then create a
-                    // `CodeSectionReader` (which notably the payload does not
-                    // give us here) and recurse with that. This means that
-                    // users overriding `parse_code_section` always get that
-                    // function called.
-                    let section = get_original_section(range.clone())?;
-                    let reader = wasmparser::BinaryReader::new(section, range.start);
+                    // Crate a `CodeSectionReader` (which notably the payload
+                    // does not give us here) and recurse with that. This means
+                    // that users overriding `parse_code_section` always get
+                    // that function called.
+                    let section = get_original_section(unchecked_range.clone())?;
+                    let reader = parser.binary_reader(section, unchecked_range.start);
                     let section = wasmparser::CodeSectionReader::new(reader)?;
                     reencoder.parse_code_section(&mut codes, section)?;
                     module.section(&codes);
@@ -937,7 +945,23 @@ pub mod utils {
         Ok(crate::MemArg {
             offset: arg.offset,
             align: arg.align.into(),
-            memory_index: reencoder.memory_index(arg.memory)?,
+            target: match arg.target {
+                wasmparser::MemArgTarget::Memory(i) => {
+                    crate::MemArgTarget::Memory(reencoder.memory_index(i)?)
+                }
+                wasmparser::MemArgTarget::Array(ty) => {
+                    crate::MemArgTarget::Array(reencoder.type_index(ty)?)
+                }
+            },
+            ordering: match arg.ordering {
+                None => None,
+                Some(wasmparser::MemArgOrdering::Op(o)) => {
+                    Some(crate::MemArgOrdering::Op(reencoder.ordering(o)?))
+                }
+                Some(wasmparser::MemArgOrdering::Rmw(o)) => {
+                    Some(crate::MemArgOrdering::Rmw(reencoder.ordering(o)?))
+                }
+            },
         })
     }
 
@@ -1027,7 +1051,9 @@ pub mod utils {
         external_kind: wasmparser::ExternalKind,
     ) -> crate::ExportKind {
         match external_kind {
-            wasmparser::ExternalKind::Func => crate::ExportKind::Func,
+            wasmparser::ExternalKind::Func | wasmparser::ExternalKind::FuncExact => {
+                crate::ExportKind::Func
+            }
             wasmparser::ExternalKind::Table => crate::ExportKind::Table,
             wasmparser::ExternalKind::Memory => crate::ExportKind::Memory,
             wasmparser::ExternalKind::Global => crate::ExportKind::Global,
@@ -1141,10 +1167,11 @@ pub mod utils {
     ) -> Result<crate::SubType, Error<T::Error>> {
         Ok(crate::SubType {
             is_final: sub_ty.is_final,
-            supertype_idx: sub_ty
-                .supertype_idx
+            supertype_idxs: sub_ty
+                .supertype_idxs
+                .iter()
                 .map(|i| reencoder.type_index_unpacked(i.unpack()))
-                .transpose()?,
+                .collect::<Result<Vec<_>, _>>()?,
             composite_type: reencoder.composite_type(sub_ty.composite_type)?,
         })
     }
@@ -1170,6 +1197,14 @@ pub mod utils {
         Ok(crate::CompositeType {
             inner,
             shared: composite_ty.shared,
+            descriptor: composite_ty
+                .descriptor_idx
+                .map(|i| reencoder.type_index_unpacked(i.unpack()))
+                .transpose()?,
+            describes: composite_ty
+                .describes_idx
+                .map(|i| reencoder.type_index_unpacked(i.unpack()))
+                .transpose()?,
         })
     }
 
@@ -1268,6 +1303,9 @@ pub mod utils {
         Ok(match heap_type {
             wasmparser::HeapType::Concrete(i) => {
                 crate::HeapType::Concrete(reencoder.type_index_unpacked(i)?)
+            }
+            wasmparser::HeapType::Exact(i) => {
+                crate::HeapType::Exact(reencoder.type_index_unpacked(i)?)
             }
             wasmparser::HeapType::Abstract { shared, ty } => crate::HeapType::Abstract {
                 shared,
@@ -1406,6 +1444,9 @@ pub mod utils {
     ) -> Result<crate::EntityType, Error<T::Error>> {
         Ok(match type_ref {
             wasmparser::TypeRef::Func(i) => crate::EntityType::Function(reencoder.type_index(i)?),
+            wasmparser::TypeRef::FuncExact(i) => {
+                crate::EntityType::FunctionExact(reencoder.type_index(i)?)
+            }
             wasmparser::TypeRef::Table(t) => crate::EntityType::Table(reencoder.table_type(t)?),
             wasmparser::TypeRef::Memory(m) => crate::EntityType::Memory(reencoder.memory_type(m)?),
             wasmparser::TypeRef::Global(g) => crate::EntityType::Global(reencoder.global_type(g)?),
@@ -1417,12 +1458,52 @@ pub mod utils {
     /// all the imports to the `import` section.
     pub fn parse_import_section<T: ?Sized + Reencode>(
         reencoder: &mut T,
-        imports: &mut crate::ImportSection,
+        import_section: &mut crate::ImportSection,
         section: wasmparser::ImportSectionReader<'_>,
     ) -> Result<(), Error<T::Error>> {
-        for import in section {
-            reencoder.parse_import(imports, import?)?;
+        for imports in section {
+            let imports = imports?;
+            reencoder.parse_imports(import_section, imports)?;
         }
+        Ok(())
+    }
+
+    /// Parses a [`wasmparser::Imports`] and adds all of its contents to the
+    /// `import` section.
+    pub fn parse_imports<T: ?Sized + Reencode>(
+        reencoder: &mut T,
+        import_section: &mut crate::ImportSection,
+        imports: wasmparser::Imports<'_>,
+    ) -> Result<(), Error<T::Error>> {
+        import_section.imports(match imports {
+            wasmparser::Imports::Single(_, import) => Imports::Single(crate::Import {
+                module: import.module,
+                name: import.name,
+                ty: reencoder.entity_type(import.ty)?,
+            }),
+            wasmparser::Imports::Compact1 { module, items } => {
+                let mut new_items: Vec<crate::ImportCompact> = Vec::new();
+                for item in items {
+                    let item = item?;
+                    new_items.push(crate::ImportCompact {
+                        name: item.name,
+                        ty: reencoder.entity_type(item.ty)?,
+                    })
+                }
+                Imports::Compact1 {
+                    module: module,
+                    items: new_items.into(),
+                }
+            }
+            wasmparser::Imports::Compact2 { module, ty, names } => {
+                let names = names.into_iter().collect::<wasmparser::Result<Vec<_>>>()?;
+                Imports::Compact2 {
+                    module: module,
+                    ty: reencoder.entity_type(ty)?,
+                    names: names.into(),
+                }
+            }
+        });
         Ok(())
     }
 
@@ -1433,11 +1514,7 @@ pub mod utils {
         imports: &mut crate::ImportSection,
         import: wasmparser::Import<'_>,
     ) -> Result<(), Error<T::Error>> {
-        imports.import(
-            import.module,
-            import.name,
-            reencoder.entity_type(import.ty)?,
-        );
+        reencoder.parse_imports(imports, wasmparser::Imports::Single(0, import))?;
         Ok(())
     }
 
@@ -1667,7 +1744,7 @@ pub mod utils {
             (map $arg:ident targets) => ((
                 $arg
                     .targets()
-                    .collect::<Result<Vec<_>, wasmparser::BinaryReaderError>>()?
+                    .collect::<Result<Vec<_>, wasmparser::Error>>()?
                     .into(),
                 $arg.default(),
             ));
@@ -1833,6 +1910,12 @@ pub mod utils {
             }
             wasmparser::Name::Field(map) => {
                 names.fields(&indirect_name_map(map, |i| reencoder.type_index(i))?);
+            }
+            wasmparser::Name::Parameter(map) => {
+                names.parameters(&indirect_name_map(map, |i| reencoder.type_index(i))?);
+            }
+            wasmparser::Name::TagParameter(map) => {
+                names.tag_parameters(&indirect_name_map(map, |i| reencoder.tag_index(i))?);
             }
             wasmparser::Name::Unknown { ty, data, .. } => {
                 names.raw(ty, data);

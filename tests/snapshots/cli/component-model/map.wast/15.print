@@ -1,0 +1,6 @@
+(component
+  (type (;0;) (map string u32))
+  (type (;1;) (stream 0))
+  (type (;2;) (map string u32))
+  (type (;3;) (future 2))
+)

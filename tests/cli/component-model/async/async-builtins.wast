@@ -1,0 +1,217 @@
+;; RUN: wast --assert default --snapshot tests/snapshots % -f cm-async,cm-more-async-builtins,cm-forward
+
+;; stream.cancel-read
+(component
+  (core module $m
+    (import "" "stream.cancel-read" (func $stream-cancel-read (param i32) (result i32)))
+  )
+  (type $stream-type (stream u8))
+  (core func $stream-cancel-read (canon stream.cancel-read $stream-type async))
+  (core instance $i (instantiate $m (with "" (instance (export "stream.cancel-read" (func $stream-cancel-read))))))
+)
+
+;; stream.cancel-read; incorrect type
+(assert_invalid
+  (component
+    (core module $m
+      (import "" "stream.cancel-read" (func $stream-cancel-read (param i32 i32) (result i32)))
+    )
+    (type $stream-type (stream u8))
+    (core func $stream-cancel-read (canon stream.cancel-read $stream-type async))
+    (core instance $i (instantiate $m (with "" (instance (export "stream.cancel-read" (func $stream-cancel-read))))))
+  )
+  "type mismatch for export `stream.cancel-read` of module instantiation argument ``"
+)
+
+;; stream.cancel-write
+(component
+  (core module $m
+    (import "" "stream.cancel-write" (func $stream-cancel-write (param i32) (result i32)))
+  )
+  (type $stream-type (stream u8))
+  (core func $stream-cancel-write (canon stream.cancel-write $stream-type async))
+  (core instance $i (instantiate $m (with "" (instance (export "stream.cancel-write" (func $stream-cancel-write))))))
+)
+
+;; stream.cancel-write; incorrect type
+(assert_invalid
+  (component
+    (core module $m
+      (import "" "stream.cancel-write" (func $stream-cancel-write (param i32 i32) (result i32)))
+    )
+    (type $stream-type (stream u8))
+    (core func $stream-cancel-write (canon stream.cancel-write $stream-type async))
+    (core instance $i (instantiate $m (with "" (instance (export "stream.cancel-write" (func $stream-cancel-write))))))
+  )
+  "type mismatch for export `stream.cancel-write` of module instantiation argument ``"
+)
+
+(component
+  (core func (canon subtask.cancel async))
+  (canon subtask.cancel async (core func))
+)
+
+;; future.cancel-read
+(component
+  (core module $m
+    (import "" "future.cancel-read" (func $future-cancel-read (param i32) (result i32)))
+  )
+  (type $future-type (future u8))
+  (core func $future-cancel-read (canon future.cancel-read $future-type async))
+  (core instance $i (instantiate $m (with "" (instance (export "future.cancel-read" (func $future-cancel-read))))))
+)
+
+;; future.cancel-read; incorrect type
+(assert_invalid
+  (component
+    (core module $m
+      (import "" "future.cancel-read" (func $future-cancel-read (param i32 i32) (result i32)))
+    )
+    (type $future-type (future u8))
+    (core func $future-cancel-read (canon future.cancel-read $future-type async))
+    (core instance $i (instantiate $m (with "" (instance (export "future.cancel-read" (func $future-cancel-read))))))
+  )
+  "type mismatch for export `future.cancel-read` of module instantiation argument ``"
+)
+
+;; future.cancel-write
+(component
+  (core module $m
+    (import "" "future.cancel-write" (func $future-cancel-write (param i32) (result i32)))
+  )
+  (type $future-type (future u8))
+  (core func $future-cancel-write (canon future.cancel-write $future-type async))
+  (core instance $i (instantiate $m (with "" (instance (export "future.cancel-write" (func $future-cancel-write))))))
+)
+
+;; future.cancel-write; incorrect type
+(assert_invalid
+  (component
+    (core module $m
+      (import "" "future.cancel-write" (func $future-cancel-write (param i32 i32) (result i32)))
+    )
+    (type $future-type (future u8))
+    (core func $future-cancel-write (canon future.cancel-write $future-type async))
+    (core instance $i (instantiate $m (with "" (instance (export "future.cancel-write" (func $future-cancel-write))))))
+  )
+  "type mismatch for export `future.cancel-write` of module instantiation argument ``"
+)
+
+;; synchronous future/stream read/write
+(component
+  (type $f (future))
+  (type $s (stream))
+  (core func (canon future.read $f))
+  (core func (canon future.write $f))
+  (core func (canon stream.read $s))
+  (core func (canon stream.write $s))
+)
+
+;; stream.forward
+(component
+  (core module $m
+    (import "" "stream.forward" (func $stream.forward (param i32 i32)))
+  )
+  (type $stream-type (stream u8))
+  (core func $stream.forward (canon stream.forward $stream-type))
+  (core instance $i (instantiate $m (with "" (instance (export "stream.forward" (func $stream.forward))))))
+)
+
+;; stream.forward; incorrect type
+(assert_invalid
+  (component
+    (core module $m
+      (import "" "stream.forward" (func $stream.forward (param i32 i32) (result i32)))
+    )
+    (type $stream-type (stream u8))
+    (core func $stream.forward (canon stream.forward $stream-type))
+    (core instance $i (instantiate $m (with "" (instance (export "stream.forward" (func $stream.forward))))))
+  )
+  "type mismatch for export `stream.forward` of module instantiation argument ``"
+)
+
+;; stream.forward; not a stream type
+(assert_invalid
+  (component
+    (type $future-type (future u8))
+    (core func (canon stream.forward $future-type)))
+  "`stream.forward` requires a stream type"
+)
+
+;; future.forward
+(component
+  (core module $m
+    (import "" "future.forward" (func $future.forward (param i32 i32)))
+  )
+  (type $future-type (future u8))
+  (core func $future.forward (canon future.forward $future-type))
+  (core instance $i (instantiate $m (with "" (instance (export "future.forward" (func $future.forward))))))
+)
+
+;; future.forward; incorrect type
+(assert_invalid
+  (component
+    (core module $m
+      (import "" "future.forward" (func $future.forward (param i32 i32) (result i32)))
+    )
+    (type $future-type (future u8))
+    (core func $future.forward (canon future.forward $future-type))
+    (core instance $i (instantiate $m (with "" (instance (export "future.forward" (func $future.forward))))))
+  )
+  "type mismatch for export `future.forward` of module instantiation argument ``"
+)
+
+;; future.forward; not a future type
+(assert_invalid
+  (component
+    (type $stream-type (stream u8))
+    (core func (canon future.forward $stream-type)))
+  "`future.forward` requires a future type"
+)
+
+;; future.write can't use some canonical options that only make sense for
+;; lifting
+(assert_invalid
+  (component
+    (core module $libc (memory (export "memory") 1) (func (export "p")))
+    (core instance $libc (instantiate $libc))
+    (type $future-type (future u8))
+    (core func $future-write
+      (canon future.write $future-type
+        (memory (core memory $libc "memory"))
+        (post-return (core func $libc "p"))
+      )
+    )
+  )
+  "canonical option `post-return` cannot be specified for lowerings"
+)
+(assert_invalid
+  (component
+    (core module $libc (memory (export "memory") 1))
+    (core instance $libc (instantiate $libc))
+    (type $future-type (future u8))
+    (core func $future-write
+      (canon future.write $future-type
+        (memory (core memory $libc "memory"))
+        (post-return (core func 9999))
+      )
+    )
+  )
+  "canonical option `post-return` cannot be specified for lowerings"
+)
+(assert_invalid
+  (component
+    (core module $libc (memory (export "memory") 1))
+    (core instance $libc (instantiate $libc))
+    (type $future-type (future u8))
+    (core func $future-write
+      (canon future.write $future-type
+        async
+        (memory (core memory $libc "memory"))
+        (callback (core func 9999))
+      )
+    )
+  )
+  "canonical option `callback` cannot be specified for lowerings"
+)
+

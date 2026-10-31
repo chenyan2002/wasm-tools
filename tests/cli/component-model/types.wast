@@ -120,11 +120,9 @@
   )
   "import name `a` conflicts with previous name `A`")
 
-(assert_malformed
-  (component quote
-    "(component $c (core type $t (module (alias outer $c $t (type)))))"
-  )
-  "unknown core type")
+(assert_invalid
+  (component $c (core type $t (module (alias outer $c $t (type)))))
+  "type index out of bounds")
 
 (assert_invalid
   (component
@@ -141,11 +139,9 @@
   ))
 )
 
-(assert_malformed
-  (component quote
-    "(component $c (type $t (component (alias outer $c $t (type)))))"
-  )
-  "unknown type")
+(assert_invalid
+  (component $c (type $t (component (alias outer $c $t (type)))))
+  "type index out of bounds")
 
 (assert_invalid
   (component
@@ -193,11 +189,9 @@
   )
   "export name `FOO-bar-BAZ` conflicts with previous name `foo-BAR-baz`")
 
-(assert_malformed
-  (component quote
-    "(component $c (type $t (instance (alias outer $c $t (type)))))"
-  )
-  "unknown type")
+(assert_invalid
+  (component $c (type $t (instance (alias outer $c $t (type)))))
+  "type index out of bounds")
 
 (assert_invalid
   (component
@@ -359,35 +353,6 @@
     ))
   )
   "cannot have more than 32 flags")
-
-;; test components with non-mvp types
-(component
-  ;; all abstract heap types work
-  (core type (func (param (ref any))))
-  (core type (func (param (ref func))))
-  (core type (func (param (ref extern))))
-  (core type (func (param (ref exn))))
-  (core type (func (param (ref noexn))))
-  (core type (func (param (ref eq))))
-  (core type (func (param (ref struct))))
-  (core type (func (param (ref array))))
-  (core type (func (param (ref nofunc))))
-  (core type (func (param (ref noextern))))
-  (core type (func (param (ref none))))
-  (core type (func (param (ref i31))))
-
-  ;; some shorthands work
-  (core type (func (param anyref)))
-  (core type (func (param eqref)))
-
-  ;; simd types work
-  (core type (func (param v128)))
-
-  ;; types-pointing-to-types works
-  (core type $t (func))
-  (core type (func (param (ref $t))))
-
-)
 
 (assert_invalid
   (component

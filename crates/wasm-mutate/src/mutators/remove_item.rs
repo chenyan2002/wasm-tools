@@ -10,7 +10,7 @@
 use crate::mutators::{Item, Mutator};
 use crate::{Error, ReencodeResult};
 use crate::{ModuleInfo, Result, WasmMutate};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashSet;
 use wasm_encoder::reencode::Reencode;
 use wasm_encoder::*;
@@ -274,11 +274,11 @@ impl Reencode for RemoveItem<'_> {
         let mut table = 0;
         let mut memory = 0;
         let mut tag = 0;
-        for item in section {
+        for item in section.into_imports() {
             let item = item?;
             let retain;
             match &item.ty {
-                wasmparser::TypeRef::Func(_) => {
+                wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_) => {
                     retain = self.item != Item::Function || self.idx != function;
                     function += 1;
                 }

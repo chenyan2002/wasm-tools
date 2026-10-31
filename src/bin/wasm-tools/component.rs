@@ -17,7 +17,7 @@ use wit_component::{
     ComponentEncoder, DecodedWasm, Linker, StringEncoding, WitPrinter, embed_component_metadata,
     metadata,
 };
-use wit_parser::{LiftLowerAbi, Mangling, ManglingAndAbi};
+use wit_parser::{LiftLowerAbi, Mangling, ManglingAndAbi, WorldItem, WorldKey};
 
 /// WebAssembly wit-based component tooling.
 #[derive(Parser)]
@@ -57,6 +57,188 @@ impl Opts {
     }
 }
 
+fn parse_import_name(s: &str) -> Result<(String, String)> {
+    s.split_once('=')
+        .map(|(old, new)| (old.to_string(), new.to_string()))
+        .context("expected `--import-name` option to be of the form `OLD=NEW`")
+}
+
+/// WebAssembly component encoder from an input core wasm binary.
+///
+/// This subcommand will create a new component `*.wasm` file from an input core
+/// wasm binary. The input core wasm binary must have metadata embedded within
+/// it about the component-types used during its compilation. This is done
+/// automatically for `wit-bindgen`-based projects, for example, and can be
+/// manually done through the `wasm-tools component embed` subcommand.
+///
+/// This command will perform translation by collecting all type information
+/// used during compilation of the core wasm module and will produce a component
+/// with all of this type information resolved.
+#[derive(Parser)]
+#[clap(after_help = "\
+Examples:
+
+    # Supposing foo.wasm contains a binary core module,
+    # create a component using the adapter in the
+    # file `wasi_snapshot_preview1.reactor.wasm`, and save the binary
+    # component to the file foo.component.wasm.
+    $ wasm-tools component new foo.wasm --adapt wasi_snapshot_preview1.reactor.wasm \
+        -o foo.component.wasm
+
+    # Supporting foo.wasm contains a binary core module,
+    # create a component using the adapter in the
+    # file some_adapter.wasm, which must implement the import module
+    # \"wasi_snapshot_preview1\", and save the binary component to the file
+    # foo.component.wasm.
+    $ wasm-tools component new foo.wasm --adapt wasi_snapshot_preview1=some_adapter.wasm \
+        -o foo.component.wasm
+
+    # In the output component, replace any imports of \"wasi:io/error@0.2.0\" with
+    # an import of \"wasi:io/error@0.2.1\".
+    # Also use the adapter contained in the file `wasm_snapshot_preview1.wasm`
+    # in the current directory, and save the output to the file foo.component.wasm.
+    $ wasm-tools component new foo.wasm --import-name \"wasi:io/error@0.2.0=wasi:io/error@0.2.1\" \
+        --adapt wasi_snapshot_preview1.wasm -o foo.component.wasm
+
+    # Create a component and print it to stdout in in text format, skipping validation of
+    # the output component.
+    $ wasm-tools component new foo.wasm -t --validate=false
+
+    # Create a component, using memory.grow to reallocate memory.
+    # This can be useful if `cabi_realloc` cannot be called before the host runtime
+    # is initialized.
+    $ wasm-tools component new foo.wasm --realloc-via-memory-grow \
+        --adapt wasi_snapshot_preview1.reactor.wasm -o foo.component.wasm
+")]
+pub struct NewOpts {
+    /// Rename an instance import in the output component.
+    ///
+    /// This may be used to rename instance imports in the final component.
+    ///
+    /// For example, `--import-name "a:b/c=d:e/f"` will rename the instance
+    /// import `a:b/c` such that it becomes `d:e/f`.
+    ///
+    /// If the old import name is not found, it is ignored.
+    #[clap(long = "import-name", value_name = "OLD=NEW", value_parser = parse_import_name)]
+    import_names: Vec<(String, String)>,
+
+    #[clap(flatten)]
+    generate_dwarf: wasm_tools::GenerateDwarfArg,
+
+    #[clap(flatten)]
+    io: wasm_tools::InputOutput,
+
+    #[clap(flatten)]
+    encoder_opts: ComponentEncoderOpts,
+
+    /// Print the output in the WebAssembly text format instead of binary.
+    #[clap(long, short = 't')]
+    wat: bool,
+}
+
+impl NewOpts {
+    fn general_opts(&self) -> &wasm_tools::GeneralOpts {
+        self.io.general_opts()
+    }
+
+    /// Executes the application.
+    fn run(self) -> Result<()> {
+        let wasm = self.io.get_input_wasm(Some(&self.generate_dwarf))?;
+        let mut encoder = ComponentEncoder::default();
+        self.encoder_opts.configure(&mut encoder)?;
+        encoder.module(&wasm)?;
+
+        let bytes = encoder
+            .import_name_map(self.import_names.into_iter().collect())
+            .encode()
+            .context("failed to encode a component from module")?;
+
+        self.io.output_wasm(&bytes, self.wat)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
+struct ComponentEncoderOpts {
+    /// The path to an adapter module to satisfy imports not otherwise bound to
+    /// WIT interfaces.
+    ///
+    /// An adapter module can be used to translate the `wasi_snapshot_preview1`
+    /// ABI, for example, to one that uses the component model. The first
+    /// `[NAME=]` specified in the argument is inferred from the name of file
+    /// specified by `MODULE` if not present and is the name of the import
+    /// module that's being implemented (e.g. `wasi_snapshot_preview1.wasm`).
+    ///
+    /// The second part of this argument is the path to the adapter module.
+    #[clap(long = "adapt", value_name = "[NAME=]MODULE", value_parser = parse_adapter)]
+    pub adapters: Vec<(String, Vec<u8>)>,
+
+    /// Deprecated, use `--validate=false` instead.
+    #[clap(long, hide = true, conflicts_with = "validate")]
+    skip_validation: bool,
+
+    /// Whether or not to validate the output component
+    #[arg(
+        long,
+        conflicts_with = "skip_validation",
+        require_equals = true,
+        value_name = "true|false"
+    )]
+    validate: Option<Option<bool>>,
+
+    /// Use memory.grow to realloc memory and stack allocation in adapters.
+    ///
+    /// This only affects adapter modules passed with `--adapt`. It makes an
+    /// adapter allocate with `memory.grow` instead of importing `cabi_realloc`
+    /// from the main module, which is the default. It does not synthesize a
+    /// `cabi_realloc` for a main module that doesn't export one.
+    ///
+    /// This can be useful if `cabi_realloc` cannot be called before the host
+    /// runtime is initialized.
+    #[clap(long)]
+    realloc_via_memory_grow: bool,
+
+    /// Indicates whether imports into the final component are merged based on
+    /// semver ranges.
+    ///
+    /// This is enabled by default.
+    #[arg(long, require_equals = true, value_name = "true|false")]
+    merge_imports_based_on_semver: Option<Option<bool>>,
+
+    /// Emits canonical interface names with version suffixes.
+    ///
+    /// When enabled, import/export names use canonical version prefixes (e.g.,
+    /// `wasi:cli/exit@0.2` instead of `wasi:cli/exit@0.2.1`) and the
+    /// `version_suffix` field is populated in the binary.
+    #[clap(long)]
+    emit_canonical_names: bool,
+
+    /// Reject usage of the "legacy" naming scheme of `wit-component` and
+    /// require the new naming scheme to be used.
+    ///
+    /// This flag can be used to ignore core module imports/exports that don't
+    /// conform to WebAssembly/component-model#378. This turns off
+    /// compatibility `wit-component`'s historical naming scheme. This is
+    /// intended to be used to test if a tool is compatible with a hypothetical
+    /// removal of the old scheme in the future.
+    #[clap(long)]
+    reject_legacy_names: bool,
+
+    /// Whether or not to add debug names to the generated binary.
+    #[arg(long, require_equals = true, value_name = "true|false")]
+    debug_names: Option<Option<bool>>,
+
+    /// Whether or not to use `return_call_ref` for shims.
+    ///
+    /// If this is not specified or specified as `false` then generated shim
+    /// modules will use `call_indirect`. Note that enabling this option means
+    /// the generated component will require the WebAssembly tail-call and
+    /// function-references proposal.
+    #[arg(long, require_equals = true, value_name = "true|false")]
+    return_call_ref: Option<Option<bool>>,
+}
+
 fn parse_optionally_name_file(s: &str) -> (&str, &str) {
     let mut parts = s.splitn(2, '=');
     let name_or_path = parts.next().unwrap();
@@ -83,119 +265,26 @@ fn parse_adapter(s: &str) -> Result<(String, Vec<u8>)> {
     Ok((name.to_string(), wasm))
 }
 
-fn parse_import_name(s: &str) -> Result<(String, String)> {
-    s.split_once('=')
-        .map(|(old, new)| (old.to_string(), new.to_string()))
-        .context("expected `--import-name` option to be of the form `OLD=NEW`")
-}
-
-/// WebAssembly component encoder from an input core wasm binary.
-///
-/// This subcommand will create a new component `*.wasm` file from an input core
-/// wasm binary. The input core wasm binary must have metadata embedded within
-/// it about the component-types used during its compilation. This is done
-/// automatically for `wit-bindgen`-based projects, for example, and can be
-/// manually done through the `wasm-tools component embed` subcommand.
-///
-/// This command will perform translation by collecting all type information
-/// used during compilation of the core wasm module and will produce a component
-/// with all of this type information resolved.
-#[derive(Parser)]
-pub struct NewOpts {
-    /// The path to an adapter module to satisfy imports not otherwise bound to
-    /// WIT interfaces.
-    ///
-    /// An adapter module can be used to translate the `wasi_snapshot_preview1`
-    /// ABI, for example, to one that uses the component model. The first
-    /// `[NAME=]` specified in the argument is inferred from the name of file
-    /// specified by `MODULE` if not present and is the name of the import
-    /// module that's being implemented (e.g. `wasi_snapshot_preview1.wasm`).
-    ///
-    /// The second part of this argument, optionally specified, is the interface
-    /// that this adapter module imports. If not specified then the interface
-    /// imported is inferred from the adapter module itself.
-    #[clap(long = "adapt", value_name = "[NAME=]MODULE", value_parser = parse_adapter)]
-    adapters: Vec<(String, Vec<u8>)>,
-
-    /// Rename an instance import in the output component.
-    ///
-    /// This may be used to rename instance imports in the final component.
-    ///
-    /// For example, `--import-name "a:b/c=unlocked-dep=<d:e/f>"` will
-    /// rename the instance import `a:b/c` such that it becomes an `unlocked-dep`
-    /// name.
-    ///
-    /// If the old import name is not found, it is ignored.
-    #[clap(long = "import-name", value_name = "[OLD]=NEW", value_parser = parse_import_name)]
-    import_names: Vec<(String, String)>,
-
-    #[clap(flatten)]
-    generate_dwarf: wasm_tools::GenerateDwarfArg,
-
-    #[clap(flatten)]
-    io: wasm_tools::InputOutput,
-
-    /// Skip validation of the output component.
-    #[clap(long)]
-    skip_validation: bool,
-
-    /// Print the output in the WebAssembly text format instead of binary.
-    #[clap(long, short = 't')]
-    wat: bool,
-
-    /// Use memory.grow to realloc memory and stack allocation.
-    #[clap(long)]
-    realloc_via_memory_grow: bool,
-
-    /// Indicates whether imports into the final component are merged based on
-    /// semver ranges.
-    ///
-    /// This is enabled by default.
-    #[clap(long, value_name = "MERGE")]
-    merge_imports_based_on_semver: Option<bool>,
-
-    /// Reject usage of the "legacy" naming scheme of `wit-component` and
-    /// require the new naming scheme to be used.
-    ///
-    /// This flag can be used to ignore core module imports/exports that don't
-    /// conform to WebAssembly/component-model#378. This turns off
-    /// compatibility `wit-component`'s historical naming scheme. This is
-    /// intended to be used to test if a tool is compatible with a hypothetical
-    /// removal of the old scheme in the future.
-    #[clap(long)]
-    reject_legacy_names: bool,
-}
-
-impl NewOpts {
-    fn general_opts(&self) -> &wasm_tools::GeneralOpts {
-        self.io.general_opts()
-    }
-
-    /// Executes the application.
-    fn run(self) -> Result<()> {
-        let wasm = self.io.get_input_wasm(Some(&self.generate_dwarf))?;
-        let mut encoder = ComponentEncoder::default()
-            .validate(!self.skip_validation)
-            .reject_legacy_names(self.reject_legacy_names);
-
-        if let Some(merge) = self.merge_imports_based_on_semver {
-            encoder = encoder.merge_imports_based_on_semver(merge);
-        }
-        encoder = encoder.module(&wasm)?;
-
+impl ComponentEncoderOpts {
+    fn configure(&self, encoder: &mut ComponentEncoder) -> Result<()> {
+        encoder
+            .validate(if self.skip_validation {
+                false
+            } else {
+                optional_flag_with_default(self.validate, true)
+            })
+            .reject_legacy_names(self.reject_legacy_names)
+            .debug_names(optional_flag_with_default(self.debug_names, true))
+            .shim_return_call_ref(optional_flag_with_default(self.return_call_ref, false))
+            .merge_imports_based_on_semver(optional_flag_with_default(
+                self.merge_imports_based_on_semver,
+                true,
+            ))
+            .realloc_via_memory_grow(self.realloc_via_memory_grow)
+            .emit_canonical_names(self.emit_canonical_names);
         for (name, wasm) in self.adapters.iter() {
-            encoder = encoder.adapter(name, wasm)?;
+            encoder.adapter(name, wasm)?;
         }
-
-        encoder = encoder.realloc_via_memory_grow(self.realloc_via_memory_grow);
-
-        let bytes = encoder
-            .import_name_map(self.import_names.into_iter().collect())
-            .encode()
-            .context("failed to encode a component from module")?;
-
-        self.io.output_wasm(&bytes, self.wat)?;
-
         Ok(())
     }
 }
@@ -216,6 +305,67 @@ impl NewOpts {
 /// for you. This is primarily intended for one-off testing or for developers
 /// working with text format wasm.
 #[derive(Parser)]
+#[clap(after_help = "\
+Examples:
+
+    # Embed the WIT in world.wit in the binary core module contained in the
+    # file foo.wasm and print the textual representation of the result
+    # to stdout.
+    $ wasm-tools component embed world.wit foo.wasm -t
+
+    # Embed the WIT in world.wit in the binary core module contained in the
+    # file foo.wasm and save the resulting binary module to out.wasm.
+    $ wasm-tools component embed world.wit foo.wasm -o out.wasm
+
+Supposing feature.wit is as follows:
+package a:b;
+
+@unstable(feature = foo)
+interface foo {
+  @unstable(feature = foo)
+  type t = u32;
+}
+    # Embed the WIT for feature.wit in the binary core module contained
+    # in the file foo.wasm, without hiding the unstable \"foo\" feature,
+    # and print the textual representation of the result to stdout.
+    $ wasm-tools component embed feature.wit --features foo foo.wasm -t
+
+    # Supposing that the current directory contains several WIT files
+    # that each define various worlds, embed the world \"adder\" in
+    # the output and print its textual representation to stdout.
+    $ wasm-tools component embed . --world adder foo.wasm -t
+
+Note: without the --world flag in this case, wasm-tools would print an
+error message that looks like:
+error: There are multiple worlds in `docs:calculator@0.1.0`; one must be explicitly chosen:
+  docs:calculator/adder@0.1.0
+  docs:calculator/calculator@0.1.0
+  docs:calculator/subtracter@0.1.0
+
+    # Generate a template core module with the same imports and exports
+    # as the WIT world \"calculator\" that appears in a file in the current
+    # directory, and print a textual representation of the result to stdout.
+    $ wasm-tools component embed . --world calculator --dummy -t
+
+    # Generate only the custom section; note that this does not require
+    # a .wasm or .wat file as an argument.
+    $ wasm-tools component embed --world foo foo.wit --only-custom -o foo.wasm
+    * using --only-custom
+
+    # Embed the WIT in world.wit in the binary core module contained in the
+    # file foo.wasm and print the textual representation of the result
+    # to stdout, lowering imports using the async ABI and lifting exports
+    # with the async-with-callback ABI.
+    $ wasm-tools component embed world.wit foo.wasm --async-callback --dummy-names legacy -t
+
+    # Embed the WIT in world.wit in the binary core module contained in the
+    # file foo.wasm and print the textual representation of the result
+    # to stdout, lowering imports using the async ABI and lifting exports
+    # with the async-without-callback ABI.
+    $ wasm-tools component embed world.wit foo.wasm --async-stackful --dummy-names legacy -t
+
+")]
+
 pub struct EmbedOpts {
     #[clap(flatten)]
     resolve: WitResolve,
@@ -246,6 +396,14 @@ pub struct EmbedOpts {
     /// well.
     #[clap(short, long)]
     world: Option<String>,
+
+    /// Emits canonical interface names with version suffixes.
+    ///
+    /// When enabled, import/export names use canonical version prefixes (e.g.,
+    /// `wasi:cli/exit@0.2` instead of `wasi:cli/exit@0.2.1`) and the
+    /// `version_suffix` field is populated in the binary.
+    #[clap(long)]
+    emit_canonical_names: bool,
 
     /// Don't read a core wasm module as input, instead generating a "dummy"
     /// module as a placeholder.
@@ -310,9 +468,13 @@ impl EmbedOpts {
 
     /// Executes the application.
     fn run(self) -> Result<()> {
-        let (resolve, pkg_id) = self.resolve.load()?;
+        let (mut resolve, pkg_id) = self.resolve.load()?;
 
         let world = resolve.select_world(&[pkg_id], self.world.as_deref())?;
+
+        if self.emit_canonical_names {
+            resolve.merge_world_imports_based_on_semver(world)?;
+        }
 
         if self.only_custom {
             let encoded = metadata::encode(
@@ -320,6 +482,7 @@ impl EmbedOpts {
                 world,
                 self.encoding.unwrap_or(StringEncoding::UTF8),
                 None,
+                self.emit_canonical_names,
             )?;
 
             self.io.output_wasm(&encoded, false)?;
@@ -362,6 +525,7 @@ impl EmbedOpts {
             &resolve,
             world,
             self.encoding.unwrap_or(StringEncoding::UTF8),
+            self.emit_canonical_names,
         )?;
 
         self.io.output_wasm(&wasm, self.wat)?;
@@ -417,21 +581,6 @@ pub struct LinkOpts {
     #[clap(long, value_name = "[NAME=]MODULE", value_parser = parse_library)]
     dl_openable: Vec<(String, Vec<u8>)>,
 
-    /// The path to an adapter module to satisfy imports not otherwise bound to
-    /// WIT interfaces.
-    ///
-    /// An adapter module can be used to translate the `wasi_snapshot_preview1`
-    /// ABI, for example, to one that uses the component model. The first
-    /// `[NAME=]` specified in the argument is inferred from the name of file
-    /// specified by `MODULE` if not present and is the name of the import
-    /// module that's being implemented (e.g. `wasi_snapshot_preview1.wasm`).
-    ///
-    /// The second part of this argument, optionally specified, is the interface
-    /// that this adapter module imports. If not specified then the interface
-    /// imported is inferred from the adapter module itself.
-    #[clap(long = "adapt", value_name = "[NAME=]MODULE", value_parser = parse_adapter)]
-    adapters: Vec<(String, Vec<u8>)>,
-
     /// Size of stack (in bytes) to allocate in the synthesized main module
     #[clap(long)]
     stack_size: Option<u32>,
@@ -441,19 +590,6 @@ pub struct LinkOpts {
 
     #[clap(flatten)]
     general: wasm_tools::GeneralOpts,
-
-    /// Deprecated, use `--validate=false` instead.
-    #[clap(long, hide = true, conflicts_with = "validate")]
-    skip_validation: bool,
-
-    /// Whether or not to validate the output component
-    #[arg(
-        long,
-        conflicts_with = "skip_validation",
-        require_equals = true,
-        value_name = "true|false"
-    )]
-    validate: Option<Option<bool>>,
 
     /// Print the output in the WebAssembly text format instead of binary.
     #[clap(long, short = 't')]
@@ -467,16 +603,8 @@ pub struct LinkOpts {
     #[clap(long)]
     use_built_in_libdl: bool,
 
-    /// Indicates whether imports into the final component are merged based on
-    /// semver ranges.
-    ///
-    /// This is enabled by default.
-    #[arg(long, require_equals = true, value_name = "true|false")]
-    merge_imports_based_on_semver: Option<Option<bool>>,
-
-    /// Whether or not to add debug names to the generated binary.
-    #[arg(long, require_equals = true, value_name = "true|false")]
-    debug_names: Option<Option<bool>>,
+    #[clap(flatten)]
+    encoder_opts: ComponentEncoderOpts,
 }
 
 fn optional_flag_with_default(flag: Option<Option<bool>>, default: bool) -> bool {
@@ -494,30 +622,22 @@ impl LinkOpts {
 
     /// Executes the application.
     fn run(self) -> Result<()> {
-        let mut linker = Linker::default()
-            .validate(!self.skip_validation)
+        let mut linker = Linker::default();
+        linker
             .stub_missing_functions(self.stub_missing_functions)
-            .use_built_in_libdl(self.use_built_in_libdl)
-            .debug_names(optional_flag_with_default(self.debug_names, true));
+            .use_built_in_libdl(self.use_built_in_libdl);
+        self.encoder_opts.configure(linker.encoder())?;
 
         if let Some(stack_size) = self.stack_size {
-            linker = linker.stack_size(stack_size);
-        }
-
-        if let Some(merge) = self.merge_imports_based_on_semver {
-            linker = linker.merge_imports_based_on_semver(merge.unwrap_or(true));
+            linker.stack_size(stack_size);
         }
 
         for (name, wasm) in &self.inputs {
-            linker = linker.library(name, wasm, false)?;
+            linker.library(name, wasm, false)?;
         }
 
         for (name, wasm) in &self.dl_openable {
-            linker = linker.library(name, wasm, true)?;
-        }
-
-        for (name, wasm) in &self.adapters {
-            linker = linker.adapter(name, wasm)?;
+            linker.library(name, wasm, true)?;
         }
 
         let bytes = linker
@@ -538,6 +658,108 @@ impl LinkOpts {
 /// back to text, and a WIT document can be extracted from a component binary to
 /// inspect its interfaces.
 #[derive(Parser)]
+#[clap(after_help = "\
+Examples:
+
+    # Parse the current directory as a WIT package and print the resulting
+    # package, supposing a directory that contains three WIT files,
+    # one defining an
+    # `adder` world; one defining a `subtracter` world; and one defining a
+    # `calculator` world.
+    $ wasm-tools component wit .
+package docs:calculator@0.1.0;
+
+interface add {
+  add: func(x: u32, y: u32) -> u32;
+}
+
+interface evaluate {
+  evaluate: func(x: u32, y: u32) -> u32;
+}
+
+interface subtract {
+  subtract: func(x: u32, y: u32) -> u32;
+}
+
+world adder {
+  export add;
+}
+world calculator {
+  import add;
+  import subtract;
+
+  export evaluate;
+}
+world subtracter {
+  export subtract;
+}
+
+   # Supposing the same directory contents as above, print the package to
+   # a file in the `out` subdirectory.
+   $ wasm-tools component wit . --out-dir out
+
+   # Supposing the same directory contents above, print the WIT for a world
+   # that imports the exports of the `calculator` world.
+   # In the output, the `calculator` world is replaced with:
+   # world calculator-importized {
+   #     import evaluate;
+   # }
+   $ wasm-tools component wit . --importize-world calculator
+
+   # Supposing foo.wasm is a binary component, extract the interface
+   # from the component and print it to stdout.
+   $ wasm-tools component wit foo.wasm
+
+   # Supposing foo.wasm is a binary component that depends on several
+   # WASI interfaces, extract the interface from the component and save it
+   # as WIT, along with WIT files containing all the dependencies, to
+   # the `out` subdirectory.
+   $ wasm-tools component wit foo.wasm --out-dir out
+Writing: out/deps/io.wit
+Writing: out/deps/cli.wit
+Writing: out/deps/clocks.wit
+Writing: out/deps/filesystem.wit
+Writing: out/deps/adder.wit
+Writing: out/component.wit
+
+   # With the same foo.wasm file, print a textual WAT representation
+   # of the interface to stdout, skipping validation of the WAT code.
+   $ wasm-tools component wit foo.wasm -t --validate=false
+
+   # With the same foo.wasm file, print a JSON representation
+   # of the interface to stdout.
+   $ wasm-tools component wit foo.wasm --json
+
+   # With the same foo.wasm file, print the WIT for a world that
+   # imports the component's exports to stdout.
+   $ wasm-tools component wit foo.wasm --importize
+
+Supposing feature.wit is as follows:
+package a:b;
+
+@unstable(feature = foo)
+interface foo {
+  @unstable(feature = foo)
+  type t = u32;
+}
+
+   # Print the WIT for feature.wit without hiding the unstable
+   # \"foo\" feature.
+   $ wasm-tools component wit feature.wit --features foo
+package a:b;
+
+@unstable(feature = foo)
+interface foo {
+  @unstable(feature = foo)
+  type t = u32;
+}
+
+   # Print the WIT for feature.wit, hiding the unstable
+   # \"foo\" feature.
+   $ wasm-tools component wit feature.wit
+package a:b;
+
+")]
 pub struct WitOpts {
     #[clap(flatten)]
     general: wasm_tools::GeneralOpts,
@@ -609,11 +831,14 @@ pub struct WitOpts {
     #[clap(
         long,
         conflicts_with = "importize_world",
-        conflicts_with = "merge_world_imports_based_on_semver"
+        conflicts_with = "exportize",
+        conflicts_with = "exportize_world",
+        conflicts_with = "merge_world_imports_based_on_semver",
+        conflicts_with = "generate_nominal_type_ids"
     )]
     importize: bool,
 
-    /// The name of the world to generate when using `--importize` or `importize-world`.
+    /// The name of the world to generate when using `--importize` or `--importize-world`.
     #[clap(long = "importize-out-world-name")]
     importize_out_world_name: Option<String>,
 
@@ -630,10 +855,62 @@ pub struct WitOpts {
     #[clap(
         long,
         conflicts_with = "importize",
+        conflicts_with = "exportize",
+        conflicts_with = "exportize_world",
         conflicts_with = "merge_world_imports_based_on_semver",
+        conflicts_with = "generate_nominal_type_ids",
         value_name = "WORLD"
     )]
     importize_world: Option<String>,
+
+    /// Generates WIT to export the component specified to this command.
+    ///
+    /// This flag requires that the input is a binary component, not a
+    /// wasm-encoded WIT package. This will then generate a WIT world and output
+    /// that. The returned world will have exports corresponding to the imports
+    /// of the component which is input.
+    ///
+    /// This is similar to `--exportize-world`, but is used with components.
+    #[clap(
+        long,
+        conflicts_with = "importize",
+        conflicts_with = "importize_world",
+        conflicts_with = "exportize_world",
+        conflicts_with = "merge_world_imports_based_on_semver",
+        conflicts_with = "generate_nominal_type_ids"
+    )]
+    exportize: bool,
+
+    /// The name of the world to generate when using `--exportize` or `--exportize-world`.
+    #[clap(long = "exportize-out-world-name")]
+    exportize_out_world_name: Option<String>,
+
+    /// When used with `--exportize` or `--exportize-world`, only move the
+    /// specified imports to exports. Can be specified multiple times. If not
+    /// provided, all imports are moved.
+    #[clap(long = "exportize-import", value_name = "IMPORT")]
+    exportize_imports: Vec<String>,
+
+    /// Generates a WIT world to export a component which corresponds to the
+    /// selected world.
+    ///
+    /// This flag is used to indicate that the input is a WIT package and the
+    /// world passed here is the name of a WIT `world` within the package. The
+    /// output of the command will be the same WIT world but one that's
+    /// exporting the selected world. This effectively moves the world's imports
+    /// to exports.
+    ///
+    /// This is similar to `--exportize`, but is used with WIT packages.
+    #[clap(
+        long,
+        conflicts_with = "importize",
+        conflicts_with = "importize_world",
+        conflicts_with = "exportize",
+        conflicts_with = "merge_world_imports_based_on_semver",
+        conflicts_with = "generate_nominal_type_ids",
+        value_name = "WORLD"
+    )]
+    exportize_world: Option<String>,
 
     /// Updates the world specified to deduplicate all of its imports based on
     /// semver versions.
@@ -646,9 +923,32 @@ pub struct WitOpts {
         long,
         conflicts_with = "importize",
         conflicts_with = "importize_world",
+        conflicts_with = "exportize",
+        conflicts_with = "exportize_world",
+        conflicts_with = "generate_nominal_type_ids",
         value_name = "WORLD"
     )]
     merge_world_imports_based_on_semver: Option<String>,
+
+    /// Generates unique type IDs for nominal types in the world provided.
+    ///
+    /// This option can be used to affect the `--json` output of this command,
+    /// for example, and it is intended to make the job of bindings generators
+    /// easier by ensuring that each `TypeId` corresponds to a single type to
+    /// generate in the target language. This will modify the `world` specified
+    /// to duplicate exported interfaces, if needed, to ensure that if they're
+    /// both imported and exported it generates unique types in the guest
+    /// language.
+    #[clap(
+        long,
+        conflicts_with = "importize",
+        conflicts_with = "importize_world",
+        conflicts_with = "exportize",
+        conflicts_with = "exportize_world",
+        conflicts_with = "merge_world_imports_based_on_semver",
+        value_name = "WORLD"
+    )]
+    generate_nominal_type_ids: Option<String>,
 
     /// Features to enable when parsing the `wit` option.
     ///
@@ -663,6 +963,14 @@ pub struct WitOpts {
     /// items are otherwise hidden by default.
     #[clap(long)]
     all_features: bool,
+
+    /// Emits canonical interface names with version suffixes.
+    ///
+    /// When enabled, import/export names use canonical version prefixes (e.g.,
+    /// `wasi:cli/exit@0.2` instead of `wasi:cli/exit@0.2.1`) and the
+    /// `version_suffix` field is populated in the binary.
+    #[clap(long)]
+    emit_canonical_names: bool,
 }
 
 impl WitOpts {
@@ -682,6 +990,20 @@ impl WitOpts {
                 self.importize_world.as_deref(),
                 self.importize_out_world_name.as_ref(),
             )?;
+        } else if self.exportize {
+            self.exportize(
+                &mut decoded,
+                None,
+                self.exportize_out_world_name.as_ref(),
+                &self.exportize_imports,
+            )?;
+        } else if self.exportize_world.is_some() {
+            self.exportize(
+                &mut decoded,
+                self.exportize_world.as_deref(),
+                self.exportize_out_world_name.as_ref(),
+                &self.exportize_imports,
+            )?;
         } else if let Some(world) = &self.merge_world_imports_based_on_semver {
             let (resolve, world_id) = match &mut decoded {
                 DecodedWasm::Component(..) => {
@@ -700,6 +1022,8 @@ impl WitOpts {
                 .context("failed to merge world imports based on semver")?;
             let resolve = mem::take(resolve);
             decoded = DecodedWasm::Component(resolve, world_id);
+        } else if let Some(world) = &self.generate_nominal_type_ids {
+            self.generate_nominal_type_ids(&mut decoded, world)?;
         }
 
         // Now that the WIT document has been decoded, it's time to emit it.
@@ -707,7 +1031,7 @@ impl WitOpts {
         if self.json {
             self.emit_json(&decoded)?;
         } else if self.wasm || self.wat {
-            self.emit_wasm(&decoded)?;
+            self.emit_wasm(&decoded, self.emit_canonical_names)?;
         } else {
             self.emit_wit(&decoded)?;
         }
@@ -721,7 +1045,9 @@ impl WitOpts {
             if input.is_dir() {
                 let mut resolve =
                     WitResolve::resolve_with_features(&self.features, self.all_features);
-                let (pkg_id, _) = resolve.push_dir(&input)?;
+                let (pkg_id, _) = resolve
+                    .push_dir(&input)
+                    .map_err(|e| anyhow::anyhow!("{}", resolve.render_error(&e)))?;
                 return Ok(DecodedWasm::WitPackage(resolve, pkg_id));
             }
         }
@@ -778,7 +1104,9 @@ impl WitOpts {
                 };
                 let mut resolve =
                     WitResolve::resolve_with_features(&self.features, self.all_features);
-                let id = resolve.push_str(path, input)?;
+                let id = resolve
+                    .push_str(path, input)
+                    .map_err(|e| anyhow::anyhow!("{}", resolve.render_error(&e)))?;
                 Ok(DecodedWasm::WitPackage(resolve, id))
             }
         }
@@ -811,12 +1139,83 @@ impl WitOpts {
         Ok(())
     }
 
-    fn emit_wasm(&self, decoded: &DecodedWasm) -> Result<()> {
+    fn exportize(
+        &self,
+        decoded: &mut DecodedWasm,
+        world: Option<&str>,
+        out_world_name: Option<&String>,
+        import_names: &[String],
+    ) -> Result<()> {
+        let (resolve, world_id) = match (&mut *decoded, world) {
+            (DecodedWasm::Component(resolve, world), None) => (resolve, *world),
+            (DecodedWasm::Component(..), Some(_)) => {
+                bail!(
+                    "the `--exportize-world` flag is not compatible with a \
+                     component input, use `--exportize` instead"
+                );
+            }
+            (DecodedWasm::WitPackage(resolve, id), world) => {
+                let world = resolve.select_world(&[*id], world)?;
+                (resolve, world)
+            }
+        };
+        // Build a set of matching names (both plain names and interface names)
+        // before constructing the filter, to avoid borrowing `resolve` in the
+        // closure.
+        let filter: Option<Box<dyn Fn(&WorldKey, &WorldItem) -> bool>> = if import_names.is_empty()
+        {
+            None
+        } else {
+            let names: Vec<String> = import_names.to_vec();
+            let world = &resolve.worlds[world_id];
+            let matching_keys: Vec<WorldKey> = world
+                .imports
+                .keys()
+                .filter(|key| match key {
+                    WorldKey::Name(n) => names.iter().any(|f| f == n),
+                    WorldKey::Interface(id) => {
+                        let iface = &resolve.interfaces[*id];
+                        match &iface.name {
+                            Some(n) => names.iter().any(|f| f == n),
+                            None => false,
+                        }
+                    }
+                })
+                .cloned()
+                .collect();
+            Some(Box::new(move |key: &WorldKey, _item: &WorldItem| {
+                matching_keys.contains(key)
+            }))
+        };
+        resolve
+            .exportize(world_id, out_world_name.cloned(), filter.as_deref())
+            .context("failed to move world imports to exports")?;
+        let resolve = mem::take(resolve);
+        *decoded = DecodedWasm::Component(resolve, world_id);
+        Ok(())
+    }
+
+    fn generate_nominal_type_ids(&self, decoded: &mut DecodedWasm, world: &str) -> Result<()> {
+        let (resolve, pkg) = match decoded {
+            DecodedWasm::Component(resolve, world_id) => {
+                let pkg = resolve.worlds[*world_id].package.unwrap();
+                (resolve, pkg)
+            }
+            DecodedWasm::WitPackage(resolve, pkg) => (resolve, *pkg),
+        };
+        let world_id = resolve.select_world(&[pkg], Some(world))?;
+        resolve.generate_nominal_type_ids(world_id);
+        let resolve = mem::take(resolve);
+        *decoded = DecodedWasm::Component(resolve, world_id);
+        Ok(())
+    }
+
+    fn emit_wasm(&self, decoded: &DecodedWasm, canonical_names: bool) -> Result<()> {
         assert!(self.wasm || self.wat);
         assert!(self.out_dir.is_none());
 
         let decoded_package = decoded.package();
-        let bytes = wit_component::encode(decoded.resolve(), decoded_package)?;
+        let bytes = wit_component::encode(decoded.resolve(), decoded_package, canonical_names)?;
         if !self.skip_validation {
             wasmparser::Validator::new_with_features(WasmFeatures::all()).validate_all(&bytes)?;
         }
@@ -934,6 +1333,12 @@ pub struct TargetsOpts {
 
     #[clap(flatten)]
     input: wasm_tools::InputArg,
+
+    /// Matches interfaces by their canonical names, so semver-compatible
+    /// versions (e.g. `wasi:cli@0.2.3` and `wasi:cli@0.2.0`) are type-checked
+    /// against each other.
+    #[clap(long)]
+    semver_compatible: bool,
 }
 
 impl TargetsOpts {
@@ -947,7 +1352,7 @@ impl TargetsOpts {
         let world = resolve.select_world(&[pkg_id], self.world.as_deref())?;
         let component_to_test = self.input.get_binary_wasm(None)?;
 
-        wit_component::targets(&resolve, world, &component_to_test)?;
+        wit_component::targets(&resolve, world, &component_to_test, self.semver_compatible)?;
 
         Ok(())
     }
@@ -1021,7 +1426,7 @@ pub struct UnbundleOpts {
     ///
     /// Modules that are larger than this value will be removed from the
     /// component and unbundled. Modules smaller than this value will be left in
-    /// place and bundled within the componente.
+    /// place and bundled within the components.
     #[clap(long, value_name = "SIZE", default_value_t = 10 << 10)]
     threshold: usize,
 
@@ -1049,7 +1454,7 @@ impl UnbundleOpts {
             let range = match payload? {
                 Payload::ModuleSection {
                     unchecked_range, ..
-                } => unchecked_range,
+                } => unchecked_range.start as usize..unchecked_range.end as usize,
                 _ => continue,
             };
             modules_to_extract.push(if range.len() > self.threshold {
@@ -1149,7 +1554,7 @@ impl CoreTypeInterner {
             return Ok(*ret);
         }
         let ty = &types[id];
-        if !ty.is_final || ty.supertype_idx.is_some() || ty.composite_type.shared {
+        if !ty.is_final || !ty.supertype_idxs.is_empty() || ty.composite_type.shared {
             bail!("unsupported core type to translate")
         }
         let f = match &ty.composite_type.inner {
@@ -1204,6 +1609,9 @@ impl<'a> ModuleTypeCreator<'a> {
     ) -> Result<wasm_encoder::EntityType> {
         Ok(match ty {
             EntityType::Func(id) => wasm_encoder::EntityType::Function(self.convert_func(id)?),
+            EntityType::FuncExact(id) => {
+                wasm_encoder::EntityType::FunctionExact(self.convert_func(id)?)
+            }
             EntityType::Table(t) => wasm_encoder::EntityType::Table(wasm_encoder::TableType {
                 shared: t.shared,
                 maximum: t.maximum,

@@ -1,7 +1,7 @@
 //! The WebAssembly component tooling.
 
 #![deny(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::str::FromStr;
 use std::{borrow::Cow, fmt::Display};
@@ -21,6 +21,7 @@ pub use encoding::{ComponentEncoder, LibraryInfo, encode};
 pub use linking::Linker;
 pub use printing::*;
 pub use targets::*;
+pub use validation::AdapterModuleDidNotExport;
 pub use wit_parser::decoding::{DecodedWasm, decode, decode_reader};
 
 pub mod metadata;
@@ -65,7 +66,7 @@ impl FromStr for StringEncoding {
             "utf8" => Ok(StringEncoding::UTF8),
             "utf16" => Ok(StringEncoding::UTF16),
             "compact-utf16" => Ok(StringEncoding::CompactUTF16),
-            _ => bail!("unknown string encoding `{}`", s),
+            _ => bail!("unknown string encoding `{s}`"),
         }
     }
 }
@@ -94,8 +95,9 @@ pub fn embed_component_metadata(
     wit_resolver: &Resolve,
     world: WorldId,
     encoding: StringEncoding,
+    canonical_names: bool,
 ) -> Result<()> {
-    let encoded = metadata::encode(&wit_resolver, world, encoding, None)?;
+    let encoded = metadata::encode(&wit_resolver, world, encoding, None, canonical_names)?;
 
     let section = wasm_encoder::CustomSection {
         name: "component-type".into(),
@@ -150,7 +152,7 @@ world test-world {}
         let world = resolver.select_world(&[pkg], Some("test-world"))?;
 
         // Embed component metadata
-        embed_component_metadata(&mut bytes, &resolver, world, StringEncoding::UTF8)?;
+        embed_component_metadata(&mut bytes, &resolver, world, StringEncoding::UTF8, true)?;
 
         // Re-retrieve custom section count, and search for the component-type custom section along the way
         let mut found_component_section = false;

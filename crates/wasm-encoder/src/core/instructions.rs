@@ -1446,6 +1446,22 @@ impl<'a> InstructionSink<'a> {
         self
     }
 
+    /// Encode [`Instruction::StructNewDesc`].
+    pub fn struct_new_desc(&mut self, type_index: u32) -> &mut Self {
+        self.sink.push(0xfb);
+        self.sink.push(0x20);
+        type_index.encode(self.sink);
+        self
+    }
+
+    /// Encode [`Instruction::StructNewDefaultDesc`].
+    pub fn struct_new_default_desc(&mut self, type_index: u32) -> &mut Self {
+        self.sink.push(0xfb);
+        self.sink.push(0x21);
+        type_index.encode(self.sink);
+        self
+    }
+
     /// Encode [`Instruction::ArrayNew`].
     pub fn array_new(&mut self, type_index: u32) -> &mut Self {
         self.sink.push(0xfb);
@@ -3603,10 +3619,17 @@ impl<'a> InstructionSink<'a> {
     }
 
     /// Encode [`Instruction::AtomicFence`].
-    pub fn atomic_fence(&mut self) -> &mut Self {
+    pub fn atomic_fence(&mut self, ordering: Ordering) -> &mut Self {
         self.sink.push(0xFE);
         self.sink.push(0x03);
-        self.sink.push(0x00);
+        ordering.encode(self.sink);
+        self
+    }
+
+    /// Encode [`Instruction::Pause`].
+    pub fn pause(&mut self) -> &mut Self {
+        self.sink.push(0xFE);
+        self.sink.push(0x04);
         self
     }
 
@@ -4572,9 +4595,24 @@ impl<'a> InstructionSink<'a> {
         self
     }
 
+    /// Encode [`Instruction::ResumeThrowRef`].
+    pub fn resume_throw_ref<V: IntoIterator<Item = Handle>>(
+        &mut self,
+        cont_type_index: u32,
+        resume_table: V,
+    ) -> &mut Self
+    where
+        V::IntoIter: ExactSizeIterator,
+    {
+        self.sink.push(0xE5);
+        cont_type_index.encode(self.sink);
+        encode_vec(resume_table, self.sink);
+        self
+    }
+
     /// Encode [`Instruction::Switch`].
     pub fn switch(&mut self, cont_type_index: u32, tag_index: u32) -> &mut Self {
-        self.sink.push(0xE5);
+        self.sink.push(0xE6);
         cont_type_index.encode(self.sink);
         tag_index.encode(self.sink);
         self
@@ -4607,6 +4645,64 @@ impl<'a> InstructionSink<'a> {
     pub fn i64_mul_wide_u(&mut self) -> &mut Self {
         self.sink.push(0xFC);
         22u32.encode(self.sink);
+        self
+    }
+
+    /// Encode [`Instruction::RefGetDesc`].
+    pub fn ref_get_desc(&mut self, type_index: u32) -> &mut Self {
+        self.sink.push(0xFB);
+        34u32.encode(self.sink);
+        type_index.encode(self.sink);
+        self
+    }
+
+    /// Encode [`Instruction::RefCastDescEqNonNull`].
+    pub fn ref_cast_desc_eq_non_null(&mut self, ht: HeapType) -> &mut Self {
+        self.sink.push(0xFB);
+        35u32.encode(self.sink);
+        ht.encode(self.sink);
+        self
+    }
+
+    /// Encode [`Instruction::RefCastDescEqNullable`].
+    pub fn ref_cast_desc_eq_nullable(&mut self, ht: HeapType) -> &mut Self {
+        self.sink.push(0xFB);
+        36u32.encode(self.sink);
+        ht.encode(self.sink);
+        self
+    }
+
+    /// Encode [`Instruction::BrOnCastDescEq`].
+    pub fn br_on_cast_desc_eq(
+        &mut self,
+        relative_depth: u32,
+        from_ref_type: RefType,
+        to_ref_type: RefType,
+    ) -> &mut Self {
+        self.sink.push(0xFB);
+        37u32.encode(self.sink);
+        let cast_flags = (from_ref_type.nullable as u8) | ((to_ref_type.nullable as u8) << 1);
+        self.sink.push(cast_flags);
+        relative_depth.encode(self.sink);
+        from_ref_type.heap_type.encode(self.sink);
+        to_ref_type.heap_type.encode(self.sink);
+        self
+    }
+
+    /// Encode [`Instruction::BrOnCastDescEqFail`].
+    pub fn br_on_cast_desc_eq_fail(
+        &mut self,
+        relative_depth: u32,
+        from_ref_type: RefType,
+        to_ref_type: RefType,
+    ) -> &mut Self {
+        self.sink.push(0xFB);
+        38u32.encode(self.sink);
+        let cast_flags = (from_ref_type.nullable as u8) | ((to_ref_type.nullable as u8) << 1);
+        self.sink.push(cast_flags);
+        relative_depth.encode(self.sink);
+        from_ref_type.heap_type.encode(self.sink);
+        to_ref_type.heap_type.encode(self.sink);
         self
     }
 }

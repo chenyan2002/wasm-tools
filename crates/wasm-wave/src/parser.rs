@@ -1,20 +1,29 @@
 //! Parsing types
 
-use std::{collections::HashSet, error::Error, fmt::Display};
+use core::{error::Error, fmt::Display};
 
-use indexmap::IndexMap;
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use crate::{
     WasmValue,
     ast::{Node, NodeType},
-    lex::{Keyword, Lexer, Span, Token},
+    lex::{FuncNameLexer, FuncNameToken, Keyword, Lexer, Span, Token},
     untyped::{UntypedFuncCall, UntypedValue},
 };
+
+const MAX_DEPTH: usize = 100;
 
 /// A Web Assembly Value Encoding parser.
 pub struct Parser<'source> {
     lex: Lexer<'source>,
     curr: Option<Token>,
+    depth: usize,
 }
 
 impl<'source> Parser<'source> {
@@ -28,6 +37,7 @@ impl<'source> Parser<'source> {
         Self {
             lex: lexer,
             curr: None,
+            depth: 0,
         }
     }
 
@@ -44,23 +54,6 @@ impl<'source> Parser<'source> {
         Ok(UntypedValue::new(self.lex.source(), node))
     }
 
-    /// Parses a function name followed by a WAVE-encoded, parenthesized,
-    /// comma-separated sequence of values into an [`UntypedFuncCall`].
-    pub fn parse_raw_func_call(&mut self) -> Result<UntypedFuncCall<'source>, ParserError> {
-        self.advance()?;
-        let name = self.parse_label()?;
-        self.advance()?;
-        self.expect_token(Token::ParenOpen)?;
-
-        let params = if self.next_is(Token::ParenClose) {
-            self.advance()?;
-            None
-        } else {
-            Some(self.parse_tuple()?)
-        };
-        Ok(UntypedFuncCall::new(self.lex.source(), name, params))
-    }
-
     /// Returns an error if any significant input remains unparsed.
     pub fn finish(&mut self) -> Result<(), ParserError> {
         match self.lex.clone().spanned().next() {
@@ -73,6 +66,19 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_node(&mut self) -> Result<Node, ParserError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(ParserError::new(
+                ParserErrorKind::NestingTooDeep,
+                self.lex.span(),
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_node_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_node_inner(&mut self) -> Result<Node, ParserError> {
         Ok(match self.advance()? {
             Token::Number => self.leaf_node(NodeType::Number),
             Token::Char => self.leaf_node(NodeType::Char),
@@ -80,7 +86,7 @@ impl<'source> Parser<'source> {
             Token::MultilineString => self.leaf_node(NodeType::MultilineString),
             Token::ParenOpen => self.parse_tuple()?,
             Token::BracketOpen => self.parse_list()?,
-            Token::BraceOpen => self.parse_record_or_flags()?,
+            Token::BraceOpen => self.parse_braces()?,
             Token::Sharp => self.parse_handle()?,
             Token::LabelOrKeyword => match Keyword::decode(self.slice()) {
                 Some(Keyword::True) => self.leaf_node(NodeType::BoolTrue),
@@ -123,68 +129,65 @@ impl<'source> Parser<'source> {
         Ok(Node::new(NodeType::List, start..self.span().end, children))
     }
 
-    fn parse_record_or_flags(&mut self) -> Result<Node, ParserError> {
+    fn parse_braces(&mut self) -> Result<Node, ParserError> {
         let start = self.span().start;
         self.advance()?;
 
         match self.token() {
-            // Handle empty record (`{:}`)
+            // Handle empty record or map (`{:}`)
             Token::Colon => {
                 self.advance()?; // Advance to `}`
                 self.expect_token(Token::BraceClose)?;
-                return Ok(Node::new(NodeType::Record, start..self.span().end, []));
+                return Ok(Node::new(NodeType::TupleSet, start..self.span().end, []));
             }
-            // Handle empty flags (`{}`)
-            Token::BraceClose => return Ok(Node::new(NodeType::Flags, start..self.span().end, [])),
+            // Handle empty flags or map (`{}`)
+            Token::BraceClose => {
+                return Ok(Node::new(NodeType::EmptySet, start..self.span().end, []));
+            }
             _ => (),
         }
 
-        // Check for a following `:` to distinguish records from flags
-        if self.next_is(Token::Colon) {
-            self.finish_record(start)
+        // Check for a following `:` to distinguish records and maps from flags,
+        // which can only be labels
+        if self.token() != Token::LabelOrKeyword || self.next_is(Token::Colon) {
+            self.finish_tuple_set(start)
         } else {
             self.finish_flags(start)
         }
     }
 
-    fn finish_record(&mut self, start: usize) -> Result<Node, ParserError> {
-        let mut seen = HashSet::with_capacity(1);
+    fn finish_tuple_set(&mut self, start: usize) -> Result<Node, ParserError> {
         let mut children = Vec::with_capacity(2);
         loop {
-            // Parse field label
-            let label = self.parse_label()?;
-            // Check for duplicate fields
-            let field = self.slice().trim_start_matches('%');
-            if !seen.insert(field) {
-                return Err(ParserError::with_detail(
-                    ParserErrorKind::DuplicateField,
-                    label.span(),
-                    format!("{field:?}"),
-                ));
-            }
+            // Parse record field label or map key
+            let key = self.parse_key()?;
             // Parse colon
             self.advance()?;
             self.expect_token(Token::Colon)?;
             // Parse value
             let value = self.parse_node()?;
-            children.extend([label, value]);
-            // Parse comma and/or end of record
-            if self.advance()? == Token::Comma {
-                self.advance()?;
-            }
-            if self.token() == Token::BraceClose {
-                break;
+            children.extend([key, value]);
+            // Parse comma or closing brace
+            match self.advance()? {
+                Token::Comma => {
+                    self.advance()?;
+                    if self.token() == Token::BraceClose {
+                        break;
+                    }
+                }
+                Token::BraceClose => break,
+                _ => return Err(self.unexpected_token()),
             }
         }
         Ok(Node::new(
-            NodeType::Record,
+            NodeType::TupleSet,
             start..self.span().end,
             children,
         ))
     }
 
     fn finish_flags(&mut self, start: usize) -> Result<Node, ParserError> {
-        let mut flags = IndexMap::with_capacity(1);
+        let mut flags = BTreeMap::new();
         loop {
             // Parse flag label
             let label = self.parse_label()?;
@@ -198,12 +201,15 @@ impl<'source> Parser<'source> {
                     format!("{flag:?}"),
                 ));
             }
-            // Parse comma and/or end of flags
-            if self.advance()? == Token::Comma {
-                self.advance()?;
-            }
-            if self.token() == Token::BraceClose {
-                break;
+            match self.advance()? {
+                Token::Comma => {
+                    self.advance()?;
+                    if self.token() == Token::BraceClose {
+                        break;
+                    }
+                }
+                Token::BraceClose => break,
+                _ => return Err(self.unexpected_token()),
             }
         }
         Ok(Node::new(
@@ -266,6 +272,20 @@ impl<'source> Parser<'source> {
         Ok(self.leaf_node(NodeType::Label))
     }
 
+    /// Parses a record field label or map key. Keywords are labels here, so
+    /// that, e.g., `true` can be a field or a `bool` key.
+    fn parse_key(&mut self) -> Result<Node, ParserError> {
+        let ty = match self.token() {
+            Token::LabelOrKeyword => NodeType::Label,
+            Token::Number => NodeType::Number,
+            Token::Char => NodeType::Char,
+            Token::String => NodeType::String,
+            Token::MultilineString => NodeType::MultilineString,
+            _ => return Err(self.unexpected_token()),
+        };
+        Ok(self.leaf_node(ty))
+    }
+
     fn advance(&mut self) -> Result<Token, ParserError> {
         let token = match self.lex.next() {
             Some(Ok(token)) => token,
@@ -313,7 +333,7 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_comma_separated_nodes(&mut self, end_token: Token) -> Result<Vec<Node>, ParserError> {
-        let mut nodes = vec![];
+        let mut nodes = Vec::new();
         if self.next_is(end_token) {
             self.advance()?;
             return Ok(nodes);
@@ -400,7 +420,7 @@ impl ParserError {
 }
 
 impl Display for ParserError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if let Some(source) = &self.source {
             write!(f, "{}: {} at {:?}", self.kind, source, self.span)
         } else if let Some(detail) = &self.detail {
@@ -417,6 +437,55 @@ impl Error for ParserError {
     }
 }
 
+/// Parses a function name followed by a WAVE-encoded, parenthesized,
+/// comma-separated sequence of values into an [`UntypedFuncCall`].
+pub fn parse_raw_func_call<'source>(
+    source: &'source str,
+) -> Result<UntypedFuncCall<'source>, ParserError> {
+    let mut name_parser = FuncNameParser::with_lexer(FuncNameLexer::new(source));
+    let _func_name = name_parser.advance()?;
+    let name = name_parser.lex.span();
+
+    let mut params_parser = Parser::with_lexer(name_parser.lex.morph());
+    params_parser.advance()?;
+    params_parser.expect_token(Token::ParenOpen)?;
+
+    let params = if params_parser.next_is(Token::ParenClose) {
+        params_parser.advance()?;
+        None
+    } else {
+        Some(params_parser.parse_tuple()?)
+    };
+    params_parser.finish()?;
+    Ok(UntypedFuncCall::new(source, name, params))
+}
+
+struct FuncNameParser<'source> {
+    lex: FuncNameLexer<'source>,
+    curr: Option<FuncNameToken>,
+}
+impl<'source> FuncNameParser<'source> {
+    fn with_lexer(lex: FuncNameLexer<'source>) -> Self {
+        Self { lex, curr: None }
+    }
+    fn advance(&mut self) -> Result<FuncNameToken, ParserError> {
+        let token = match self.lex.next() {
+            Some(Ok(token)) => token,
+            Some(Err(span)) => {
+                let span = span.unwrap_or_else(|| self.lex.span());
+                return Err(ParserError::new(ParserErrorKind::InvalidToken, span));
+            }
+            None => {
+                return Err(ParserError::new(
+                    ParserErrorKind::UnexpectedEnd,
+                    self.lex.span(),
+                ));
+            }
+        };
+        self.curr = Some(token);
+        Ok(token)
+    }
+}
 /// The kind of a WAVE parsing error.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
@@ -436,10 +505,11 @@ pub enum ParserErrorKind {
     DuplicateField,
     DuplicateFlag,
     WasmValueError,
+    NestingTooDeep,
 }
 
 impl Display for ParserErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let msg = match self {
             ParserErrorKind::EmptyTuple => "empty tuple",
             ParserErrorKind::MultipleChars => "multiple characters in char value",
@@ -455,6 +525,7 @@ impl Display for ParserErrorKind {
             ParserErrorKind::DuplicateField => "duplicate field",
             ParserErrorKind::DuplicateFlag => "duplicate flag",
             ParserErrorKind::WasmValueError => "error converting Wasm value",
+            ParserErrorKind::NestingTooDeep => "value nesting too deep",
         };
         write!(f, "{msg}")
     }
@@ -612,16 +683,156 @@ mod tests {
     }
 
     #[test]
-    fn parse_percent_identifiers() {
+    fn parse_flags_in_type_order() {
+        // Keeps flags in the order `make_flags` gives them, like
+        // `wasmtime::component::Val` does, unlike `Value`, which sorts them.
+        #[derive(Clone)]
+        struct Flags(Vec<String>);
+
+        impl WasmValue for Flags {
+            type Type = Type;
+
+            fn kind(&self) -> crate::wasm::WasmTypeKind {
+                crate::wasm::WasmTypeKind::Flags
+            }
+
+            fn make_flags<'a>(
+                _ty: &Type,
+                names: impl IntoIterator<Item = &'a str>,
+            ) -> Result<Self, crate::wasm::WasmValueError> {
+                Ok(Self(names.into_iter().map(String::from).collect()))
+            }
+        }
+
+        let ty = Type::flags(["read", "write", "exec"]).unwrap();
+        for input in ["{write, exec}", "{exec, write}", "{%exec, write}"] {
+            let Flags(names) = Parser::new(input).parse_value(&ty).unwrap();
+            assert_eq!(names, ["write", "exec"], "for {input:?}");
+        }
+    }
+
+    #[test]
+    fn reject_record_missing_commas() {
         let ty = Type::record([("red", Type::S32), ("green", Type::CHAR)]).unwrap();
+
+        for input in [
+            r#"{"red": 1 "green": 'a'}"#,
+            r#"{"red":1"green":'a'}"#,
+            "{\"red\": 1\n\"green\": 'a'}",
+        ] {
+            let err = Parser::new(input).parse_value::<Value>(&ty).unwrap_err();
+            assert_eq!(err.kind(), ParserErrorKind::UnexpectedToken);
+        }
+    }
+
+    #[test]
+    fn reject_map_missing_commas() {
+        let ty = Type::map(Type::STRING, Type::U32).unwrap();
+        for input in [
+            r#"{"a": 1 "b": 2}"#,
+            r#"{"a":1"b":2}"#,
+            "{\"a\": 1\n\"b\": 2}",
+        ] {
+            let err = Parser::new(input).parse_value::<Value>(&ty).unwrap_err();
+            assert_eq!(err.kind(), ParserErrorKind::UnexpectedToken);
+        }
+
+        let ty = Type::map(Type::S8, Type::BOOL).unwrap();
+        for input in ["{-1: true 1: false}", "{-1:true-2:false}"] {
+            let err = Parser::new(input).parse_value::<Value>(&ty).unwrap_err();
+            assert_eq!(err.kind(), ParserErrorKind::UnexpectedToken);
+        }
+    }
+
+    #[test]
+    fn reject_flags_missing_commas() {
+        let ty = Type::flags(["read", "write", "exec"]).unwrap();
+        for input in [
+            "{read write}",
+            "{read write exec}",
+            "{read, write exec}",
+            "{%read write}",
+            "{read\nwrite}",
+            "{read // comment\nwrite}",
+        ] {
+            let err = Parser::new(input).parse_value::<Value>(&ty).unwrap_err();
+            assert_eq!(err.kind(), ParserErrorKind::UnexpectedToken);
+        }
+    }
+
+    #[test]
+    fn reject_missing_commas_untyped() {
+        // The commas are also required before any type is known.
+        for input in [
+            "{a: 1 b: 2}",
+            "{a:0b:\"\"}",
+            "{a b}",
+            "{a b c}",
+            r#"{"a": 1 "b": 2}"#,
+            "{1: 2 3: 4}",
+            "{a: {b: 1 c: 2}}",
+            "{a: [{b: 1 c: 2}]}",
+        ] {
+            let err = Parser::new(input).parse_raw_value().unwrap_err();
+            assert_eq!(err.kind(), ParserErrorKind::UnexpectedToken);
+        }
+    }
+
+    #[test]
+    fn accept_commas_between_and_after_entries() {
+        let ty = Type::record([("red", Type::S32), ("green", Type::CHAR)]).unwrap();
+        for input in [
+            "{red: 0, green: 'a'}",
+            "{red: 0, green: 'a',}",
+            "{ red : 0 , green : 'a' , }",
+            "{red: 0 // c\n, green: 'a'}",
+        ] {
+            Parser::new(input).parse_value::<Value>(&ty).unwrap();
+        }
+        let ty = Type::flags(["read", "write"]).unwrap();
+        for input in [
+            "{read, write}",
+            "{read, write,}",
+            "{ read , write , }",
+            "{read}",
+            "{read,}",
+        ] {
+            Parser::new(input).parse_value::<Value>(&ty).unwrap();
+        }
+    }
+
+    #[test]
+    fn reject_record_unknown_fields() {
+        let ty = Type::record([("red", Type::S32), ("green", Type::CHAR)]).unwrap();
+        for input in [
+            "{red: 0, green: 'a', blue: 1}",
+            "{blue: 1, red: 0, green: 'a'}",
+            // The value of an unknown field is not checked against anything.
+            "{red: 0, green: 'a', blue: 300}",
+            "{red: 0, green: 'a', blue: {x: 1, x: 2}}",
+        ] {
+            let err = Parser::new(input).parse_value::<Value>(&ty).unwrap_err();
+            assert_eq!(err.kind(), ParserErrorKind::InvalidValue);
+        }
+    }
+
+    #[test]
+    fn parse_percent_identifiers() {
+        let ty = Type::record([
+            ("red", Type::S32),
+            ("green", Type::CHAR),
+            ("color-42-2A-5d", Type::BOOL),
+        ])
+        .unwrap();
         // Test identifiers with '%' prefixes.
         assert_eq!(
-            parse_value("{ %red: 0, %green: 'a' }", &ty),
+            parse_value("{ %red: 0, %green: 'a', %color-42-2A-5d: true }", &ty),
             Value::make_record(
                 &ty,
                 [
                     ("red", Value::make_s32(0)),
-                    ("green", Value::make_char('a'))
+                    ("green", Value::make_char('a')),
+                    ("color-42-2A-5d", Value::make_bool(true))
                 ]
             )
             .unwrap()
@@ -691,6 +902,137 @@ mod tests {
             .parse_value::<Value>(&ty)
             .unwrap_err();
         assert_eq!(err.kind(), ParserErrorKind::InvalidType);
+    }
+
+    #[test]
+    fn parse_maps() {
+        let ty = Type::map(Type::STRING, Type::U32).unwrap();
+        let entry =
+            |key: &str, value: u32| (Value::make_string(key.into()), Value::make_u32(value));
+        assert_eq!(parse_value("{}", &ty), Value::make_map(&ty, []).unwrap());
+        assert_eq!(
+            parse_value(r#"{"a": 1}"#, &ty),
+            Value::make_map(&ty, [entry("a", 1)]).unwrap()
+        );
+        // Entry order is preserved and trailing commas are permitted.
+        assert_eq!(
+            parse_value(r#"{ "b" : 2, "a": 1, }"#, &ty),
+            Value::make_map(&ty, [entry("b", 2), entry("a", 1)]).unwrap()
+        );
+
+        let ty = Type::map(Type::S8, Type::BOOL).unwrap();
+        assert_eq!(
+            parse_value("{-1: true, 1: false}", &ty),
+            Value::make_map(
+                &ty,
+                [
+                    (Value::make_s8(-1), Value::make_bool(true)),
+                    (Value::make_s8(1), Value::make_bool(false)),
+                ]
+            )
+            .unwrap()
+        );
+
+        // Keyword keys are `bool` keys, not record fields.
+        let ty = Type::map(Type::BOOL, Type::option(Type::BOOL)).unwrap();
+        assert_eq!(
+            parse_value("{true: none, false: some(false)}", &ty),
+            Value::make_map(
+                &ty,
+                [
+                    (
+                        Value::make_bool(true),
+                        Value::make_option(&Type::option(Type::BOOL), None).unwrap()
+                    ),
+                    (
+                        Value::make_bool(false),
+                        Value::make_option(
+                            &Type::option(Type::BOOL),
+                            Some(Value::make_bool(false))
+                        )
+                        .unwrap()
+                    ),
+                ]
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn reject_invalid_maps() {
+        let ty = Type::map(Type::STRING, Type::U32).unwrap();
+        for (input, kind) in [
+            // Wrong key type
+            ("{1: 1}", ParserErrorKind::InvalidType),
+            ("{'a': 1}", ParserErrorKind::InvalidType),
+            ("{a: 1}", ParserErrorKind::InvalidType),
+            // Wrong value type
+            (r#"{"a": "b"}"#, ParserErrorKind::InvalidType),
+            // Lists and flags are not maps
+            ("[]", ParserErrorKind::InvalidType),
+            (r#"[("a", 1)]"#, ParserErrorKind::InvalidType),
+            ("{a}", ParserErrorKind::InvalidType),
+            // Mixed flags and map entries
+            (r#"{"a"}"#, ParserErrorKind::UnexpectedToken),
+            (r#"{"a": 1, b}"#, ParserErrorKind::UnexpectedToken),
+            (r#"{a, "b": 1}"#, ParserErrorKind::UnexpectedToken),
+            // Missing key or value
+            (r#"{"a":}"#, ParserErrorKind::UnexpectedToken),
+            ("{: 1}", ParserErrorKind::UnexpectedToken),
+            (r#"{"a": 1: 2}"#, ParserErrorKind::UnexpectedToken),
+        ] {
+            let err = Parser::new(input).parse_value::<Value>(&ty).unwrap_err();
+            assert_eq!(err.kind(), kind, "for {input:?}: {err}");
+        }
+
+        // Map keys are not record fields
+        let ty = Type::record([("a", Type::U32)]).unwrap();
+        let err = Parser::new(r#"{"a": 1}"#)
+            .parse_value::<Value>(&ty)
+            .unwrap_err();
+        assert_eq!(err.kind(), ParserErrorKind::InvalidType);
+    }
+
+    #[test]
+    fn reject_deeply_nested_values() {
+        let deep = MAX_DEPTH + 1;
+        let cases = [
+            ("[".repeat(deep) + &"]".repeat(deep), "nested lists"),
+            ("(".repeat(deep) + "0" + &")".repeat(deep), "nested tuples"),
+            (
+                "some(".repeat(deep) + "0" + &")".repeat(deep),
+                "nested some()",
+            ),
+            ("ok(".repeat(deep) + "0" + &")".repeat(deep), "nested ok()"),
+            (
+                "{a:".repeat(deep) + "0" + &"}".repeat(deep),
+                "nested records",
+            ),
+            (
+                "v(".repeat(deep) + "0" + &")".repeat(deep),
+                "nested variant payloads",
+            ),
+        ];
+        for (input, desc) in cases {
+            let err = UntypedValue::parse(&input)
+                .expect_err(&alloc::format!("{desc} should be rejected"));
+            assert_eq!(
+                err.kind(),
+                ParserErrorKind::NestingTooDeep,
+                "wrong error kind for {desc}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_deeply_nested_func_call_params() {
+        let deep = MAX_DEPTH + 1;
+        let input = alloc::format!("f({}0{})", "some(".repeat(deep), ")".repeat(deep));
+        let err = match UntypedFuncCall::parse(&input) {
+            Ok(_) => panic!("deeply nested func call params should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ParserErrorKind::NestingTooDeep);
     }
 
     fn parse_value(input: &str, ty: &Type) -> Value {

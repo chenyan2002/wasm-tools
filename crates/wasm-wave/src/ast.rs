@@ -1,12 +1,21 @@
 //! Abstract syntax tree types
 
-use std::{borrow::Cow, collections::HashMap, str::FromStr};
+use core::str::FromStr;
+
+use alloc::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use crate::{
     lex::Span,
     parser::{ParserError, ParserErrorKind},
     strings::{StringPartsIter, unescape},
-    wasm::{WasmType, WasmTypeKind, WasmValue, WasmValueError},
+    wasm::{DisplayType, WasmType, WasmTypeKind, WasmValue, WasmValueError},
+    writer::merge_map_entries,
 };
 
 /// A WAVE AST node.
@@ -129,13 +138,46 @@ impl Node {
         Ok(self.children.iter())
     }
 
+    /// Returns an iterator of key and value node pairs if this node can
+    /// represent a map value.
+    ///
+    /// Keys are not checked here; see [`NodeType::TupleSet`] for the nodes
+    /// they may be. Entries are in their encoded order and may repeat keys.
+    pub fn as_map(&self) -> Result<impl ExactSizeIterator<Item = (&Node, &Node)>, ParserError> {
+        match self.ty {
+            NodeType::TupleSet | NodeType::EmptySet => (),
+            _ => return Err(self.error(ParserErrorKind::InvalidType)),
+        }
+        Ok(self.children.chunks(2).map(|chunk| (&chunk[0], &chunk[1])))
+    }
+
     /// Returns an iterator of field name and value node pairs if this node
     /// represents a record value.
+    ///
+    /// Returns an error if a key is not a field label or if a field is
+    /// repeated.
     pub fn as_record<'this, 'src>(
         &'this self,
         src: &'src str,
     ) -> Result<impl ExactSizeIterator<Item = (&'src str, &'this Node)>, ParserError> {
-        self.ensure_type(NodeType::Record)?;
+        self.ensure_type(NodeType::TupleSet)?;
+        let mut seen = BTreeSet::new();
+        for key in self.children.iter().step_by(2) {
+            let field = key.as_label(src).map_err(|_| {
+                ParserError::with_detail(
+                    ParserErrorKind::InvalidType,
+                    key.span(),
+                    "expected a record field label",
+                )
+            })?;
+            if !seen.insert(field) {
+                return Err(ParserError::with_detail(
+                    ParserErrorKind::DuplicateField,
+                    key.span(),
+                    format!("{field:?}"),
+                ));
+            }
+        }
         Ok(self
             .children
             .chunks(2)
@@ -189,11 +231,11 @@ impl Node {
         &'this self,
         src: &'src str,
     ) -> Result<impl Iterator<Item = &'src str> + 'this, ParserError> {
-        self.ensure_type(NodeType::Flags)?;
-        Ok(self.children.iter().map(|node| {
-            debug_assert_eq!(node.ty, NodeType::Label);
-            node.slice(src)
-        }))
+        match self.ty {
+            NodeType::Flags | NodeType::EmptySet => (),
+            _ => return Err(self.error(ParserErrorKind::InvalidType)),
+        }
+        Ok(self.children.iter().map(|node| node.as_label(src).unwrap()))
     }
 
     fn as_label<'src>(&self, src: &'src str) -> Result<&'src str, ParserError> {
@@ -228,6 +270,7 @@ impl Node {
             WasmTypeKind::Result => self.to_wasm_result(ty, src)?,
             WasmTypeKind::Flags => self.to_wasm_flags(ty, src)?,
             WasmTypeKind::Handle => self.to_wasm_handle(ty, src)?,
+            WasmTypeKind::Map => self.to_wasm_map(ty, src)?,
             other => {
                 return Err(
                     self.wasm_value_error(WasmValueError::UnsupportedType(other.to_string()))
@@ -282,12 +325,12 @@ impl Node {
     }
 
     fn to_wasm_record<V: WasmValue>(&self, ty: &V::Type, src: &str) -> Result<V, ParserError> {
-        let values = self.as_record(src)?.collect::<HashMap<_, _>>();
+        let mut values = self.as_record(src)?.collect::<BTreeMap<_, _>>();
         let record_fields = ty.record_fields().collect::<Vec<_>>();
         let fields = record_fields
             .iter()
             .map(|(name, field_type)| {
-                let value = match (values.get(name.as_ref()), field_type.kind()) {
+                let value = match (values.remove(name.as_ref()), field_type.kind()) {
                     (Some(node), _) => node.to_wasm_value(field_type, src)?,
                     (None, WasmTypeKind::Option) => V::make_option(field_type, None)
                         .map_err(|err| self.wasm_value_error(err))?,
@@ -300,6 +343,10 @@ impl Node {
                 Ok((name.as_ref(), value))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if !values.is_empty() {
+            // Value does not match the type, as it has more fields.
+            return Err(self.error(ParserErrorKind::InvalidValue));
+        }
         V::make_record(ty, fields).map_err(|err| self.wasm_value_error(err))
     }
 
@@ -385,7 +432,46 @@ impl Node {
     }
 
     fn to_wasm_flags<V: WasmValue>(&self, ty: &V::Type, src: &str) -> Result<V, ParserError> {
-        V::make_flags(ty, self.as_flags(src)?).map_err(|err| self.wasm_value_error(err))
+        // Sort flags in `WasmType::flags_names` order.
+        let names = ty.flags_names().collect::<Vec<_>>();
+        let mut flags = self.as_flags(src)?.collect::<Vec<_>>();
+        flags.sort_by_cached_key(|flag| names.iter().position(|name| name == flag));
+        V::make_flags(ty, flags).map_err(|err| self.wasm_value_error(err))
+    }
+
+    fn to_wasm_map<V: WasmValue>(&self, ty: &V::Type, src: &str) -> Result<V, ParserError> {
+        let (key_type, value_type) = ty.map_key_value_types().unwrap();
+        let entries = self
+            .as_map()?
+            .map(|(key, value)| {
+                let key_value = key.to_wasm_map_key(&key_type, src)?;
+                let encoded_key = crate::to_string(&key_value).map_err(|err| {
+                    ParserError::with_source(ParserErrorKind::WasmValueError, key.span(), err)
+                })?;
+                Ok((
+                    encoded_key,
+                    key_value,
+                    value.to_wasm_value(&value_type, src)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ParserError>>()?;
+        V::make_map(ty, merge_map_entries(entries)).map_err(|err| self.wasm_value_error(err))
+    }
+
+    fn to_wasm_map_key<V: WasmValue>(&self, ty: &V::Type, src: &str) -> Result<V, ParserError> {
+        if self.ty != NodeType::Label {
+            return self.to_wasm_value(ty, src);
+        }
+        // A label in key position is a record field, unless it is a bool key.
+        match (ty.kind(), self.slice(src)) {
+            (WasmTypeKind::Bool, "true") => Ok(V::make_bool(true)),
+            (WasmTypeKind::Bool, "false") => Ok(V::make_bool(false)),
+            _ => Err(ParserError::with_detail(
+                ParserErrorKind::InvalidType,
+                self.span(),
+                format!("expected a {} key, found a label", DisplayType(ty)),
+            )),
+        }
     }
 
     fn to_wasm_maybe_payload<V: WasmValue>(
@@ -458,10 +544,18 @@ pub enum NodeType {
     /// List
     /// Child nodes are the list values.
     List,
-    /// Record
-    /// Child nodes are field Label, value pairs, e.g.
-    /// `[<field 1>, <value 1>, <field 2>, <value 2>, ...]`
-    Record,
+    /// Record or map, e.g. `{a: 1}`, `{"a": 1}` or `{:}`
+    /// Child nodes are key, value pairs, e.g.
+    /// `[<key 1>, <value 1>, <key 2>, <value 2>, ...]`
+    ///
+    /// Keys are Label, Number, Char, String or MultilineString nodes. A
+    /// Label key is a record field, or, unprefixed `true` or `false`, a
+    /// `bool` map key. Which of the two this node represents depends on the
+    /// type it is converted to.
+    TupleSet,
+    /// Empty braces, `{}`
+    /// Represents empty flags or an empty map. Has no child nodes.
+    EmptySet,
     /// Label
     /// In value position may represent an enum value or variant case (without payload).
     Label,
@@ -480,7 +574,8 @@ pub enum NodeType {
     /// Has zero or one child node for the payload value.
     ResultErr,
     /// Flags
-    /// Child nodes are flag Labels.
+    /// Child nodes are flag Labels. Empty flags (`{}`) are an
+    /// [`NodeType::EmptySet`].
     Flags,
     /// Handle
     /// Child node is a opaque label.

@@ -30,42 +30,68 @@ jobs:
         include:
         - build: x86_64-linux
           os: ubuntu-latest
+          env:
+            CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+            DOCKER_IMAGE: ./ci/docker/x86_64-linux/Dockerfile
         - build: x86_64-musl
           os: ubuntu-latest
-          target: x86_64-unknown-linux-musl
-        - build: x86_64-macos
-          os: macos-latest
-          target: x86_64-apple-darwin
-        - build: aarch64-macos
-          os: macos-latest
-          target: aarch64-apple-darwin
-        - build: x86_64-windows
-          os: windows-latest
+          env:
+            CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+            CARGO_BUILD_WARNINGS: allow
+            DOCKER_IMAGE: ./ci/docker/x86_64-musl/Dockerfile
         - build: aarch64-linux
           os: ubuntu-latest
-          target: aarch64-unknown-linux-gnu
+          env:
+            CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu
+            DOCKER_IMAGE: ./ci/docker/aarch64-linux/Dockerfile
         - build: aarch64-musl
           os: ubuntu-latest
-          target: aarch64-unknown-linux-musl
+          env:
+            CARGO_BUILD_TARGET: aarch64-unknown-linux-musl
+            CARGO_BUILD_WARNINGS: allow
+            DOCKER_IMAGE: ./ci/docker/aarch64-musl/Dockerfile
+        - build: riscv64-linux
+          os: ubuntu-latest
+          env:
+            CARGO_BUILD_TARGET: riscv64gc-unknown-linux-gnu
+            DOCKER_IMAGE: ./ci/docker/riscv64-linux/Dockerfile
+
+        - build: x86_64-macos
+          os: macos-latest
+          env:
+            CARGO_BUILD_TARGET: x86_64-apple-darwin
+            MACOSX_DEPLOYMENT_TARGET: 10.12
+        - build: aarch64-macos
+          os: macos-latest
+          env:
+            CARGO_BUILD_TARGET: aarch64-apple-darwin
+            MACOSX_DEPLOYMENT_TARGET: 10.12
+
+        - build: x86_64-windows
+          os: windows-latest
+          env:
+            CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+            RUSTFLAGS: -Ctarget-feature=+crt-static
+        - build: aarch64-windows
+          os: windows-11-arm
+          env:
+            CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+            RUSTFLAGS: -Ctarget-feature=+crt-static
+
         - build: wasm32-wasip1
           os: ubuntu-latest
-          target: wasm32-wasip1
+          env:
+            CARGO_BUILD_TARGET: wasm32-wasip1
+    env: ${{ matrix.env }}
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
-    - uses: bytecodealliance/wasmtime/.github/actions/binary-compatible-builds@release-28.0.0
-      with:
-        name: ${{ matrix.build }}
-      if: matrix.build != 'wasm32-wasip1'
-    - run: |
-        echo CARGO_BUILD_TARGET=${{ matrix.target }} >> $GITHUB_ENV
-        rustup target add ${{ matrix.target }}
-      if: matrix.target != ''
-    - run: $CENTOS cargo build --release
-    - run: ./ci/build-tarballs.sh "${{ matrix.build }}" "${{ matrix.target }}"
-    - uses: actions/upload-artifact@v4
+    - run: rustup target add $CARGO_BUILD_TARGET
+    - run: ./ci/build-release-artifacts.sh
+    - run: ./ci/build-tarballs.sh "${{ matrix.build }}"
+    - uses: actions/upload-artifact@v7
       with:
         name: bins-${{ matrix.build }}
         path: dist
@@ -74,7 +100,7 @@ jobs:
     name: Test (no-hash-maps)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: ./.github/actions/install-rust
@@ -93,7 +119,7 @@ jobs:
           - os: ubuntu-latest
             rust: beta
           - os: ubuntu-latest
-            rust: nightly
+            rust: nightly-2026-09-18
           - os: macos-latest
             rust: stable
           - os: windows-latest
@@ -102,20 +128,26 @@ jobs:
             rust: msrv
             # skip testing crates that require wasmtime since wasmtime has a
             # more aggressive msrv than wasm-tools
-            flags: --exclude fuzz-stats --exclude wit-component --exclude wasm-mutate-stats --exclude wit-dylib
+            flags: --exclude fuzz-stats --exclude wit-component --exclude wasm-mutate-stats --exclude wit-dylib --exclude wit-dylib-ffi --exclude test-programs
           # this is the rust nightly that oss-fuzz currently uses so we don't
           # want this to break.
           - os: ubuntu-latest
-            rust: nightly-2025-07-16
+            rust: nightly-2026-07-09
           # test that if `RUST_BACKTRACE=1` is set in the environment that all
           # tests with blessed error messages still pass.
           - os: ubuntu-latest
             rust: stable
             env:
               RUST_BACKTRACE: 1
+          # test the 'try_op' feature
+          - os: ubuntu-latest
+            rust: stable
+            env:
+              RUSTFLAGS: --cfg=debug_check_try_op
+            flags: -F wasmparser/try-op
     env: ${{ matrix.env || fromJSON('{}') }}
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
@@ -127,14 +159,15 @@ jobs:
     name: Test with extra Cargo features
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
     - run: cargo test --locked -p wasmparser --benches
-    - run: cargo test --locked -p wasm-encoder --all-features
+    - run: cargo test --locked --all-features --manifest-path crates/wasm-encoder/Cargo.toml
     - run: cargo test -p wasm-smith --features wasmparser
     - run: cargo test -p wasm-smith --features component-model
+    - run: cargo test --locked -p wasmparser --features try-op
 
   test_capi:
     name: Test the C API
@@ -147,7 +180,7 @@ jobs:
           - os: macos-latest
           - os: windows-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
@@ -158,12 +191,12 @@ jobs:
     name: Test libdl.so
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
       with:
-        toolchain: 1.89.0
+        toolchain: 1.97.0
     - run: rustup target add wasm32-wasip1
     - run: cd crates/wit-component/dl && bash check.sh
 
@@ -171,7 +204,7 @@ jobs:
     name: Test on WebAssembly
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
@@ -188,31 +221,32 @@ jobs:
           --exclude fuzz-stats \
           --exclude wasm-tools-fuzz \
           --exclude wasm-mutate-stats \
-          --exclude dl
+          --exclude dl \
+          --exclude test-programs
 
   rustfmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - uses: ./.github/actions/install-rust
     - run: rustup component add rustfmt
     - run: printf "\n" > playground/component/src/bindings.rs
     # Note that this doesn't use `cargo fmt` because that doesn't format
     # modules-defined-in-macros which is in use in `wast` for example. This is
     # the best alternative I can come up with at this time
-    - run: find . -name '*.rs' | xargs rustfmt --check --edition 2021
+    - run: find . -name '*.rs' | xargs rustfmt --check --edition 2024
 
   fuzz:
     name: Fuzz
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
       with:
-        toolchain: nightly
+        toolchain: nightly-2026-09-18
     - run: cargo install cargo-fuzz
     - run: cargo fuzz build --dev -s none
     - run: cargo fuzz build --dev --features wasmtime -s none
@@ -220,7 +254,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/install-rust
       - run: rustup target add x86_64-unknown-none
       - run: cargo check --benches -p wasm-smith
@@ -244,7 +278,9 @@ jobs:
       - run: cargo check --no-default-features --features completion
       - run: cargo check --no-default-features --features wast
       - run: cargo check --no-default-features --features wit-dylib
+      - run: cargo check --no-default-features -p wit-encoder
       - run: cargo check --no-default-features -p wit-parser
+      - run: cargo check --no-default-features -p wit-parser --target x86_64-unknown-none
       - run: cargo check --no-default-features -p wit-parser --features wat
       - run: cargo check --no-default-features -p wit-parser --features serde
       - run: cargo check --no-default-features -p wit-parser --features decoding
@@ -255,6 +291,7 @@ jobs:
       - run: cargo check --no-default-features -p wasmparser --target x86_64-unknown-none --features validate,serde,prefer-btree-collections
       - run: cargo check --no-default-features -p wasmparser --features std
       - run: cargo check --no-default-features -p wasmparser --features validate
+      - run: cargo check --no-default-features -p wasmparser --features validate,try-op
       - run: cargo check --no-default-features -p wasmparser --features features
       - run: cargo check --no-default-features -p wasmparser --features features,validate
       - run: cargo check --no-default-features -p wasmparser --features prefer-btree-collections
@@ -272,11 +309,11 @@ jobs:
       - run: cargo check --no-default-features -p wat
       - run: cargo check --no-default-features -p wat --features component-model
       - run: cargo check --no-default-features -p wat --features dwarf
-      - run: cargo check --no-default-features -p wasm-encoder
-      - run: cargo check --no-default-features -p wasm-encoder --target x86_64-unknown-none
-      - run: cargo check --no-default-features -p wasm-encoder --target x86_64-unknown-none --features wasmparser,component-model
-      - run: cargo check --no-default-features -p wasm-encoder --features component-model
-      - run: cargo check --no-default-features -p wasm-encoder --features wasmparser
+      - run: cargo check --no-default-features --manifest-path crates/wasm-encoder/Cargo.toml
+      - run: cargo check --no-default-features --manifest-path crates/wasm-encoder/Cargo.toml --target x86_64-unknown-none
+      - run: cargo check --no-default-features --manifest-path crates/wasm-encoder/Cargo.toml --target x86_64-unknown-none --features wasmparser,component-model
+      - run: cargo check --no-default-features --manifest-path crates/wasm-encoder/Cargo.toml --features component-model
+      - run: cargo check --no-default-features --manifest-path crates/wasm-encoder/Cargo.toml --features wasmparser
       - run: cargo check --no-default-features -p wasm-smith
       - run: cargo check --no-default-features -p wasm-smith --features component-model
       - run: cargo check --no-default-features -p wasm-smith --features wasmparser
@@ -285,6 +322,14 @@ jobs:
       - run: cargo check --no-default-features -p wasm-metadata
       - run: cargo check --no-default-features -p wasm-metadata --features serde
       - run: cargo check --no-default-features -p wasm-metadata --features oci
+      - run: cargo check --no-default-features -p wasm-wave
+      - run: cargo check --no-default-features -p wasm-wave --target x86_64-unknown-none
+      - run: cargo check --no-default-features -p wasm-wave --features std
+      - run: cargo check --no-default-features -p wasm-wave --features wit
+      - run: cargo check --no-default-features -p wasm-wave --features std,wit
+      - run: cargo check --no-default-features -p wasm-compose
+      - run: cargo check --no-default-features -p wasm-compose --features serde
+      - run: cargo check --no-default-features -p wasm-compose --features yaml
       - run: |
           if cargo tree -p wasm-smith --no-default-features -e no-dev | grep wasmparser; then
             echo wasm-smith without default features should not depend on wasmparser
@@ -297,7 +342,7 @@ jobs:
     name: Check generated files are up-to-date
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: ./.github/actions/install-rust
@@ -310,14 +355,14 @@ jobs:
   doc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/install-rust
       - run: RUSTDOCFLAGS="-Dwarnings" cargo doc --all
 
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/install-rust
       - run: rustup component add clippy
       - run: cargo clippy --workspace --all-targets --exclude dl --exclude component
@@ -326,7 +371,7 @@ jobs:
     if: github.repository_owner == 'bytecodealliance'
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
     - uses: ./.github/actions/install-rust
@@ -373,13 +418,18 @@ jobs:
   maybe-trigger-tag:
     runs-on: ubuntu-latest
     needs: ci-status
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      packages: write
     if: |
       always()
       && needs.ci-status.result == 'success'
       && github.event_name == 'push'
       && startsWith(github.ref, 'refs/heads/release-')
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
       with:
         submodules: true
         fetch-depth: 0

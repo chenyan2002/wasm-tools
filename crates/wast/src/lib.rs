@@ -51,7 +51,7 @@
 //! [`LexError`]: lexer::LexError
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// A macro to create a custom keyword parser.
 ///
@@ -396,7 +396,9 @@ pub mod kw {
     custom_keyword!(assert_exception);
     custom_keyword!(assert_exhaustion);
     custom_keyword!(assert_invalid);
+    custom_keyword!(assert_invalid_custom);
     custom_keyword!(assert_malformed);
+    custom_keyword!(assert_malformed_custom);
     custom_keyword!(assert_return);
     custom_keyword!(assert_trap);
     custom_keyword!(assert_unlinkable);
@@ -416,10 +418,14 @@ pub mod kw {
     custom_keyword!(data);
     custom_keyword!(declare);
     custom_keyword!(delegate);
+    custom_keyword!(descriptor);
+    custom_keyword!(describes);
     custom_keyword!(r#do = "do");
     custom_keyword!(dtor);
     custom_keyword!(elem);
     custom_keyword!(end);
+    custom_keyword!(entry);
+    custom_keyword!(exact);
     custom_keyword!(tag);
     custom_keyword!(exn);
     custom_keyword!(exnref);
@@ -449,6 +455,7 @@ pub mod kw {
     custom_keyword!(i8);
     custom_keyword!(i8x16);
     custom_keyword!(import);
+    custom_keyword!(implements);
     custom_keyword!(instance);
     custom_keyword!(instantiate);
     custom_keyword!(interface);
@@ -491,14 +498,14 @@ pub mod kw {
     custom_keyword!(ref_null = "ref.null");
     custom_keyword!(register);
     custom_keyword!(rec);
-    custom_keyword!(acq_rel);
+    custom_keyword!(acqrel);
     custom_keyword!(rep);
     custom_keyword!(resource);
     custom_keyword!(resource_new = "resource.new");
     custom_keyword!(resource_drop = "resource.drop");
     custom_keyword!(resource_rep = "resource.rep");
     custom_keyword!(result);
-    custom_keyword!(seq_cst);
+    custom_keyword!(seqcst);
     custom_keyword!(shared);
     custom_keyword!(start);
     custom_keyword!(sub);
@@ -519,7 +526,6 @@ pub mod kw {
     custom_keyword!(u64);
     custom_keyword!(char);
     custom_keyword!(case);
-    custom_keyword!(refines);
     custom_keyword!(record);
     custom_keyword!(string);
     custom_keyword!(bool_ = "bool");
@@ -530,6 +536,7 @@ pub mod kw {
     custom_keyword!(option);
     custom_keyword!(tuple);
     custom_keyword!(list);
+    custom_keyword!(map);
     custom_keyword!(error);
     custom_keyword!(canon);
     custom_keyword!(lift);
@@ -556,21 +563,21 @@ pub mod kw {
     custom_keyword!(export_info = "export-info");
     custom_keyword!(import_info = "import-info");
     custom_keyword!(runtime_path = "runtime-path");
+    custom_keyword!(target_arch = "target-arch");
     custom_keyword!(thread);
-    custom_keyword!(thread_spawn_ref = "thread.spawn_ref");
-    custom_keyword!(thread_spawn_indirect = "thread.spawn_indirect");
+    custom_keyword!(thread_spawn_ref = "thread.spawn-ref");
+    custom_keyword!(thread_spawn_indirect = "thread.spawn-indirect");
     custom_keyword!(thread_available_parallelism = "thread.available_parallelism");
-    custom_keyword!(backpressure_set = "backpressure.set");
     custom_keyword!(backpressure_inc = "backpressure.inc");
     custom_keyword!(backpressure_dec = "backpressure.dec");
     custom_keyword!(task_return = "task.return");
     custom_keyword!(task_cancel = "task.cancel");
-    custom_keyword!(thread_yield = "thread.yield");
     custom_keyword!(subtask_drop = "subtask.drop");
     custom_keyword!(subtask_cancel = "subtask.cancel");
     custom_keyword!(stream_new = "stream.new");
     custom_keyword!(stream_read = "stream.read");
     custom_keyword!(stream_write = "stream.write");
+    custom_keyword!(stream_forward = "stream.forward");
     custom_keyword!(stream_cancel_read = "stream.cancel-read");
     custom_keyword!(stream_cancel_write = "stream.cancel-write");
     custom_keyword!(stream_drop_readable = "stream.drop-readable");
@@ -578,6 +585,7 @@ pub mod kw {
     custom_keyword!(future_new = "future.new");
     custom_keyword!(future_read = "future.read");
     custom_keyword!(future_write = "future.write");
+    custom_keyword!(future_forward = "future.forward");
     custom_keyword!(future_cancel_read = "future.cancel-read");
     custom_keyword!(future_cancel_write = "future.cancel-write");
     custom_keyword!(future_drop_readable = "future.drop-readable");
@@ -600,12 +608,17 @@ pub mod kw {
     custom_keyword!(context_get = "context.get");
     custom_keyword!(context_set = "context.set");
     custom_keyword!(thread_index = "thread.index");
-    custom_keyword!(thread_new_indirect = "thread.new_indirect");
-    custom_keyword!(thread_switch_to = "thread.switch-to");
-    custom_keyword!(thread_suspend = "thread.suspend");
+    custom_keyword!(thread_new_indirect = "thread.new-indirect");
     custom_keyword!(thread_resume_later = "thread.resume-later");
-    custom_keyword!(thread_yield_to = "thread.yield-to");
+    custom_keyword!(thread_suspend = "thread.suspend");
+    custom_keyword!(thread_yield = "thread.yield");
+    custom_keyword!(thread_suspend_then_resume = "thread.suspend-then-resume");
+    custom_keyword!(thread_yield_then_resume = "thread.yield-then-resume");
+    custom_keyword!(thread_suspend_then_promote = "thread.suspend-then-promote");
+    custom_keyword!(thread_yield_then_promote = "thread.yield-then-promote");
     custom_keyword!(cancellable);
+    custom_keyword!(version_suffix = "version-suffix");
+    custom_keyword!(external_id = "external-id");
 }
 
 /// Common annotations used to parse WebAssembly text files.

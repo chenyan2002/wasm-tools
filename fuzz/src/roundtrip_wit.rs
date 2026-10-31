@@ -6,7 +6,9 @@ use wit_component::*;
 use wit_parser::{LiftLowerAbi, ManglingAndAbi, PackageId, Resolve};
 
 pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
-    let wasm = u.arbitrary().and_then(|config| {
+    let canonical_names = u.arbitrary()?;
+    let wasm = u.arbitrary().and_then(|mut config: wit_smith::Config| {
+        config.canonical_names = canonical_names;
         log::debug!("config: {config:#?}");
         wit_smith::smith(&config, u)
     })?;
@@ -17,7 +19,7 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
     };
     resolve.assert_valid();
 
-    roundtrip_through_printing("doc1", &resolve, pkg, &wasm);
+    roundtrip_through_printing("doc1", &resolve, pkg, &wasm, canonical_names);
 
     let (resolve2, pkg2) = match wit_component::decode(&wasm).unwrap() {
         DecodedWasm::WitPackage(resolve, pkgs) => (resolve, pkgs),
@@ -25,9 +27,10 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
     };
     resolve2.assert_valid();
 
-    let wasm2 = wit_component::encode(&resolve2, pkg2).expect("failed to encode WIT document");
+    let wasm2 = wit_component::encode(&resolve2, pkg2, canonical_names)
+        .expect("failed to encode WIT document");
     write_file("doc2.wasm", &wasm2);
-    roundtrip_through_printing("doc2", &resolve2, pkg2, &wasm2);
+    roundtrip_through_printing("doc2", &resolve2, pkg2, &wasm2, canonical_names);
 
     if wasm != wasm2 {
         panic!("roundtrip wasm didn't match");
@@ -62,12 +65,21 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
                 dummy = dst.finish();
             }
         }
-        wit_component::embed_component_metadata(&mut dummy, &resolve, id, StringEncoding::UTF8)
-            .unwrap();
+        wit_component::embed_component_metadata(
+            &mut dummy,
+            &resolve,
+            id,
+            StringEncoding::UTF8,
+            canonical_names,
+        )
+        .unwrap();
         write_file("dummy.wasm", &dummy);
 
         log::debug!("... componentizing the world into a binary component");
         let wasm = wit_component::ComponentEncoder::default()
+            .shim_return_call_ref(u.arbitrary()?)
+            .debug_names(u.arbitrary()?)
+            .realloc_via_memory_grow(u.arbitrary()?)
             .module(&dummy)
             .unwrap()
             .encode()
@@ -79,8 +91,11 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
 
         // Decode what was just created and record it later for testing merging
         // worlds together.
-        let (_, decoded) = wit_component::metadata::decode(&dummy).unwrap();
-        decoded_bindgens.push((decoded, dummy, world.name.clone()));
+        let (dresolve, dworldid) = match wit_component::decode(&wasm).unwrap() {
+            wit_component::DecodedWasm::Component(r, w) => (r, w),
+            _ => unreachable!(),
+        };
+        decoded_bindgens.push((dresolve, dworldid, dummy, world.name.clone()));
 
         log::debug!("... decoding the component itself");
         wit_component::decode(&wasm).unwrap();
@@ -90,6 +105,11 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
         log::debug!("... importizing this world");
         let mut resolve2 = resolve.clone();
         let _ = resolve2.importize(id, None);
+
+        // Test out `generate_nominal_type_ids`
+        log::debug!("... calling `generate_nominal_type_ids`");
+        let mut resolve2 = resolve.clone();
+        resolve2.generate_nominal_type_ids(id);
     }
 
     if decoded_bindgens.len() < 2 {
@@ -97,32 +117,58 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
     }
 
     let i = u.choose_index(decoded_bindgens.len())?;
-    let (mut b1, wasm1, world1) = decoded_bindgens.swap_remove(i);
+    let (mut b1, worldid1, wasm1, world1) = decoded_bindgens.swap_remove(i);
 
     if u.arbitrary()? {
         let i = u.choose_index(decoded_bindgens.len())?;
-        let (b2, wasm2, world2) = decoded_bindgens.swap_remove(i);
+        let (mut b2, worldid2, wasm2, world2) = decoded_bindgens.swap_remove(i);
 
         log::debug!("merging bindgens world {world1} <- world {world2}");
 
         write_file("bindgen1.wasm", &wasm1);
         write_file("bindgen2.wasm", &wasm2);
 
+        let pkg2 = b2.worlds[worldid2].package.unwrap();
+        let mut name = b2.packages[pkg2].name.clone();
+        b2.package_names.swap_remove(&name).unwrap();
+        name.name.push_str("2");
+        let prev = b2.package_names.insert(name.clone(), pkg2);
+        assert!(prev.is_none());
+        b2.packages[pkg2].name = name;
+
+        let only_interfaces = b1.worlds[worldid1]
+            .imports
+            .iter()
+            .chain(b1.worlds[worldid1].exports.iter())
+            .chain(b2.worlds[worldid2].imports.iter())
+            .chain(b2.worlds[worldid2].exports.iter())
+            .all(|(id, _)| matches!(id, wit_parser::WorldKey::Interface(_)));
+
         // Merging worlds may fail but if successful then a `Resolve` is asserted
         // to be valid which is what we're interested in here. Note that failure
         // here can be due to the structure of worlds which aren't reasonable to
         // control in this generator, so it's just done to see what happens and try
         // to trigger panics in `Resolve::assert_valid`.
-        let _ = b1.merge(b2);
+        let merge_result = b1.merge(b2);
+
+        if only_interfaces {
+            merge_result.unwrap();
+        }
     } else {
         log::debug!("merging world imports based on semver {world1}");
         write_file("bindgen1.wasm", &wasm1);
-        let _ = b1.resolve.merge_world_imports_based_on_semver(b1.world);
+        let _ = b1.merge_world_imports_based_on_semver(worldid1);
     }
     Ok(())
 }
 
-fn roundtrip_through_printing(file: &str, resolve: &Resolve, pkg: PackageId, wasm: &[u8]) {
+fn roundtrip_through_printing(
+    file: &str,
+    resolve: &Resolve,
+    pkg: PackageId,
+    wasm: &[u8],
+    canonical_names: bool,
+) {
     // Print to a single string, using nested `package ... { .. }` statements,
     // and then parse that in a new `Resolve`.
     let mut new_resolve = Resolve::default();
@@ -142,7 +188,7 @@ fn roundtrip_through_printing(file: &str, resolve: &Resolve, pkg: PackageId, was
 
     // Finally encode the `new_resolve` which should be the exact same as
     // before.
-    let wasm2 = wit_component::encode(&new_resolve, new_pkg).unwrap();
+    let wasm2 = wit_component::encode(&new_resolve, new_pkg, canonical_names).unwrap();
     write_file(&format!("{file}-reencoded.wasm"), &wasm2);
     if wasm != wasm2 {
         panic!("failed to roundtrip through text printing");
@@ -190,7 +236,6 @@ impl Reencode for RemoveImports<'_, '_> {
     }
 }
 
-#[should_panic] // TODO: this should get fixed
 #[test]
 fn smoke() {
     super::test::test_n_times(100, run);

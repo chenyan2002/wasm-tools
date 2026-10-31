@@ -1,4 +1,9 @@
-use std::{borrow::Cow, sync::Arc};
+use alloc::{
+    borrow::Cow,
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+};
 
 use crate::wasm::{WasmType, WasmTypeKind, maybe_unwrap_type};
 
@@ -10,7 +15,7 @@ pub struct Type(pub(super) TypeEnum);
 pub(super) enum TypeEnum {
     Simple(SimpleType),
     List(Arc<ListType>),
-    FixedSizeList(Arc<ListType>, u32),
+    FixedLengthList(Arc<ListType>, u32),
     Record(Arc<RecordType>),
     Tuple(Arc<TupleType>),
     Variant(Arc<VariantType>),
@@ -19,6 +24,7 @@ pub(super) enum TypeEnum {
     Result(Arc<ResultType>),
     Flags(Arc<FlagsType>),
     Handle(Arc<HandleType>),
+    Map(Arc<MapType>),
 }
 
 #[allow(missing_docs)]
@@ -58,9 +64,9 @@ impl Type {
     }
 
     /// Returns a list type with the given element type.
-    pub fn fixed_size_list(element_type: impl Into<Self>, elements: u32) -> Self {
+    pub fn fixed_length_list(element_type: impl Into<Self>, elements: u32) -> Self {
         let element = element_type.into();
-        Self(TypeEnum::FixedSizeList(
+        Self(TypeEnum::FixedLengthList(
             Arc::new(ListType { element }),
             elements,
         ))
@@ -143,6 +149,18 @@ impl Type {
         })))
     }
 
+    /// Returns a map type with the given key and value types. Returns None if
+    /// `key_type` is not a valid map key type (`bool`, an integer type, `char`,
+    /// or `string`).
+    pub fn map(key_type: impl Into<Self>, value_type: impl Into<Self>) -> Option<Self> {
+        let key = key_type.into();
+        if !is_map_key(key.kind()) {
+            return None;
+        }
+        let value = value_type.into();
+        Some(Self(TypeEnum::Map(Arc::new(MapType { key, value }))))
+    }
+
     /// Returns a [`Type`] matching the given [`WasmType`]. Returns None if the
     /// given type is unsupported or otherwise invalid.
     pub fn from_wasm_type(ty: &impl WasmType) -> Option<Self> {
@@ -158,6 +176,14 @@ const fn is_simple(kind: WasmTypeKind) -> bool {
     matches!(
         kind,
         Bool | S8 | S16 | S32 | S64 | U8 | U16 | U32 | U64 | F32 | F64 | Char | String
+    )
+}
+
+const fn is_map_key(kind: WasmTypeKind) -> bool {
+    use WasmTypeKind::*;
+    matches!(
+        kind,
+        Bool | S8 | S16 | S32 | S64 | U8 | U16 | U32 | U64 | Char | String
     )
 }
 
@@ -207,12 +233,18 @@ pub struct HandleType {
     pub(super) name: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct MapType {
+    pub(super) key: Type,
+    pub(super) value: Type,
+}
+
 impl WasmType for Type {
     fn kind(&self) -> WasmTypeKind {
         match self.0 {
             TypeEnum::Simple(simple) => simple.0,
             TypeEnum::List(_) => WasmTypeKind::List,
-            TypeEnum::FixedSizeList(_, _) => WasmTypeKind::FixedSizeList,
+            TypeEnum::FixedLengthList(_, _) => WasmTypeKind::FixedLengthList,
             TypeEnum::Record(_) => WasmTypeKind::Record,
             TypeEnum::Tuple(_) => WasmTypeKind::Tuple,
             TypeEnum::Variant(_) => WasmTypeKind::Variant,
@@ -221,6 +253,7 @@ impl WasmType for Type {
             TypeEnum::Result(_) => WasmTypeKind::Result,
             TypeEnum::Flags(_) => WasmTypeKind::Flags,
             TypeEnum::Handle(_) => WasmTypeKind::Handle,
+            TypeEnum::Map(_) => WasmTypeKind::Map,
         }
     }
 
@@ -231,7 +264,7 @@ impl WasmType for Type {
 
     fn record_fields(&self) -> Box<dyn Iterator<Item = (Cow<'_, str>, Self)> + '_> {
         let TypeEnum::Record(record) = &self.0 else {
-            return Box::new(std::iter::empty());
+            return Box::new(core::iter::empty());
         };
         Box::new(
             record
@@ -243,14 +276,14 @@ impl WasmType for Type {
 
     fn tuple_element_types(&self) -> Box<dyn Iterator<Item = Self> + '_> {
         let TypeEnum::Tuple(tuple) = &self.0 else {
-            return Box::new(std::iter::empty());
+            return Box::new(core::iter::empty());
         };
         Box::new(tuple.elements.iter().cloned())
     }
 
     fn variant_cases(&self) -> Box<dyn Iterator<Item = (Cow<'_, str>, Option<Self>)> + '_> {
         let TypeEnum::Variant(variant) = &self.0 else {
-            return Box::new(std::iter::empty());
+            return Box::new(core::iter::empty());
         };
         Box::new(
             variant
@@ -262,7 +295,7 @@ impl WasmType for Type {
 
     fn enum_cases(&self) -> Box<dyn Iterator<Item = Cow<'_, str>> + '_> {
         let TypeEnum::Enum(enum_) = &self.0 else {
-            return Box::new(std::iter::empty());
+            return Box::new(core::iter::empty());
         };
         Box::new(enum_.cases.iter().map(|name| name.as_ref().into()))
     }
@@ -279,7 +312,7 @@ impl WasmType for Type {
 
     fn flags_names(&self) -> Box<dyn Iterator<Item = Cow<'_, str>> + '_> {
         let TypeEnum::Flags(flags) = &self.0 else {
-            return Box::new(std::iter::empty());
+            return Box::new(core::iter::empty());
         };
         Box::new(flags.flags.iter().map(|name| name.as_ref().into()))
     }
@@ -288,10 +321,15 @@ impl WasmType for Type {
         let res = maybe_unwrap_type!(&self.0, TypeEnum::Handle).unwrap();
         &res.name
     }
+
+    fn map_key_value_types(&self) -> Option<(Self, Self)> {
+        let map = maybe_unwrap_type!(&self.0, TypeEnum::Map)?;
+        Some((map.key.clone(), map.value.clone()))
+    }
 }
 
-impl std::fmt::Display for Type {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Type {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         crate::wasm::DisplayType(self).fmt(f)
     }
 }

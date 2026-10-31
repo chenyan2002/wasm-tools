@@ -26,7 +26,8 @@ pub enum Type {
     Option(Box<Type>),
     Result(Box<Result_>),
     List(Box<Type>),
-    FixedSizeList(Box<Type>, u32),
+    Map(Box<Type>, Box<Type>),
+    FixedLengthList(Box<Type>, u32),
     Tuple(Tuple),
     Future(Option<Box<Type>>),
     Stream(Option<Box<Type>>),
@@ -59,8 +60,11 @@ impl Type {
     pub fn list(type_: Type) -> Self {
         Type::List(Box::new(type_))
     }
-    pub fn fixed_size_list(type_: Type, size: u32) -> Self {
-        Type::FixedSizeList(Box::new(type_), size)
+    pub fn map(key: Type, value: Type) -> Self {
+        Type::Map(Box::new(key), Box::new(value))
+    }
+    pub fn fixed_length_list(type_: Type, size: u32) -> Self {
+        Type::FixedLengthList(Box::new(type_), size)
     }
     pub fn tuple(types: impl IntoIterator<Item = Type>) -> Self {
         Type::Tuple(Tuple {
@@ -120,7 +124,10 @@ impl Display for Type {
             Type::List(type_) => {
                 write!(f, "list<{type_}>")
             }
-            Type::FixedSizeList(type_, size) => {
+            Type::Map(key, value) => {
+                write!(f, "map<{key}, {value}>")
+            }
+            Type::FixedLengthList(type_, size) => {
                 write!(f, "list<{type_}, {size}>")
             }
             Type::Tuple(tuple) => tuple.fmt(f),
@@ -410,23 +417,18 @@ impl Render for TypeDef {
                     }
                     match &func.kind {
                         crate::ResourceFuncKind::Method(name, async_, result) => {
-                            let opt_async = if *async_ { "async " } else { "" };
-                            write!(
-                                f,
-                                "{}{name}: {opt_async}func({})",
-                                opts.spaces(),
-                                func.params
-                            )?;
+                            let keyword = crate::function::func_keyword(*async_, func.accessor);
+                            write!(f, "{}{name}: {keyword}({})", opts.spaces(), func.params)?;
                             if let Some(ty) = result {
                                 write!(f, " -> {ty}")?;
                             }
                             write!(f, ";\n")?;
                         }
                         crate::ResourceFuncKind::Static(name, async_, result) => {
-                            let opt_async = if *async_ { "async " } else { "" };
+                            let keyword = crate::function::func_keyword(*async_, func.accessor);
                             write!(
                                 f,
-                                "{}{name}: static {opt_async}func({})",
+                                "{}{name}: static {keyword}({})",
                                 opts.spaces(),
                                 func.params
                             )?;

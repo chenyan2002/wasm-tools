@@ -1,0 +1,69 @@
+{
+  "source_filename": "tests/cli/component-model/custom-page-sizes.wast",
+  "commands": [
+    {
+      "type": "module",
+      "line": 4,
+      "filename": "custom-page-sizes.0.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 14,
+      "filename": "custom-page-sizes.1.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 24,
+      "filename": "custom-page-sizes.2.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 31,
+      "filename": "custom-page-sizes.3.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 38,
+      "filename": "custom-page-sizes.4.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 45,
+      "filename": "custom-page-sizes.5.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_invalid",
+      "line": 54,
+      "filename": "custom-page-sizes.6.wasm",
+      "module_type": "binary",
+      "text": "mismatch in page size for memories"
+    },
+    {
+      "type": "assert_invalid",
+      "line": 63,
+      "filename": "custom-page-sizes.7.wasm",
+      "module_type": "binary",
+      "text": "mismatch in page size for memories"
+    },
+    {
+      "type": "assert_invalid",
+      "line": 72,
+      "filename": "custom-page-sizes.8.wasm",
+      "module_type": "binary",
+      "text": "mismatch in page size for memories"
+    },
+    {
+      "type": "assert_invalid",
+      "line": 81,
+      "filename": "custom-page-sizes.9.wasm",
+      "module_type": "binary",
+      "text": "mismatch in page size for memories"
+    }
+  ]
+}

@@ -13,7 +13,7 @@
   (core module $main (;0;)
     (type (;0;) (func (param i32)))
     (type (;1;) (func (param i32 i32 i32 i32) (result i32)))
-    (import "foo:foo/foo" "a" (func (;0;) (type 0)))
+    (import "foo:foo/foo" "a" (func (;0;) (type 0) (param i32)))
     (memory (;0;) 1)
     (export "memory" (memory 0))
     (export "cabi_realloc" (func 1))
@@ -41,7 +41,6 @@
   (alias core export $main "memory" (core memory $memory (;0;)))
   (type (;1;) (func (param "b" u8)))
   (alias core export $main "a" (core func $"#core-func1 a" (@name "a") (;1;)))
-  (alias core export $main "cabi_realloc" (core func $cabi_realloc (;2;)))
   (func $"#func1 a" (@name "a") (;1;) (type 1) (canon lift (core func $"#core-func1 a")))
   (export $"#func2 a" (@name "a") (;2;) "a" (func $"#func1 a"))
   (@producers

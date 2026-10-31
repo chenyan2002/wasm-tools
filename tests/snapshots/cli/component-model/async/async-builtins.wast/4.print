@@ -1,0 +1,4 @@
+(component
+  (core func (;0;) (canon subtask.cancel async))
+  (core func (;1;) (canon subtask.cancel async))
+)

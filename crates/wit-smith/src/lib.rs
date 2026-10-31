@@ -6,7 +6,7 @@
 //! type structures.
 
 use arbitrary::{Result, Unstructured};
-use wit_parser::{InvalidTransitiveDependency, Resolve};
+use wit_parser::{Resolve, ResolveErrorKind};
 
 mod config;
 pub use self::config::Config;
@@ -26,21 +26,44 @@ pub fn smith(config: &Config, u: &mut Unstructured<'_>) -> Result<Vec<u8>> {
         let group = pkg.sources.parse().unwrap();
         let id = match resolve.push_group(group) {
             Ok(id) => id,
-            Err(e) => {
-                if e.is::<InvalidTransitiveDependency>() {
+            Err(e) => match e.kind() {
+                ResolveErrorKind::InvalidTransitiveDependency { .. } => {
                     return Err(arbitrary::Error::IncorrectFormat);
                 }
-                let err = e.to_string();
-                if err.contains("shadows previously") || err.contains("mismatch in stability") {
+                ResolveErrorKind::ItemShadowing { .. }
+                | ResolveErrorKind::StabilityMismatch { .. } => {
                     log::error!("{e}");
                     return Err(arbitrary::Error::IncorrectFormat);
                 }
-                panic!("bad wit parse: {e:?}")
-            }
+                _ => {
+                    panic!("bad wit parse: {e:?}")
+                }
+            },
         };
         last = Some(id);
     }
     let pkg = last.unwrap();
 
-    Ok(wit_component::encode(&resolve, pkg).expect("failed to encode WIT document"))
+    let wasm = wit_component::encode(&resolve, pkg, config.canonical_names)
+        .expect("failed to encode WIT document");
+
+    if let Err(e) = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&wasm)
+    {
+        // Handle disallowing `stream<char>` here vs not generating it to start
+        // with as it's a bit easier to handle.
+        if e.to_string()
+            .contains("`stream<char>` is not valid at this time")
+        {
+            return Err(arbitrary::Error::IncorrectFormat);
+        }
+
+        // Easier to handle this limit here rather than in generation right now.
+        if e.to_string()
+            .contains("value type's maximum in-memory size exceeds maximum byte size")
+        {
+            return Err(arbitrary::Error::IncorrectFormat);
+        }
+    }
+    Ok(wasm)
 }

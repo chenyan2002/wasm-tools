@@ -15,7 +15,7 @@ pub(crate) fn rewrite_wasm(
     let mut names_found = false;
     let mut stack = Vec::new();
     let mut output = Vec::new();
-    for payload in Parser::new(0).parse_all(&input) {
+    for payload in Parser::new(0).parse_all(input) {
         let payload = payload?;
 
         // Track nesting depth, so that we don't mess with inner producer sections:
@@ -92,10 +92,10 @@ pub(crate) fn rewrite_wasm(
                         continue;
                     }
                     #[cfg(feature = "oci")]
-                    KnownCustom::Unknown if c.name() == "author" => {
+                    KnownCustom::Unknown if c.name() == "authors" => {
                         if metadata.authors.is_keep() {
-                            let author = crate::Authors::parse_custom_section(c)?;
-                            author.append_to(&mut output);
+                            let authors = crate::Authors::parse_custom_section(c)?;
+                            authors.append_to(&mut output);
                             continue;
                         } else if metadata.authors.is_clear() {
                             continue;
@@ -169,7 +169,7 @@ pub(crate) fn rewrite_wasm(
         if let Some((id, range)) = payload.as_section() {
             wasm_encoder::RawSection {
                 id,
-                data: &input[range],
+                data: &input[range.start as usize..range.end as usize],
             }
             .append_to(&mut output);
         }
@@ -193,8 +193,8 @@ pub(crate) fn rewrite_wasm(
         producers.section().append_to(&mut output);
     }
     #[cfg(feature = "oci")]
-    if let AddMetadataField::Set(author) = &metadata.authors {
-        author.append_to(&mut output);
+    if let AddMetadataField::Set(authors) = &metadata.authors {
+        authors.append_to(&mut output);
     }
     #[cfg(feature = "oci")]
     if let AddMetadataField::Set(description) = &metadata.description {

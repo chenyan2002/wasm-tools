@@ -1,8 +1,8 @@
 use super::{Adapter, ComponentEncoder, LibraryInfo, RequiredOptions};
 use crate::validation::{
-    Import, ImportMap, ValidatedModule, validate_adapter_module, validate_module,
+    Import, ImportMap, PayloadType, ValidatedModule, validate_adapter_module, validate_module,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use indexmap::{IndexMap, IndexSet};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -49,11 +49,20 @@ pub struct ComponentWorld<'a> {
 pub struct ImportedInterface {
     pub lowerings: IndexMap<(String, AbiVariant), Lowering>,
     pub interface: Option<InterfaceId>,
+    pub implements: Option<InterfaceId>,
+    pub external_id: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum Lowering {
-    Direct,
+    /// This import can be `canon lower`'d at the same time that the core module
+    /// importing it is instantiated.
+    Direct {
+        options: RequiredOptions,
+    },
+    /// This import requires an indirection through the shim module's table as
+    /// the `options` required here can only be satisfied after the core module
+    /// in question has been instantiated (e.g. `realloc`).
     Indirect {
         sig: WasmSignature,
         options: RequiredOptions,
@@ -83,6 +92,24 @@ impl<'a> ComponentWorld<'a> {
         Ok(ret)
     }
 
+    /// Returns whether the component encoding process should use context slot 1
+    /// in tasks, generally reserved for TLS.
+    ///
+    /// This is a heuristic which should go away once component-model-threading
+    /// has been stable for awhile and the return value of this function should
+    /// be const-propagated as `true`.
+    pub fn can_use_context_slot_1(&self) -> bool {
+        let uses = |info: &ValidatedModule| {
+            info.imports.imports().any(|(_, _, import)| match import {
+                Import::ThreadNewIndirect
+                | Import::ContextGet { slot: 1, .. }
+                | Import::ContextSet { slot: 1, .. } => true,
+                _ => false,
+            })
+        };
+        uses(&self.info) || self.adapters.values().any(|a| uses(&a.info))
+    }
+
     /// Process adapters which are required here. Iterate over all
     /// adapters and figure out what functions are required from the
     /// adapter itself, either because the functions are imported by the
@@ -90,6 +117,12 @@ impl<'a> ComponentWorld<'a> {
     fn process_adapters(&mut self) -> Result<()> {
         let resolve = &self.encoder.metadata.resolve;
         let world = self.encoder.metadata.world;
+        let main_memory_page_size = self
+            .info
+            .exports
+            .memory()
+            .map(|(_, ty)| ty.page_size())
+            .unwrap_or(65536);
         for (
             name,
             Adapter {
@@ -110,7 +143,7 @@ impl<'a> ComponentWorld<'a> {
                         WorldItem::Interface { id, .. } => {
                             resolve.interfaces[*id].functions.is_empty()
                         }
-                        WorldItem::Type(_) => true,
+                        WorldItem::Type { .. } => true,
                     })
             };
             if no_required_by_import() && no_required_exports() && library_info.is_none() {
@@ -162,6 +195,11 @@ impl<'a> ComponentWorld<'a> {
                 for (name, _export) in info.exports.iter() {
                     required.insert(name.to_string());
                 }
+                let page_size_log2 = info
+                    .imports
+                    .imported_memory()
+                    .and_then(|ty| ty.page_size_log2)
+                    .unwrap_or(16);
 
                 Cow::Owned(
                     crate::gc::run(
@@ -172,6 +210,7 @@ impl<'a> ComponentWorld<'a> {
                         } else {
                             self.info.exports.realloc_to_import_into_adapter()
                         },
+                        page_size_log2,
                     )
                     .context("failed to reduce input adapter module to its minimal size")?,
                 )
@@ -186,6 +225,15 @@ impl<'a> ComponentWorld<'a> {
             .with_context(|| {
                 format!("failed to validate the imports of the minimized adapter module `{name}`")
             })?;
+            if let Some(adapter_memory) = info.imports.imported_memory() {
+                let adapter_page_size = adapter_memory.page_size();
+                if main_memory_page_size != adapter_page_size {
+                    bail!(
+                        "adapter module `{name}` memory page size ({adapter_page_size}) \
+                         does not match main module's memory page size ({main_memory_page_size})"
+                    );
+                }
+            }
             self.adapters.insert(
                 name,
                 WorldAdapter {
@@ -237,47 +285,68 @@ impl<'a> ComponentWorld<'a> {
             }
         }
         for (name, item) in resolve.worlds[world].imports.iter() {
-            add_item(&mut self.import_map, resolve, name, item, &required)?;
+            add_item(
+                &mut self.import_map,
+                resolve,
+                name,
+                item,
+                &required,
+                &self.info,
+            )?;
         }
         return Ok(());
 
         fn add_item(
             import_map: &mut IndexMap<Option<String>, ImportedInterface>,
             resolve: &Resolve,
-            name: &WorldKey,
+            key: &WorldKey,
             item: &WorldItem,
             required: &Required<'_>,
+            info: &ValidatedModule,
         ) -> Result<()> {
-            let name = resolve.name_world_key(name);
+            let name = resolve.name_world_key(key);
             log::trace!("register import `{name}`");
             let import_map_key = match item {
-                WorldItem::Function(_) | WorldItem::Type(_) => None,
+                WorldItem::Function(_) | WorldItem::Type { .. } => None,
                 WorldItem::Interface { .. } => Some(name),
             };
             let interface_id = match item {
-                WorldItem::Function(_) | WorldItem::Type(_) => None,
+                WorldItem::Function(_) | WorldItem::Type { .. } => None,
                 WorldItem::Interface { id, .. } => Some(*id),
+            };
+            let implements = resolve.implements_interface(key, item);
+            // Note that `external_id` is only tracked for interface imports
+            // here. World-level functions and types all share the `None` entry
+            // in `import_map` but each item can have its own `external-id`
+            // which is emitted on a per-item basis instead.
+            let external_id = match item {
+                WorldItem::Function(_) | WorldItem::Type { .. } => None,
+                WorldItem::Interface { .. } => resolve.external_id_value(key, item),
             };
             let interface = import_map
                 .entry(import_map_key)
                 .or_insert_with(|| ImportedInterface {
                     interface: interface_id,
                     lowerings: Default::default(),
+                    implements,
+                    external_id: external_id.clone(),
                 });
             assert_eq!(interface.interface, interface_id);
+            assert_eq!(interface.implements, implements);
+            assert_eq!(interface.external_id, external_id);
             match item {
                 WorldItem::Function(func) => {
-                    interface.add_func(required, resolve, func);
+                    interface.add_func(required, resolve, func, info);
                 }
-                WorldItem::Type(ty) => {
-                    interface.add_type(required, resolve, *ty);
+                WorldItem::Type { id, .. } => {
+                    interface.add_type(required, resolve, *id);
                 }
                 WorldItem::Interface { id, .. } => {
                     for (_name, ty) in resolve.interfaces[*id].types.iter() {
                         interface.add_type(required, resolve, *ty);
                     }
                     for (_name, func) in resolve.interfaces[*id].functions.iter() {
-                        interface.add_func(required, resolve, func);
+                        interface.add_func(required, resolve, func, info);
                     }
                 }
             }
@@ -317,7 +386,7 @@ impl<'a> ComponentWorld<'a> {
             log::trace!("add live world export `{}`", resolve.name_world_key(name));
             let id = match item {
                 WorldItem::Interface { id, .. } => id,
-                WorldItem::Function(_) | WorldItem::Type(_) => {
+                WorldItem::Function(_) | WorldItem::Type { .. } => {
                     live.add_world_item(resolve, item);
                     continue;
                 }
@@ -359,7 +428,7 @@ impl<'a> ComponentWorld<'a> {
         // encoded and therefore unconditionally live here. Once encoding is
         // based on conditionally-live things then this should be removed.
         for (_, item) in world.imports.iter() {
-            if let WorldItem::Type(id) = item {
+            if let WorldItem::Type { id, .. } = item {
                 live.add_type_id(resolve, *id);
             }
         }
@@ -385,6 +454,7 @@ impl<'a> ComponentWorld<'a> {
                 Import::StreamNew(info)
                 | Import::StreamRead { info, async_: _ }
                 | Import::StreamWrite { info, async_: _ }
+                | Import::StreamForward(info)
                 | Import::StreamCancelRead { info, async_: _ }
                 | Import::StreamCancelWrite { info, async_: _ }
                 | Import::StreamDropReadable(info)
@@ -392,30 +462,34 @@ impl<'a> ComponentWorld<'a> {
                 | Import::FutureNew(info)
                 | Import::FutureRead { info, async_: _ }
                 | Import::FutureWrite { info, async_: _ }
+                | Import::FutureForward(info)
                 | Import::FutureCancelRead { info, async_: _ }
                 | Import::FutureCancelWrite { info, async_: _ }
                 | Import::FutureDropReadable(info)
                 | Import::FutureDropWritable(info) => {
-                    live.add_type_id(resolve, info.ty);
+                    if let PayloadType::Type { id, .. } = info.ty {
+                        live.add_type_id(resolve, id);
+                    }
                 }
 
                 // The `task.return` intrinsic needs to be able to refer to the
                 // type that is being returned.
-                Import::ExportedTaskReturn(.., ty) => {
-                    if let Some(ty) = ty {
-                        live.add_type(resolve, ty);
+                Import::ExportedTaskReturn(.., func) => {
+                    if let Some(ty) = func.result {
+                        live.add_type(resolve, &ty);
                     }
                 }
 
                 // Intrinsics that don't need to refer to WIT types can be
                 // skipped here.
                 Import::AdapterExport { .. }
-                | Import::MainModuleMemory
+                | Import::MainModuleMemory(_)
                 | Import::MainModuleExport { .. }
                 | Import::Item(_)
-                | Import::ContextGet(_)
-                | Import::ContextSet(_)
-                | Import::BackpressureSet
+                | Import::ContextGet { .. }
+                | Import::ContextSet { .. }
+                | Import::TlsBaseGet { .. }
+                | Import::TlsBaseSet { .. }
                 | Import::BackpressureInc
                 | Import::BackpressureDec
                 | Import::WaitableSetNew
@@ -423,7 +497,6 @@ impl<'a> ComponentWorld<'a> {
                 | Import::WaitableSetPoll { .. }
                 | Import::WaitableSetDrop
                 | Import::WaitableJoin
-                | Import::ThreadYield { .. }
                 | Import::SubtaskDrop
                 | Import::SubtaskCancel { .. }
                 | Import::ErrorContextNew { .. }
@@ -432,10 +505,13 @@ impl<'a> ComponentWorld<'a> {
                 | Import::ExportedTaskCancel
                 | Import::ThreadIndex
                 | Import::ThreadNewIndirect { .. }
-                | Import::ThreadSwitchTo { .. }
-                | Import::ThreadSuspend { .. }
                 | Import::ThreadResumeLater
-                | Import::ThreadYieldTo { .. } => {}
+                | Import::ThreadSuspend { .. }
+                | Import::ThreadYield { .. }
+                | Import::ThreadSuspendThenResume { .. }
+                | Import::ThreadYieldThenResume { .. }
+                | Import::ThreadSuspendThenPromote { .. }
+                | Import::ThreadYieldThenPromote { .. } => {}
             }
         }
     }
@@ -445,18 +521,19 @@ impl<'a> ComponentWorld<'a> {
         let world = self.encoder.metadata.world;
 
         let exports = &resolve.worlds[world].exports;
-        for (_name, item) in exports.iter() {
+        for (_key, item) in exports.iter() {
             let id = match item {
                 WorldItem::Function(_) => continue,
                 WorldItem::Interface { id, .. } => *id,
-                WorldItem::Type(_) => unreachable!(),
+                WorldItem::Type { .. } => unreachable!(),
             };
             let mut set = HashSet::new();
 
             for other in resolve.interface_direct_deps(id) {
+                let key = WorldKey::Interface(other);
                 // If this dependency is not exported, then it'll show up
                 // through an import, so we're not interested in it.
-                if !exports.contains_key(&WorldKey::Interface(other)) {
+                if !exports.contains_key(&key) {
                     continue;
                 }
 
@@ -479,8 +556,36 @@ struct Required<'a> {
     resource_drops: IndexSet<TypeId>,
 }
 
+/// Returns whether `options` can all be satisfied without needing anything from
+/// a core module that hasn't been instantiated yet.
+fn options_are_available_before_instantiation(
+    options: RequiredOptions,
+    info: &ValidatedModule,
+) -> bool {
+    // If neither memory nor realloc are needed, this can always be lowered
+    // eagerly.
+    if !options.contains(RequiredOptions::MEMORY) && !options.contains(RequiredOptions::REALLOC) {
+        return true;
+    }
+
+    // Otherwise this depends on linear memory. If the main module imports
+    // linear memory then it's available before instantiating it, and in that
+    // situation we'll also generate shim functions for `realloc` so that's also
+    // available before instantiation.
+    //
+    // If linear memory isn't imported, but instead it's only exported, then we
+    // can't have it before we instantiate the main module.
+    info.imports.imported_memory().is_some()
+}
+
 impl ImportedInterface {
-    fn add_func(&mut self, required: &Required<'_>, resolve: &Resolve, func: &Function) {
+    fn add_func(
+        &mut self,
+        required: &Required<'_>,
+        resolve: &Resolve,
+        func: &Function,
+        info: &ValidatedModule,
+    ) {
         let mut abis = Vec::with_capacity(2);
         if let Some(set) = required.interface_funcs.get(&self.interface) {
             if set.contains(&(func.name.as_str(), AbiVariant::GuestImport)) {
@@ -493,8 +598,8 @@ impl ImportedInterface {
         for abi in abis {
             log::trace!("add func {} {abi:?}", func.name);
             let options = RequiredOptions::for_import(resolve, func, abi);
-            let lowering = if options.is_empty() {
-                Lowering::Direct
+            let lowering = if options_are_available_before_instantiation(options, info) {
+                Lowering::Direct { options }
             } else {
                 let sig = resolve.wasm_signature(abi, func);
                 Lowering::Indirect { sig, options }

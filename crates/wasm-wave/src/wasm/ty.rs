@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt::Debug};
+use alloc::{borrow::Cow, boxed::Box};
 
 /// The kind of a [`WasmType`]. These correspond to the value types defined by the
 /// [Component Model design](https://github.com/WebAssembly/component-model/blob/673d5c43c3cc0f4aeb8996a5c0931af623f16808/design/mvp/WIT.md).
@@ -20,7 +20,7 @@ pub enum WasmTypeKind {
     Char,
     String,
     List,
-    FixedSizeList,
+    FixedLengthList,
     Record,
     Tuple,
     Variant,
@@ -29,12 +29,13 @@ pub enum WasmTypeKind {
     Result,
     Flags,
     Handle,
+    Map,
     #[doc(hidden)]
     Unsupported,
 }
 
-impl std::fmt::Display for WasmTypeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for WasmTypeKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             WasmTypeKind::Bool => "bool",
             WasmTypeKind::S8 => "s8",
@@ -50,7 +51,7 @@ impl std::fmt::Display for WasmTypeKind {
             WasmTypeKind::Char => "char",
             WasmTypeKind::String => "string",
             WasmTypeKind::List => "list",
-            WasmTypeKind::FixedSizeList => "list<_,N>",
+            WasmTypeKind::FixedLengthList => "list<_,N>",
             WasmTypeKind::Record => "record",
             WasmTypeKind::Tuple => "tuple",
             WasmTypeKind::Variant => "variant",
@@ -59,6 +60,7 @@ impl std::fmt::Display for WasmTypeKind {
             WasmTypeKind::Result => "result",
             WasmTypeKind::Flags => "flags",
             WasmTypeKind::Handle => "handle",
+            WasmTypeKind::Map => "map",
             WasmTypeKind::Unsupported => "<<UNSUPPORTED>>",
         })
     }
@@ -133,6 +135,14 @@ pub trait WasmType: Clone + Sized {
     /// # Panics
     /// Panics if the type is not implemented (the trait default).
     fn handle_type(&self) -> &str {
+        unimplemented!()
+    }
+
+    /// Returns the map's key and value Types or `None` if `self` is not a map
+    /// type.
+    /// # Panics
+    /// Panics if the type is not implemented (the trait default).
+    fn map_key_value_types(&self) -> Option<(Self, Self)> {
         unimplemented!()
     }
 }

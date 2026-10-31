@@ -1,15 +1,15 @@
-use super::{Config, Print, PrintTermcolor, Printer, State};
+use super::{Config, ParameterNames, Print, PrintTermcolor, Printer, State};
 use anyhow::{Result, anyhow, bail};
 use termcolor::{Ansi, NoColor};
 use wasmparser::VisitSimdOperator;
 use wasmparser::{
     BlockType, BrTable, Catch, CompositeInnerType, ContType, FrameKind, FuncType, Handle, MemArg,
-    ModuleArity, Operator, OperatorsReader, Ordering, RefType, ResumeTable, SubType, TryTable,
-    VisitOperator,
+    MemArgOrdering, MemArgTarget, ModuleArity, Operator, OperatorsReader, Ordering, RefType,
+    ResumeTable, SubType, TryTable, VisitOperator,
 };
 
 pub struct OperatorState {
-    op_offset: usize,
+    op_offset: u64,
     nesting_start: u32,
     label: u32,
     label_indices: Vec<u32>,
@@ -38,7 +38,22 @@ struct FoldedInstruction {
     plain: String,
     folded: Vec<FoldedInstruction>,
     results: u32,
-    offset: usize,
+    offset: u64,
+    /// A branch hint annotation (e.g. `@metadata.code.branch_hint "\00"`) that
+    /// applies to this instruction. It's printed on its own line immediately
+    /// before the instruction, since that's the instruction it annotates.
+    hint: Option<String>,
+}
+
+impl Drop for FoldedInstruction {
+    fn drop(&mut self) {
+        // Flatten nested instructions to avoid stack overflow as instructions
+        // can be nested quite deep.
+        let mut stack = std::mem::take(&mut self.folded);
+        while let Some(mut inst) = stack.pop() {
+            stack.append(&mut inst.folded);
+        }
+    }
 }
 
 struct Block {
@@ -47,8 +62,11 @@ struct Block {
     plain: String,
     folded: Vec<FoldedInstruction>,
     predicate: Option<Vec<FoldedInstruction>>,
-    consequent: Option<(Vec<FoldedInstruction>, usize)>,
-    offset: usize,
+    consequent: Option<(Vec<FoldedInstruction>, u64)>,
+    offset: u64,
+    /// A branch hint annotation applying to the `if` instruction that opened
+    /// this block, carried until the block is turned into a `FoldedInstruction`.
+    hint: Option<String>,
 }
 
 pub struct PrintOperatorFolded<'printer, 'state, 'a, 'b> {
@@ -56,7 +74,7 @@ pub struct PrintOperatorFolded<'printer, 'state, 'a, 'b> {
     state: &'state mut State,
     operator_state: &'printer mut OperatorState,
     control: Vec<Block>,
-    branch_hint: Option<FoldedInstruction>,
+    branch_hint: Option<String>,
     original_separator: OperatorSeparator,
 }
 
@@ -164,7 +182,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperator<'printer, 'state, 'a, 'b> {
             BlockType::FuncType(idx) => {
                 self.push_str(" ")?;
                 self.printer
-                    .print_core_functype_idx(self.state, idx, None)?;
+                    .print_core_functype_idx(self.state, idx, ParameterNames::None)?;
             }
         }
         Ok(has_name)
@@ -404,8 +422,10 @@ impl<'printer, 'state, 'a, 'b> PrintOperator<'printer, 'state, 'a, 'b> {
     }
 
     fn memarg(&mut self, memarg: MemArg) -> Result<()> {
-        if memarg.memory != 0 {
-            self.memory_index(memarg.memory)?;
+        match memarg.target {
+            MemArgTarget::Memory(0) => {}
+            MemArgTarget::Memory(memory) => self.memory_index(memory)?,
+            MemArgTarget::Array(ty) => self.type_index(ty)?,
         }
         if memarg.offset != 0 {
             write!(self.result(), " offset={}", memarg.offset)?;
@@ -413,6 +433,11 @@ impl<'printer, 'state, 'a, 'b> PrintOperator<'printer, 'state, 'a, 'b> {
         if memarg.align != memarg.max_align {
             let align = 1_u64 << memarg.align;
             write!(self.result(), " align={align}")?;
+        }
+        if let Some(MemArgOrdering::Op(ordering)) | Some(MemArgOrdering::Rmw(ordering)) =
+            memarg.ordering
+        {
+            self.ordering(ordering)?;
         }
         Ok(())
     }
@@ -422,8 +447,8 @@ impl<'printer, 'state, 'a, 'b> PrintOperator<'printer, 'state, 'a, 'b> {
             self.result(),
             " {}",
             match ordering {
-                Ordering::SeqCst => "seq_cst",
-                Ordering::AcqRel => "acq_rel",
+                Ordering::SeqCst => "seqcst",
+                Ordering::AcqRel => "acqrel",
             }
         )?;
         Ok(())
@@ -501,7 +526,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperator<'printer, 'state, 'a, 'b> {
 macro_rules! define_visit {
     // General structure of all the operator printer methods:
     //
-    // * Print the name of the insruction as defined in this macro
+    // * Print the name of the instruction as defined in this macro
     // * Print any payload, as necessary
     ($(@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*) )*) => ($(
         fn $visit(&mut self $( , $($arg: $argty),* )?) -> Self::Output {
@@ -588,6 +613,11 @@ macro_rules! define_visit {
         if $src != 0 || $dst != 0 {
             $self.table_index($dst)?;
             $self.table_index($src)?;
+        }
+    );
+    (payload $self:ident AtomicFence $ordering:ident) => (
+        if $ordering != Ordering::SeqCst {
+            $self.ordering($ordering)?;
         }
     );
     (payload $self:ident MemoryGrow $mem:ident) => (
@@ -765,6 +795,23 @@ macro_rules! define_visit {
         $self.push_str(" ")?;
         $self.printer.print_field_idx($self.state, $ty, $field)?;
     );
+
+    (payload $self:ident RefGetDesc $hty:ident) => (
+        $self.struct_type_index($hty)?;
+    );
+    (payload $self:ident RefCastDescEqNonNull $hty:ident) => (
+        $self.push_str(" ")?;
+        let rty = RefType::new(false, $hty)
+            .ok_or_else(|| anyhow!("implementation limit: type index too large"))?;
+        $self.printer.print_reftype($self.state, rty)?;
+    );
+    (payload $self:ident RefCastDescEqNullable $hty:ident) => (
+        $self.push_str(" ")?;
+        let rty = RefType::new(true, $hty)
+            .ok_or_else(|| anyhow!("implementation limit: type index too large"))?;
+        $self.printer.print_reftype($self.state, rty)?;
+    );
+
     (payload $self:ident $op:ident $($arg:ident)*) => (
         $($self.$arg($arg)?;)*
     );
@@ -984,6 +1031,7 @@ macro_rules! define_visit {
     (name MemoryAtomicWait32) => ("memory.atomic.wait32");
     (name MemoryAtomicWait64) => ("memory.atomic.wait64");
     (name AtomicFence) => ("atomic.fence");
+    (name Pause) => ("pause");
     (name I32AtomicLoad) => ("i32.atomic.load");
     (name I64AtomicLoad) => ("i64.atomic.load");
     (name I32AtomicLoad8U) => ("i32.atomic.load8_u");
@@ -1309,6 +1357,8 @@ macro_rules! define_visit {
     (name StructGetS) => ("struct.get_s");
     (name StructGetU) => ("struct.get_u");
     (name StructSet) => ("struct.set");
+    (name StructNewDesc) => ("struct.new_desc");
+    (name StructNewDefaultDesc) => ("struct.new_default_desc");
     (name ArrayNew) => ("array.new");
     (name ArrayNewDefault) => ("array.new_default");
     (name ArrayNewFixed) => ("array.new_fixed");
@@ -1383,11 +1433,17 @@ macro_rules! define_visit {
     (name Suspend) => ("suspend");
     (name Resume) => ("resume");
     (name ResumeThrow) => ("resume_throw");
+    (name ResumeThrowRef) => ("resume_throw_ref");
     (name Switch) => ("switch");
     (name I64Add128) => ("i64.add128");
     (name I64Sub128) => ("i64.sub128");
     (name I64MulWideS) => ("i64.mul_wide_s");
     (name I64MulWideU) => ("i64.mul_wide_u");
+    (name RefGetDesc) => ("ref.get_desc");
+    (name RefCastDescEqNonNull) => ("ref.cast_desc_eq");
+    (name RefCastDescEqNullable) => ("ref.cast_desc_eq");
+    (name BrOnCastDescEq) => ("br_on_cast_desc_eq");
+    (name BrOnCastDescEqFail) => ("br_on_cast_desc_eq_fail");
 }
 
 impl<'a> VisitOperator<'a> for PrintOperator<'_, '_, '_, '_> {
@@ -1405,8 +1461,8 @@ impl<'a> VisitSimdOperator<'a> for PrintOperator<'_, '_, '_, '_> {
 }
 
 pub trait OpPrinter {
-    fn branch_hint(&mut self, offset: usize, taken: bool) -> Result<()>;
-    fn set_offset(&mut self, offset: usize);
+    fn branch_hint(&mut self, offset: u64, taken: bool) -> Result<()>;
+    fn set_offset(&mut self, offset: u64);
     fn visit_operator(
         &mut self,
         reader: &mut OperatorsReader<'_>,
@@ -1417,7 +1473,7 @@ pub trait OpPrinter {
 }
 
 impl OpPrinter for PrintOperator<'_, '_, '_, '_> {
-    fn branch_hint(&mut self, offset: usize, taken: bool) -> Result<()> {
+    fn branch_hint(&mut self, offset: u64, taken: bool) -> Result<()> {
         self.printer.newline(offset)?;
         let desc = if taken { "\"\\01\"" } else { "\"\\00\"" };
         self.printer.result.start_comment()?;
@@ -1426,7 +1482,7 @@ impl OpPrinter for PrintOperator<'_, '_, '_, '_> {
         Ok(())
     }
 
-    fn set_offset(&mut self, offset: usize) {
+    fn set_offset(&mut self, offset: u64) {
         self.operator_state.op_offset = offset;
     }
 
@@ -1461,20 +1517,15 @@ impl OpPrinter for PrintOperator<'_, '_, '_, '_> {
 }
 
 impl OpPrinter for PrintOperatorFolded<'_, '_, '_, '_> {
-    fn branch_hint(&mut self, offset: usize, taken: bool) -> Result<()> {
+    fn branch_hint(&mut self, _offset: u64, taken: bool) -> Result<()> {
         let mut hint = String::new();
         hint.push_str("@metadata.code.branch_hint ");
         hint.push_str(if taken { "\"\\01\"" } else { "\"\\00\"" });
-        self.branch_hint = Some(FoldedInstruction {
-            plain: hint,
-            folded: Vec::new(),
-            results: 0,
-            offset,
-        });
+        self.branch_hint = Some(hint);
         Ok(())
     }
 
-    fn set_offset(&mut self, offset: usize) {
+    fn set_offset(&mut self, offset: u64) {
         self.operator_state.op_offset = offset;
     }
 
@@ -1550,9 +1601,11 @@ impl OpPrinter for PrintOperatorFolded<'_, '_, '_, '_> {
         if self.control.len() != 1 {
             bail!("instruction sequence not closed");
         }
-        for inst in &self.control.last().unwrap().folded {
-            PrintOperatorFolded::print(&mut self.printer, &mut self.original_separator, &inst)?;
-        }
+        PrintOperatorFolded::print(
+            &mut self.printer,
+            &mut self.original_separator,
+            &self.control.last().unwrap().folded,
+        )?;
         if let Some(s) = annotation {
             self.printer.newline_unknown_pos()?;
             self.printer.result.start_comment()?;
@@ -1648,6 +1701,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                 predicate: None,
                 consequent: None,
                 offset: self.operator_state.op_offset,
+                hint: None,
             }),
             _ => bail!("invalid func_idx"),
         }
@@ -1665,6 +1719,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
             predicate: None,
             consequent: None,
             offset: 0,
+            hint: None,
         });
     }
 
@@ -1695,47 +1750,74 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
             }
         }
 
-        let mut inst = FoldedInstruction {
+        let inst = FoldedInstruction {
             plain,
             folded: stack.folded.drain(first_param..).collect(),
             results,
             offset: self.operator_state.op_offset,
+            hint: self.branch_hint.take(),
         };
-        if let Some(hint) = self.branch_hint.take() {
-            inst.folded.push(hint);
-        }
         stack.folded.push(inst);
 
         Ok(())
     }
 
-    // Print a folded instruction to the "real" printer. First print the "plain"
-    // instruction, then recursively print each instruction that was folded in to the
-    // foldedinst phrase.
-    fn print(
+    fn print_separator(
         printer: &mut Printer,
         sep: &mut OperatorSeparator,
-        inst: &FoldedInstruction,
+        offset: u64,
     ) -> Result<()> {
         match sep {
-            OperatorSeparator::Newline => printer.newline(inst.offset)?,
+            OperatorSeparator::Newline => printer.newline(offset)?,
             OperatorSeparator::None => (),
             OperatorSeparator::NoneThenSpace => *sep = OperatorSeparator::Space,
             OperatorSeparator::Space => printer.result.write_str(" ")?,
         }
+        Ok(())
+    }
 
-        printer.result.write_str("(")?;
-        printer.result.write_str(&inst.plain)?;
-        if inst.folded.is_empty() && inst.plain.contains(";;") {
-            // Wasm line comment (e.g. label annotation) shouldn't comment out the closing parenthesis
-            printer.newline(inst.offset)?;
+    /// Print a list of folded instructions to the "real" printer.
+    ///
+    /// For each instruction first print the "plain" instruction, then print
+    /// each instruction that was folded in to the foldedinst phrase.
+    fn print(
+        printer: &mut Printer,
+        sep: &mut OperatorSeparator,
+        insts: &[FoldedInstruction],
+    ) -> Result<()> {
+        // Note that folded instructions can get quite deep, so a stack here is
+        // used to manage the list of instructions to print.
+        let mut stack = vec![insts.iter()];
+        while let Some(iter) = stack.last_mut() {
+            let Some(inst) = iter.next() else {
+                stack.pop();
+                if !stack.is_empty() {
+                    printer.nesting -= 1;
+                    printer.result.write_str(")")?;
+                }
+                continue;
+            };
+
+            // A branch hint annotation is printed on its own line immediately
+            // before the instruction it applies to.
+            if let Some(hint) = &inst.hint {
+                Self::print_separator(printer, sep, inst.offset)?;
+                printer.result.write_str("(")?;
+                printer.result.write_str(hint)?;
+                printer.result.write_str(")")?;
+            }
+
+            Self::print_separator(printer, sep, inst.offset)?;
+
+            printer.result.write_str("(")?;
+            printer.result.write_str(&inst.plain)?;
+            if inst.folded.is_empty() && inst.plain.contains(";;") {
+                // Wasm line comment (e.g. label annotation) shouldn't comment out the closing parenthesis
+                printer.newline(inst.offset)?;
+            }
+            printer.nesting += 1;
+            stack.push(inst.folded.iter());
         }
-        printer.nesting += 1;
-        for fi in &inst.folded {
-            PrintOperatorFolded::print(printer, sep, &fi)?;
-        }
-        printer.nesting -= 1;
-        printer.result.write_str(")")?;
         Ok(())
     }
 
@@ -1757,6 +1839,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
             predicate: None,
             consequent: None,
             offset: self.operator_state.op_offset,
+            hint: None,
         });
         Ok(())
     }
@@ -1772,9 +1855,6 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
         {
             predicate.push(phrase)
         }
-        if let Some(hint) = self.branch_hint.take() {
-            predicate.push(hint);
-        }
         self.control.push(Block {
             ty,
             kind: FrameKind::If,
@@ -1783,6 +1863,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
             predicate: Some(predicate),
             consequent: None,
             offset: self.operator_state.op_offset,
+            hint: self.branch_hint.take(),
         });
         Ok(())
     }
@@ -1797,6 +1878,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                 predicate,
                 folded,
                 offset,
+                hint,
                 ..
             }) => self.control.push(Block {
                 ty,
@@ -1806,6 +1888,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                 predicate,
                 consequent: Some((folded, offset)),
                 offset: self.operator_state.op_offset,
+                hint,
             }),
             _ => bail!("no enclosing if block"),
         }
@@ -1832,6 +1915,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                 folded,
                 results,
                 offset,
+                hint: None,
             },
             Some(Block {
                 kind: FrameKind::If,
@@ -1839,6 +1923,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                 folded,
                 predicate: Some(predicate),
                 offset,
+                hint,
                 ..
             }) => {
                 let then_clause = FoldedInstruction {
@@ -1846,6 +1931,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                     folded,
                     results,
                     offset,
+                    hint: None,
                 };
                 let mut folded = predicate;
                 folded.push(then_clause);
@@ -1854,6 +1940,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                     folded,
                     results,
                     offset,
+                    hint,
                 }
             }
             Some(Block {
@@ -1863,6 +1950,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                 predicate: Some(predicate),
                 consequent: Some((consequent, if_offset)),
                 offset,
+                hint,
                 ..
             }) => {
                 let then_clause = FoldedInstruction {
@@ -1870,12 +1958,14 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                     folded: consequent,
                     results,
                     offset: if_offset,
+                    hint: None,
                 };
                 let else_clause = FoldedInstruction {
                     plain: String::from("else"),
                     folded,
                     results,
                     offset,
+                    hint: None,
                 };
                 let mut folded = predicate;
                 folded.push(then_clause);
@@ -1885,6 +1975,7 @@ impl<'printer, 'state, 'a, 'b> PrintOperatorFolded<'printer, 'state, 'a, 'b> {
                     folded,
                     results,
                     offset: if_offset,
+                    hint,
                 }
             }
             _ => bail!("unhandled frame kind"),

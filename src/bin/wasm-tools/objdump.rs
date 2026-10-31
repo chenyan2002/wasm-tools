@@ -9,6 +9,30 @@ use wasmparser::{Encoding, Parser, Payload::*};
 /// This is a relatively incomplete subcommand and is generally intended to just
 /// help poke around an object file.
 #[derive(clap::Parser)]
+#[clap(after_help = "
+Examples:
+
+       # Dump the contents of the file `add.wasm`:
+       $ wasm-tools objdump add.wasm
+       types                                  |        0xa -       0x11 |         7 bytes | 1 count
+       functions                              |       0x13 -       0x15 |         2 bytes | 1 count
+       exports                                |       0x17 -       0x33 |        28 bytes | 1 count
+       code                                   |       0x35 -       0x3e |         9 bytes | 1 count
+       custom \"name\"                          |       0x45 -       0x5c |        23 bytes | 1 count
+
+   One line is printed per section. The columns indicate:
+       * The name of the section (for example, \"types\")
+       * The offsets within the file for the start and end of the section (for example, \"0xa - 0x11\")
+       * The size of the section (for example, \"7 bytes\")
+       * The number of items within the section (for example, \"1 count\")
+
+       # Dump the contents of the file `add.wasm` and store the text-based output in a file
+       # named `add.txt`:
+       $ wasm-tools objdump add.wasm -o add.txt
+
+Exit status:
+    0 if OK,
+    nonzero to indicate a parse error.")]
 pub struct Opts {
     #[clap(flatten)]
     io: wasm_tools::InputOutput,
@@ -44,9 +68,11 @@ impl Opts {
                 ElementSection(s) => printer.section(s, "elements")?,
                 DataCountSection { range, .. } => printer.section_raw(range, 1, "data count")?,
                 DataSection(s) => printer.section(s, "data")?,
-                CodeSectionStart { range, count, .. } => {
-                    printer.section_raw(range, count, "code")?
-                }
+                CodeSectionStart {
+                    unchecked_range,
+                    count,
+                    ..
+                } => printer.section_raw(unchecked_range, count, "code")?,
                 CodeSectionEntry(_) => {}
 
                 ModuleSection {
@@ -76,11 +102,9 @@ impl Opts {
                 ComponentImportSection(s) => printer.section(s, "component imports")?,
                 ComponentExportSection(s) => printer.section(s, "component exports")?,
 
-                CustomSection(c) => printer.section_raw(
-                    c.data_offset()..c.data_offset() + c.data().len(),
-                    1,
-                    &format!("custom {:?}", c.name()),
-                )?,
+                CustomSection(c) => {
+                    printer.section_raw(c.data_range(), 1, &format!("custom {:?}", c.name()))?
+                }
 
                 End(_) => printer.end()?,
 
@@ -176,7 +200,7 @@ impl Printer {
         self.section_raw(section.range(), section.count(), name)
     }
 
-    fn section_raw(&mut self, range: Range<usize>, count: u32, name: &str) -> Result<()> {
+    fn section_raw(&mut self, range: Range<u64>, count: u32, name: &str) -> Result<()> {
         writeln!(
             self.output,
             "{:40} | {:#10x} - {:#10x} | {:9} bytes | {} count",

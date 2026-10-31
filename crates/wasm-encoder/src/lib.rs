@@ -69,7 +69,7 @@
 //! assert!(wasmparser::validate(&wasm_bytes).is_ok());
 //! ```
 
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![no_std]
 #![deny(missing_docs, missing_debug_implementations)]
 
@@ -129,7 +129,7 @@ impl Encode for str {
 
 impl Encode for usize {
     fn encode(&self, sink: &mut Vec<u8>) {
-        assert!(*self <= u32::max_value() as usize);
+        assert!(*self <= u32::MAX as usize);
         (*self as u32).encode(sink)
     }
 }

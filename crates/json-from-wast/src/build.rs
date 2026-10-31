@@ -103,6 +103,19 @@ impl<'a> JsonBuilder<'a, '_> {
                     file,
                 }
             }
+            WastDirective::AssertMalformedCustom {
+                span: _,
+                module,
+                message,
+            } => {
+                let line = self.lineno(module.span());
+                let (_name, file) = self.emit_file(module, true)?;
+                crate::Command::AssertMalformedCustom {
+                    line,
+                    text: message.into(),
+                    file,
+                }
+            }
             WastDirective::AssertInvalid {
                 span: _,
                 module,
@@ -111,6 +124,19 @@ impl<'a> JsonBuilder<'a, '_> {
                 let line = self.lineno(module.span());
                 let (_name, file) = self.emit_file(module, false)?;
                 crate::Command::AssertInvalid {
+                    line,
+                    text: message.into(),
+                    file,
+                }
+            }
+            WastDirective::AssertInvalidCustom {
+                span: _,
+                module,
+                message,
+            } => {
+                let line = self.lineno(module.span());
+                let (_name, file) = self.emit_file(module, false)?;
+                crate::Command::AssertInvalidCustom {
                     line,
                     text: message.into(),
                     file,
@@ -248,8 +274,18 @@ impl<'a> JsonBuilder<'a, '_> {
                 QuoteWatTest::Binary(s) => (s, WasmFileType::Binary, "wasm"),
             },
         };
-        let filename: &str = &self.ret.source_filename;
-        let stem = Path::new(filename).file_stem().unwrap().to_str().unwrap();
+        let stem = match &self.opts.module_filename {
+            Some(name) => name.clone(),
+            None => {
+                let filename: &str = &self.ret.source_filename;
+                Path::new(filename)
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
         let fileno = self.files;
         self.files += 1;
         let filename = format!("{stem}.{fileno}.{ext}");
@@ -365,6 +401,11 @@ impl<'a> JsonBuilder<'a, '_> {
             WastVal::List(s) => crate::ComponentConst::List(
                 s.into_iter()
                     .map(|i| self.component_val(i))
+                    .collect::<Result<_>>()?,
+            ),
+            WastVal::Map(s) => crate::ComponentConst::Map(
+                s.into_iter()
+                    .map(|(k, v)| Ok((self.component_val(k)?, self.component_val(v)?)))
                     .collect::<Result<_>>()?,
             ),
             WastVal::Record(s) => crate::ComponentConst::Record(

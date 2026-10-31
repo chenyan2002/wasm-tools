@@ -6,12 +6,58 @@ use std::path::Path;
 
 fn main() {
     let _ = fs::remove_dir_all("./tests/cli/spec");
-    copy_tests("tests/testsuite".as_ref(), "tests/cli/spec".as_ref());
+    copy_tests(
+        "tests/testsuite".as_ref(),
+        "tests/cli/spec".as_ref(),
+        spec_features,
+    );
+    copy_tests(
+        "tests/component-model/test".as_ref(),
+        "tests/cli/spec/components".as_ref(),
+        component_features,
+    );
+}
+
+fn spec_features(path: &Path) -> &str {
+    return match find_proposal(path) {
+        None | Some("extended-name-section") => "wasm3",
+        Some("threads") => "wasm1,threads",
+        Some("custom-page-sizes") => "wasm3,custom-page-sizes",
+        Some("wide-arithmetic") => "wasm3,wide-arithmetic",
+        Some("custom-descriptors") => "wasm3,custom-descriptors",
+        Some("compact-import-section") => "wasm3,compact-imports",
+        Some(proposal) => panic!("unsupported proposal: {}", proposal),
+    };
+
+    /// Finds the wasm proposal, if present, within `src`.
+    fn find_proposal(src: &Path) -> Option<&str> {
+        // Look for `foo` in `.../proposals/foo/...`
+        let mut parts = src.iter();
+        while let Some(next) = parts.next() {
+            if next.to_str() == Some("proposals") {
+                return parts.next()?.to_str();
+            }
+        }
+        None
+    }
+}
+
+fn component_features(_path: &Path) -> &str {
+    "wasm3,\
+        component-model,\
+        cm-map,\
+        cm-async,\
+        cm-implements,\
+        cm-async-stackful,\
+        cm-threading,\
+        cm-more-async-builtins,\
+        cm-fixed-length-lists,\
+        cm-forward"
 }
 
 /// Recursively visit `src` and, for all test files, create a file in `dst` to
 /// run the test.
-fn copy_tests(src: &Path, dst: &Path) {
+fn copy_tests(src: &Path, dst: &Path, features: fn(&Path) -> &str) {
     fs::create_dir(&dst).unwrap();
     for entry in src.read_dir().unwrap() {
         let entry = entry.unwrap();
@@ -19,7 +65,7 @@ fn copy_tests(src: &Path, dst: &Path) {
         let src = entry.path();
         let dst = dst.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
-            copy_tests(&src, &dst);
+            copy_tests(&src, &dst, features);
             continue;
         }
 
@@ -27,12 +73,12 @@ fn copy_tests(src: &Path, dst: &Path) {
             continue;
         }
 
-        copy_test(&src, &dst);
+        copy_test(&src, &dst, features);
     }
 }
 
 /// Creates `dst` as a file to run `src` as a test.
-fn copy_test(src: &Path, dst: &Path) {
+fn copy_test(src: &Path, dst: &Path, features: fn(&Path) -> &str) {
     // The legacy exception-handling proposal is not currently supported because
     // it uses the folded form of s-expressions which are not implemented here.
     // Regardless just skip these spec tests.
@@ -40,12 +86,24 @@ fn copy_test(src: &Path, dst: &Path) {
         return;
     }
 
-    let mut contents = format!(";; RUN: wast \\\n");
+    let directive = match dst.file_name().and_then(|s| s.to_str()) {
+        // Disable tests by doing something like:
+        // Some("exact-func-import.wast") => "FAIL",
+
+        // Skip this test for now since the tests mentioned in
+        // https://github.com/WebAssembly/extended-name-section/pull/11/changes#r4008526172
+        // don't round-trip. Can probably find a way to work around that and
+        // still run the test but for now wait for that discussion.
+        Some("name.wast") if dst.ends_with("extended-name-section/custom/name.wast") => "FAIL",
+
+        Some(_) | None => "RUN",
+    };
+
+    let mut contents = format!(";; {directive}: wast \\\n");
     contents.push_str(";;      --assert default \\\n");
 
     // Allow certain assert_malformed tests to be interpreted as assert_invalid
-    if src.ends_with("binary.wast") || src.ends_with("global.wast") || src.ends_with("select.wast")
-    {
+    if src.ends_with("binary.wast") {
         contents.push_str(";;      --assert permissive \\\n");
     }
 
@@ -69,32 +127,11 @@ fn copy_test(src: &Path, dst: &Path) {
     // Push a `--features=..` flag for the spec tests. Spec tests often need a
     // precise set of features different from the defaults of `wasm-tools` so
     // it's always overridden here.
-    let features = match find_proposal(src) {
-        None => "wasm2",
-        Some("annotations") => "wasm2",
-        Some("threads") => "wasm1,threads",
-        Some("wasm-3.0") => "wasm3",
-        Some("custom-page-sizes") => "wasm3,custom-page-sizes",
-        Some("wide-arithmetic") => "wasm2,wide-arithmetic",
-        Some("relaxed-simd") => "wasm2,relaxed-simd",
-        Some(proposal) => panic!("unsupported proposal: {}", proposal),
-    };
+    let features = features(src);
     contents.push_str(&format!(";;      --features={features} \\\n"));
 
     // And finally push a path to the test itself.
     contents.push_str(&format!(";;      {}\n", src.display()));
 
     fs::write(dst, contents).unwrap();
-}
-
-/// Finds the wasm proposal, if present, within `src`.
-fn find_proposal(src: &Path) -> Option<&str> {
-    // Look for `foo` in `.../proposals/foo/...`
-    let mut parts = src.iter();
-    while let Some(next) = parts.next() {
-        if next.to_str() == Some("proposals") {
-            return parts.next()?.to_str();
-        }
-    }
-    None
 }

@@ -31,7 +31,7 @@ use crate::{
         },
     },
 };
-use rand::{Rng, prelude::*};
+use rand::{RngExt, prelude::*};
 use wasm_encoder::{CodeSection, Function, Module, ValType};
 use wasmparser::{CodeSectionReader, FunctionBody};
 
@@ -64,6 +64,7 @@ impl CodemotionMutator {
     ) -> crate::Result<(Function, u32)> {
         let original_code_section = config.info().code.unwrap();
         let reader = config.info().get_binary_reader(original_code_section);
+        let input_code_section = config.info().get_code_section().data;
         let sectionreader = CodeSectionReader::new(reader)?;
         let function_count = sectionreader.count();
         let function_to_mutate = config.rng().random_range(0..function_count);
@@ -94,13 +95,13 @@ impl CodemotionMutator {
             }
 
             match filtered.choose(config.rng()) {
-                Some(choosen_mutator) => {
-                    let newfunc = choosen_mutator.mutate(
+                Some(chosen_mutator) => {
+                    let newfunc = chosen_mutator.mutate(
                         config,
                         &ast,
                         &self.copy_locals(reader)?,
                         &operators,
-                        config.info().raw_sections[original_code_section].data,
+                        input_code_section,
                     )?;
                     return Ok((newfunc, fidx));
                 }

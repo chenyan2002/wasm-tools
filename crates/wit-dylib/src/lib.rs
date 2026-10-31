@@ -1,4 +1,3 @@
-use crate::metadata::Metadata;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -14,8 +13,11 @@ use wit_parser::{
     WorldKey,
 };
 
+mod async_;
 mod bindgen;
-mod metadata;
+pub mod metadata;
+pub use crate::async_::AsyncFilterSet;
+pub use crate::metadata::Metadata;
 
 pub const C_HEADER: &'static str = include_str!("../wit_dylib.h");
 
@@ -24,16 +26,53 @@ pub const C_HEADER: &'static str = include_str!("../wit_dylib.h");
 pub struct DylibOpts {
     /// The interpreter name to insert into the `WASM_DYLINK_NEEDED` section
     /// encoded as `dylink.0`.
-    #[cfg_attr(feature = "clap", clap(long))]
+    #[cfg_attr(feature = "clap", clap(long, value_name = "name"))]
     pub interpreter: Option<String>,
+
+    #[cfg_attr(feature = "clap", clap(flatten))]
+    pub async_: AsyncFilterSet,
+
+    /// Where the stack pointer is located in the ABI of the generated dylib.
+    ///
+    /// For WASIp2-and-prior the `global` option should be used, and for
+    /// WASIp3-and-later the `task-context` option should be used.
+    #[cfg_attr(
+        feature = "clap",
+        clap(long, value_name = "loc", default_value = "global")
+    )]
+    pub stack_pointer: StackPointer,
 }
 
-pub fn create(resolve: &Resolve, world_id: WorldId, opts: Option<&DylibOpts>) -> Vec<u8> {
+#[derive(Default, Clone, Debug)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum StackPointer {
+    #[default]
+    Global,
+    TaskContext,
+}
+
+pub fn create(
+    resolve: &Resolve,
+    world_id: WorldId,
+    opts: Option<&mut DylibOpts>,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(create_with_metadata(resolve, world_id, opts)?.0)
+}
+
+pub fn create_with_metadata(
+    resolve: &Resolve,
+    world_id: WorldId,
+    mut opts: Option<&mut DylibOpts>,
+) -> anyhow::Result<(Vec<u8>, Metadata)> {
     let mut adapter = Adapter::default();
-    if let Some(opts) = opts {
+    if let Some(opts) = &mut opts {
         adapter.opts = opts.clone();
     }
-    adapter.encode(resolve, world_id)
+    let result = adapter.encode(resolve, world_id)?;
+    if let Some(opts) = &mut opts {
+        **opts = adapter.opts;
+    }
+    Ok((result, adapter.metadata))
 }
 
 #[derive(Default)]
@@ -45,7 +84,7 @@ struct Adapter {
     global_index: u32,
     table_base: Option<u32>,
     memory_base: Option<u32>,
-    stack_pointer: Option<u32>,
+    stack_pointer: Option<ImportedStackPointer>,
     func_index: u32,
     functions: FunctionSection,
     exports: ExportSection,
@@ -68,20 +107,69 @@ struct Adapter {
     elem_segment: Vec<u32>,
 }
 
+#[derive(Copy, Clone)]
+enum ImportedStackPointer {
+    Global(u32),
+    TaskContext { get: u32, set: u32 },
+}
+
 #[derive(Default)]
 struct Imports<'a> {
-    funcs: Vec<(&'a wit_parser::Function, Option<&'a WorldKey>, u32)>,
+    wit_imports: Vec<WitImport<'a>>,
+    wit_exports: Vec<WitExport<'a>>,
+}
+
+struct WitImport<'a> {
+    interface: Option<&'a WorldKey>,
+    func: &'a wit_parser::Function,
+    import_index: u32,
+}
+
+struct WitExport<'a> {
+    interface: Option<&'a WorldKey>,
+    func: &'a wit_parser::Function,
+    async_task_return_index: Option<u32>,
+}
+
+/// Represents data for a given `stream<T>` or `future<T>` as referenced by an
+/// imported or exported function by way of its parameter list or result.
+struct PayloadData {
+    /// `{stream|future}.new` import
+    new_elem_index: u32,
+    /// `{stream|future}.read` import
+    read_elem_index: u32,
+    /// `{stream|future}.write` import
+    write_elem_index: u32,
+    /// `{stream|future}.cancel-read` import
+    cancel_read_elem_index: u32,
+    /// `{stream|future}.cancel-write` import
+    cancel_write_elem_index: u32,
+    /// `{stream|future}.drop-readable` import
+    drop_readable_elem_index: u32,
+    /// `{stream|future}.drop-writable` import
+    drop_writable_elem_index: u32,
+    /// Position of this `stream<T>` or `future<T>` in the function's signature
+    /// relative to any other `stream`s or `future`s.  See
+    /// `wit_parser::Function::find_futures_and_streams` for details.
+    ordinal: usize,
+    /// Name of the function with the signature in which this `stream<T>` or
+    /// `future<T>` was found.
+    function: String,
 }
 
 impl Adapter {
-    pub fn encode(&mut self, resolve: &Resolve, world_id: WorldId) -> Vec<u8> {
-        self.sizes.fill(resolve);
+    pub fn encode(&mut self, resolve: &Resolve, world_id: WorldId) -> anyhow::Result<Vec<u8>> {
+        self.sizes.fill(resolve)?;
 
         // First define all imports that will go into the wasm module since
         // they're required to be first in their index spaces anyway. This will
         // import intrinsics necessary for exported resources, for example, as
         // well.
         let imports = self.add_imports(resolve, world_id);
+
+        let mut payload_data = HashMap::new();
+        self.collect_payload_data(resolve, world_id, &mut payload_data);
+
         self.imports_done = true;
 
         // Ensure that `cabi_realloc` is reexported from our module to indicate
@@ -93,7 +181,7 @@ impl Adapter {
 
         // Generate/add metadata for all functions that are either imported or
         // exported.
-        self.bindgen_world(resolve, world_id, &imports);
+        self.bindgen_world(resolve, world_id, &imports, &payload_data);
 
         // Now that all functions have been learned about the metadata data
         // segment can be finalized and emitted. Here this additionally invokes
@@ -110,13 +198,167 @@ impl Adapter {
         let ty = self.define_ty([], []);
         self.define_func("__wasm_call_ctors", ty, ctor, true);
 
-        self.finish(&metadata)
+        Ok(self.finish(&metadata))
     }
 
-    fn mangling(&self) -> ManglingAndAbi {
-        // TODO: this probably wants CLI parameters and/or a `Function` argument
-        // to configure how exactly name mangling and ABIs work out.
+    fn mangling(
+        &mut self,
+        resolve: &Resolve,
+        interface: Option<&WorldKey>,
+        func: &wit_parser::Function,
+        is_import: bool,
+    ) -> ManglingAndAbi {
+        let abi = if self
+            .opts
+            .async_
+            .is_async(resolve, interface, func, is_import)
+        {
+            LiftLowerAbi::AsyncCallback
+        } else {
+            LiftLowerAbi::Sync
+        };
+        ManglingAndAbi::Legacy(abi)
+    }
+
+    fn resource_intrinsic_mangling(&mut self) -> ManglingAndAbi {
         ManglingAndAbi::Legacy(LiftLowerAbi::Sync)
+    }
+
+    /// Scan the specified function for any `stream` or `future` types in the
+    /// parameter list or result, importing the necessary intrinsics for each
+    /// one found and inserting them into `data` for later reference.
+    fn collect_payload_data_for_func(
+        &mut self,
+        resolve: &Resolve,
+        interface: Option<&WorldKey>,
+        func: &wit_parser::Function,
+        prefix: &str,
+        data: &mut HashMap<TypeId, PayloadData>,
+    ) {
+        let mut make = |arg_count, kind, ordinal| {
+            let module = format!(
+                "{prefix}{}",
+                interface
+                    .map(|name| resolve.name_world_key(name))
+                    .unwrap_or_else(|| "$root".into())
+            );
+            let function = func.name.clone();
+
+            let import = |me: &mut Self, prefix, name, params, results| {
+                let ty = me.define_ty(params, results);
+                let import = me.import_func(
+                    &module,
+                    &format!("{prefix}[{kind}-{name}-{ordinal}]{function}"),
+                    ty,
+                );
+                me.push_elem(import)
+            };
+
+            let new_elem_index = import(self, "", "new", vec![], vec![ValType::I64]);
+            let read_elem_index = import(
+                self,
+                "[async-lower]",
+                "read",
+                vec![ValType::I32; arg_count],
+                vec![ValType::I32],
+            );
+            let write_elem_index = import(
+                self,
+                "[async-lower]",
+                "write",
+                vec![ValType::I32; arg_count],
+                vec![ValType::I32],
+            );
+            let cancel_read_elem_index = import(
+                self,
+                "",
+                "cancel-read",
+                vec![ValType::I32],
+                vec![ValType::I32],
+            );
+            let cancel_write_elem_index = import(
+                self,
+                "",
+                "cancel-write",
+                vec![ValType::I32],
+                vec![ValType::I32],
+            );
+            let drop_readable_elem_index =
+                import(self, "", "drop-readable", vec![ValType::I32], vec![]);
+            let drop_writable_elem_index =
+                import(self, "", "drop-writable", vec![ValType::I32], vec![]);
+
+            PayloadData {
+                new_elem_index,
+                read_elem_index,
+                write_elem_index,
+                cancel_read_elem_index,
+                cancel_write_elem_index,
+                drop_readable_elem_index,
+                drop_writable_elem_index,
+                ordinal,
+                function,
+            }
+        };
+
+        for (ordinal, ty) in func
+            .find_futures_and_streams(resolve)
+            .into_iter()
+            .enumerate()
+        {
+            match &resolve.types[ty].kind {
+                TypeDefKind::Future(_) => {
+                    data.entry(ty).or_insert_with(|| make(2, "future", ordinal))
+                }
+                TypeDefKind::Stream(_) => {
+                    data.entry(ty).or_insert_with(|| make(3, "stream", ordinal))
+                }
+                _ => unreachable!(),
+            };
+        }
+    }
+
+    fn collect_payload_data(
+        &mut self,
+        resolve: &Resolve,
+        world_id: WorldId,
+        data: &mut HashMap<TypeId, PayloadData>,
+    ) {
+        let world = &resolve.worlds[world_id];
+
+        for (key, import) in world.imports.iter() {
+            match import {
+                WorldItem::Interface { id, .. } => {
+                    for (_, func) in resolve.interfaces[*id].functions.iter() {
+                        self.collect_payload_data_for_func(resolve, Some(key), func, "", data);
+                    }
+                }
+                WorldItem::Type { .. } => {}
+                WorldItem::Function(func) => {
+                    self.collect_payload_data_for_func(resolve, None, func, "", data);
+                }
+            }
+        }
+
+        for (key, export) in world.exports.iter() {
+            match export {
+                WorldItem::Interface { id, .. } => {
+                    for (_, func) in resolve.interfaces[*id].functions.iter() {
+                        self.collect_payload_data_for_func(
+                            resolve,
+                            Some(key),
+                            func,
+                            "[export]",
+                            data,
+                        );
+                    }
+                }
+                WorldItem::Type { .. } => unreachable!(),
+                WorldItem::Function(func) => {
+                    self.collect_payload_data_for_func(resolve, None, func, "[export]", data);
+                }
+            }
+        }
     }
 
     fn add_imports<'a>(&mut self, resolve: &'a Resolve, world_id: WorldId) -> Imports<'a> {
@@ -141,8 +383,8 @@ impl Adapter {
                         self.add_imported_type_intrinsics(resolve, Some(interface), *ty);
                     }
                 }
-                WorldItem::Type(ty) => {
-                    self.add_imported_type_intrinsics(resolve, None, *ty);
+                WorldItem::Type { id, .. } => {
+                    self.add_imported_type_intrinsics(resolve, None, *id);
                 }
                 WorldItem::Function(func) => {
                     self.add_imported_func(resolve, None, func, &mut ret);
@@ -154,13 +396,23 @@ impl Adapter {
         // so do so here.
         for (name, export) in world.exports.iter() {
             match export {
-                WorldItem::Function(_func) => {}
+                WorldItem::Function(func) => {
+                    self.add_imported_func_intrinsics_for_export(resolve, None, func, &mut ret);
+                }
                 WorldItem::Interface { id: export, .. } => {
                     for (_, ty) in resolve.interfaces[*export].types.iter() {
                         self.add_imported_type_intrinsics_for_export(resolve, Some(name), *ty);
                     }
+                    for (_, func) in resolve.interfaces[*export].functions.iter() {
+                        self.add_imported_func_intrinsics_for_export(
+                            resolve,
+                            Some(name),
+                            func,
+                            &mut ret,
+                        );
+                    }
                 }
-                WorldItem::Type(_) => unreachable!(),
+                WorldItem::Type { .. } => unreachable!(),
             }
         }
 
@@ -177,7 +429,21 @@ impl Adapter {
 
         self.table_base = Some(self.import_global("env", "__table_base", const_i32_global));
         self.memory_base = Some(self.import_global("env", "__memory_base", const_i32_global));
-        self.stack_pointer = Some(self.import_global("env", "__stack_pointer", mut_i32_global));
+        self.stack_pointer = Some(match self.opts.stack_pointer {
+            StackPointer::Global => ImportedStackPointer::Global(self.import_global(
+                "env",
+                "__stack_pointer",
+                mut_i32_global,
+            )),
+            StackPointer::TaskContext => {
+                let get_ty = self.define_ty([], [ValType::I32]);
+                let set_ty = self.define_ty([ValType::I32], []);
+                ImportedStackPointer::TaskContext {
+                    get: self.import_func("$root", "[context-get-0]", get_ty),
+                    set: self.import_func("$root", "[context-set-0]", set_ty),
+                }
+            }
+        });
 
         self.imports.import(
             "env",
@@ -212,13 +478,17 @@ impl Adapter {
         func: &'a wit_parser::Function,
         imports: &mut Imports<'a>,
     ) {
-        let mangling = self.mangling();
+        let mangling = self.mangling(resolve, interface, func, true);
         let (module, name) =
             resolve.wasm_import_name(mangling, WasmImport::Func { interface, func });
         let sig = resolve.wasm_signature(mangling.import_variant(), func);
         let ty = self.define_wasm_sig(sig);
-        let idx = self.import_func(&module, &name, ty);
-        imports.funcs.push((func, interface, idx));
+        let import_index = self.import_func(&module, &name, ty);
+        imports.wit_imports.push(WitImport {
+            func,
+            interface,
+            import_index,
+        });
     }
 
     fn add_imported_type_intrinsics<'a>(
@@ -227,7 +497,7 @@ impl Adapter {
         interface: Option<&'a WorldKey>,
         id: TypeId,
     ) {
-        let mangling = self.mangling();
+        let mangling = self.resource_intrinsic_mangling();
         let ty = &resolve.types[id];
         match ty.kind {
             TypeDefKind::Resource => {
@@ -244,6 +514,7 @@ impl Adapter {
                 let drop_elem_index = self.push_elem(drop);
                 let resource_index = self.metadata.resources.len();
                 self.metadata.resources.push(metadata::Resource {
+                    id,
                     interface: interface.map(|i| resolve.name_world_key(i)),
                     name: ty.name.clone().unwrap(),
                     drop_elem_index,
@@ -255,7 +526,7 @@ impl Adapter {
             }
 
             // No other types with intrinsics at this time (futures/streams are
-            // relative to where they show up in function types.
+            // relative to where they show up in function types).
             _ => {}
         }
     }
@@ -267,7 +538,7 @@ impl Adapter {
         id: TypeId,
     ) {
         let ty = &resolve.types[id];
-        let mangling = self.mangling();
+        let mangling = self.resource_intrinsic_mangling();
         match ty.kind {
             TypeDefKind::Resource => {
                 let drop_ty = self.define_ty([ValType::I32], []);
@@ -295,6 +566,7 @@ impl Adapter {
 
                 let resource_index = self.metadata.resources.len();
                 self.metadata.resources.push(metadata::Resource {
+                    id,
                     interface: interface.map(|i| resolve.name_world_key(i)),
                     name: ty.name.clone().unwrap(),
                     drop_elem_index,
@@ -317,7 +589,38 @@ impl Adapter {
         }
     }
 
-    fn bindgen_world(&mut self, resolve: &Resolve, world_id: WorldId, imports: &Imports<'_>) {
+    /// Adds `task.return` imports for async functions, and appends all
+    /// functions to `ret.wit_exports`.
+    fn add_imported_func_intrinsics_for_export<'a>(
+        &mut self,
+        resolve: &Resolve,
+        interface: Option<&'a WorldKey>,
+        func: &'a wit_parser::Function,
+        ret: &mut Imports<'a>,
+    ) {
+        let mangling = self.mangling(resolve, interface, func, false);
+        let async_task_return_index = if mangling.is_async() {
+            let (module, name, sig) =
+                func.task_return_import(resolve, interface, mangling.mangling());
+            let ty = self.define_wasm_sig(sig);
+            Some(self.import_func(&module, &name, ty))
+        } else {
+            None
+        };
+        ret.wit_exports.push(WitExport {
+            interface,
+            func,
+            async_task_return_index,
+        });
+    }
+
+    fn bindgen_world(
+        &mut self,
+        resolve: &Resolve,
+        world_id: WorldId,
+        imports: &Imports<'_>,
+        payload_data: &HashMap<TypeId, PayloadData>,
+    ) {
         let world = &resolve.worlds[world_id];
 
         // Build up a map for all types of all imports. This pushes all type
@@ -335,7 +638,7 @@ impl Adapter {
             match export {
                 WorldItem::Function(func) => import_types.add_func(resolve, func),
                 WorldItem::Interface { .. } => {}
-                WorldItem::Type(_) => unreachable!(),
+                WorldItem::Type { .. } => unreachable!(),
             }
         }
         for ty in import_types.iter() {
@@ -343,23 +646,17 @@ impl Adapter {
                 TypeOwner::Interface(id) => Some(interface_names[&id]),
                 _ => None,
             };
-            self.register_type(resolve, key, ty);
+            self.register_type(resolve, key, ty, payload_data);
         }
 
         // Using the populated type map for imports generate functions to invoke
         // these imports. Also generate exported functions in the world since
         // they use imported types as well.
-        for (func, key, func_idx) in imports.funcs.iter() {
-            self.bindgen_world_func_import(resolve, *key, func, *func_idx);
+        for import in imports.wit_imports.iter() {
+            self.bindgen_world_func_import(resolve, import);
         }
-        for (_, export) in world.exports.iter() {
-            match export {
-                WorldItem::Function(func) => {
-                    self.bindgen_world_func_export(resolve, None, func);
-                }
-                WorldItem::Interface { .. } => {}
-                WorldItem::Type(_) => unreachable!(),
-            }
+        for export in imports.wit_exports.iter().filter(|i| i.interface.is_none()) {
+            self.bindgen_world_func_export(resolve, export);
         }
 
         // Next handle exported interfaces. This is a bit tricky since an
@@ -389,7 +686,7 @@ impl Adapter {
                 TypeOwner::Interface(id) => Some(export_names[&id]),
                 _ => None,
             };
-            self.register_type(resolve, key, ty);
+            self.register_type(resolve, key, ty, payload_data);
 
             if let Some(index) = self.resource_map.get(&ty) {
                 self.bindgen_world_export_resource_dtor(resolve, key.unwrap(), ty, *index);
@@ -398,16 +695,8 @@ impl Adapter {
 
         // With export types all in place now run bindgen for all exported
         // functions.
-        for (interface, export) in world.exports.iter() {
-            match export {
-                WorldItem::Interface { id, .. } => {
-                    for (_, func) in resolve.interfaces[*id].functions.iter() {
-                        self.bindgen_world_func_export(resolve, Some(interface), func);
-                    }
-                }
-                WorldItem::Type(_) => unreachable!(),
-                WorldItem::Function(_) => {}
-            }
+        for export in imports.wit_exports.iter().filter(|i| i.interface.is_some()) {
+            self.bindgen_world_func_export(resolve, export);
         }
     }
 
@@ -416,7 +705,13 @@ impl Adapter {
     /// This will insert `id` into metadata and build up the interpreter data
     /// structures for it. The end-result is the population of `self.type_map`
     /// here.
-    fn register_type(&mut self, resolve: &Resolve, key: Option<&WorldKey>, id: TypeId) {
+    fn register_type(
+        &mut self,
+        resolve: &Resolve,
+        key: Option<&WorldKey>,
+        id: TypeId,
+        payload_data: &HashMap<TypeId, PayloadData>,
+    ) {
         let ty = &resolve.types[id];
         let interface = key.map(|key| resolve.name_world_key(key));
         let name = ty.name.clone();
@@ -429,6 +724,7 @@ impl Adapter {
                     .map(|field| (field.name.clone(), self.lookup_ty(&field.ty)))
                     .collect();
                 self.metadata.records.push(metadata::Record {
+                    id,
                     interface,
                     name: name.unwrap(),
                     fields,
@@ -439,6 +735,7 @@ impl Adapter {
                 let index = self.metadata.flags.len();
                 let names = t.flags.iter().map(|f| f.name.clone()).collect();
                 self.metadata.flags.push(metadata::Flags {
+                    id,
                     interface,
                     name: name.unwrap(),
                     names,
@@ -449,6 +746,7 @@ impl Adapter {
                 let index = self.metadata.tuples.len();
                 let types = t.types.iter().map(|t| self.lookup_ty(t)).collect();
                 self.metadata.tuples.push(metadata::Tuple {
+                    id,
                     interface,
                     name,
                     types,
@@ -463,6 +761,7 @@ impl Adapter {
                     .map(|c| (c.name.clone(), c.ty.map(|t| self.lookup_ty(&t))))
                     .collect();
                 self.metadata.variants.push(metadata::Variant {
+                    id,
                     interface,
                     name: name.unwrap(),
                     cases,
@@ -473,6 +772,7 @@ impl Adapter {
                 let index = self.metadata.enums.len();
                 let names = t.cases.iter().map(|f| f.name.clone()).collect();
                 self.metadata.enums.push(metadata::Enum {
+                    id,
                     interface,
                     name: name.unwrap(),
                     names,
@@ -482,6 +782,7 @@ impl Adapter {
             TypeDefKind::Option(t) => {
                 let index = self.metadata.options.len();
                 self.metadata.options.push(metadata::WitOption {
+                    id,
                     interface,
                     name,
                     ty: self.lookup_ty(t),
@@ -491,6 +792,7 @@ impl Adapter {
             TypeDefKind::Result(t) => {
                 let index = self.metadata.results.len();
                 self.metadata.results.push(metadata::WitResult {
+                    id,
                     interface,
                     name,
                     ok: t.ok.map(|t| self.lookup_ty(&t)),
@@ -501,45 +803,167 @@ impl Adapter {
             TypeDefKind::List(t) => {
                 let index = self.metadata.lists.len();
                 self.metadata.lists.push(metadata::List {
+                    id,
                     interface,
                     name,
                     ty: self.lookup_ty(t),
                 });
                 metadata::Type::List(index)
             }
-            TypeDefKind::FixedSizeList(t, len) => {
-                let index = self.metadata.fixed_size_lists.len();
+            TypeDefKind::FixedLengthList(t, len) => {
+                let index = self.metadata.fixed_length_lists.len();
                 self.metadata
-                    .fixed_size_lists
-                    .push(metadata::FixedSizeList {
+                    .fixed_length_lists
+                    .push(metadata::FixedLengthList {
+                        id,
                         interface,
                         name,
                         len: *len,
                         ty: self.lookup_ty(t),
                     });
-                metadata::Type::FixedSizeList(index)
+                metadata::Type::FixedLengthList(index)
             }
             TypeDefKind::Future(t) => {
                 let index = self.metadata.futures.len();
+
+                let Some(&PayloadData {
+                    new_elem_index,
+                    read_elem_index,
+                    write_elem_index,
+                    cancel_read_elem_index,
+                    cancel_write_elem_index,
+                    drop_readable_elem_index,
+                    drop_writable_elem_index,
+                    ordinal,
+                    ref function,
+                }) = payload_data.get(&id)
+                else {
+                    // Such a type can't be used with `wit-component` currently.
+                    panic!("encountered future type not used in any function")
+                };
+
+                // Compile lift and lower functions for lifting and lowering
+                // items of this future's payload type, if applicable.
+
+                let lift_elem_index = t.map(|t| {
+                    let ty = self.define_ty([ValType::I32; 2], []);
+                    let func = bindgen::lift_payload(self, resolve, t);
+                    let func = self.define_func(
+                        &format!("[future-lift-{ordinal}]{function}"),
+                        ty,
+                        func,
+                        false,
+                    );
+                    self.push_elem(func)
+                });
+
+                let lower_elem_index = t.map(|t| {
+                    let ty = self.define_ty([ValType::I32; 2], []);
+                    let func = bindgen::lower_payload(self, resolve, t);
+                    let func = self.define_func(
+                        &format!("[future-lower-{ordinal}]{function}"),
+                        ty,
+                        func,
+                        false,
+                    );
+                    self.push_elem(func)
+                });
+
                 self.metadata.futures.push(metadata::Future {
+                    id,
                     interface,
                     name,
                     ty: t.map(|t| self.lookup_ty(&t)),
+                    new_elem_index,
+                    read_elem_index,
+                    write_elem_index,
+                    cancel_read_elem_index,
+                    cancel_write_elem_index,
+                    drop_readable_elem_index,
+                    drop_writable_elem_index,
+                    lift_elem_index,
+                    lower_elem_index,
+                    abi_payload_size: t.map(|t| self.sizes.size(&t).size_wasm32()).unwrap_or(0),
+                    abi_payload_align: t.map(|t| self.sizes.align(&t).align_wasm32()).unwrap_or(1),
                 });
                 metadata::Type::Future(index)
             }
             TypeDefKind::Stream(t) => {
                 let index = self.metadata.streams.len();
+
+                let Some(&PayloadData {
+                    new_elem_index,
+                    read_elem_index,
+                    write_elem_index,
+                    cancel_read_elem_index,
+                    cancel_write_elem_index,
+                    drop_readable_elem_index,
+                    drop_writable_elem_index,
+                    ordinal,
+                    ref function,
+                }) = payload_data.get(&id)
+                else {
+                    // Such a type can't be used with `wit-component` currently.
+                    panic!("encountered stream type not used in any function")
+                };
+
+                // Compile lift and lower functions for lifting and lowering
+                // items of this stream's payload type, if applicable.
+                //
+                // Note that these functions operate on only a single item,
+                // meaning they must be called in a loop when reading or writing
+                // multiple items.  That saves us from having to generate a Wasm
+                // loop, and allows us to reuse the same code generators for
+                // `future`s and `stream`s, although the result might not be
+                // quite as efficient.
+
+                let lift_elem_index = t.map(|t| {
+                    let ty = self.define_ty([ValType::I32; 2], []);
+                    let func = bindgen::lift_payload(self, resolve, t);
+                    let func = self.define_func(
+                        &format!("[stream-lift-{ordinal}]{function}"),
+                        ty,
+                        func,
+                        false,
+                    );
+                    self.push_elem(func)
+                });
+
+                let lower_elem_index = t.map(|t| {
+                    let ty = self.define_ty([ValType::I32; 2], []);
+                    let func = bindgen::lower_payload(self, resolve, t);
+                    let func = self.define_func(
+                        &format!("[stream-lower-{ordinal}]{function}"),
+                        ty,
+                        func,
+                        false,
+                    );
+                    self.push_elem(func)
+                });
+
                 self.metadata.streams.push(metadata::Stream {
+                    id,
                     interface,
                     name,
                     ty: t.map(|t| self.lookup_ty(&t)),
+                    new_elem_index,
+                    read_elem_index,
+                    write_elem_index,
+                    cancel_read_elem_index,
+                    cancel_write_elem_index,
+                    drop_readable_elem_index,
+                    drop_writable_elem_index,
+                    lift_elem_index,
+                    lower_elem_index,
+                    abi_payload_size: t.map(|t| self.sizes.size(&t).size_wasm32()).unwrap_or(0),
+                    abi_payload_align: t.map(|t| self.sizes.align(&t).align_wasm32()).unwrap_or(1),
                 });
                 metadata::Type::Stream(index)
             }
             TypeDefKind::Type(t) => {
                 let index = self.metadata.aliases.len();
                 self.metadata.aliases.push(metadata::Alias {
+                    id,
                     interface,
                     name: name.unwrap(),
                     ty: self.lookup_ty(t),
@@ -555,6 +979,17 @@ impl Adapter {
             }
             TypeDefKind::Handle(Handle::Borrow(t)) => {
                 metadata::Type::Borrow(self.resource_map[&dealias(resolve, *t)])
+            }
+            TypeDefKind::Map(k, v) => {
+                let index = self.metadata.maps.len();
+                self.metadata.maps.push(metadata::Map {
+                    id,
+                    interface,
+                    name,
+                    key_type: self.lookup_ty(k),
+                    value_type: self.lookup_ty(v),
+                });
+                metadata::Type::Map(index)
             }
             TypeDefKind::Unknown => unreachable!(),
         };
@@ -584,67 +1019,110 @@ impl Adapter {
         }
     }
 
-    fn bindgen_world_func_import(
-        &mut self,
-        resolve: &Resolve,
-        key: Option<&WorldKey>,
-        func: &wit_parser::Function,
-        func_idx: u32,
-    ) {
-        let mangling = self.mangling();
-        let body = bindgen::import(self, resolve, func, mangling.import_variant(), func_idx);
+    fn bindgen_world_func_import(&mut self, resolve: &Resolve, import: &WitImport<'_>) {
+        let func = import.func;
+        let mangling = self.mangling(resolve, import.interface, func, true);
+        let body = bindgen::import(
+            self,
+            resolve,
+            func,
+            mangling.import_variant(),
+            import.import_index,
+        );
 
-        let ty = self.define_ty([ValType::I32], []);
+        let ty = if mangling.is_async() {
+            // [ cx abi_area_ptr ] -> [ status ]
+            self.define_ty([ValType::I32; 2], [ValType::I32])
+        } else {
+            // [ cx ] -> []
+            self.define_ty([ValType::I32], [])
+        };
 
         let idx = self.define_func(&format!("adapter {}", func.name), ty, body, false);
         let elem_index = self.push_elem(idx);
 
-        self.metadata.funcs.push(metadata::Func {
-            interface: key.map(|k| resolve.name_world_key(k)),
+        let sync_import_elem_index;
+        let async_import_elem_index;
+        let async_import_lift_results_elem_index;
+
+        if mangling.is_async() {
+            sync_import_elem_index = None;
+            async_import_elem_index = Some(elem_index);
+            let body =
+                bindgen::lift_async_import_results(self, resolve, func, mangling.import_variant());
+            let ty = self.define_ty([ValType::I32; 2], []);
+            let idx = self.define_func(&format!("lift results {}", func.name), ty, body, false);
+            async_import_lift_results_elem_index = Some(self.push_elem(idx));
+        } else {
+            sync_import_elem_index = Some(elem_index);
+            async_import_elem_index = None;
+            async_import_lift_results_elem_index = None;
+        }
+
+        self.metadata.import_funcs.push(metadata::ImportFunc {
+            interface: import.interface.map(|k| resolve.name_world_key(k)),
             name: func.name.clone(),
-            elem_index: Some(elem_index),
-            args: func
-                .params
-                .iter()
-                .map(|(_, ty)| self.lookup_ty(ty))
-                .collect(),
+            sync_import_elem_index,
+            async_import_elem_index,
+            async_import_lift_results_elem_index,
+            args: func.params.iter().map(|p| self.lookup_ty(&p.ty)).collect(),
             result: func.result.map(|t| self.lookup_ty(&t)),
+            async_abi_area: self.async_import_abi_area(resolve, mangling, func),
         })
     }
 
-    fn bindgen_world_func_export(
-        &mut self,
+    /// Returns the `(size, align)` for the indirect params/results as necessary
+    /// for `func` if `func` is an async function.
+    fn async_import_abi_area(
+        &self,
         resolve: &Resolve,
-        key: Option<&WorldKey>,
+        mangling: ManglingAndAbi,
         func: &wit_parser::Function,
-    ) {
-        let mangling = self.mangling();
+    ) -> Option<(usize, usize)> {
+        if !mangling.is_async() {
+            return None;
+        }
+
+        let info = self
+            .sizes
+            .record(bindgen::async_import_abi_area_types(resolve, func));
+        Some((info.size.size_wasm32(), info.align.align_wasm32()))
+    }
+
+    fn bindgen_world_func_export(&mut self, resolve: &Resolve, export: &WitExport<'_>) {
+        let func = export.func;
+        let mangling = self.mangling(resolve, export.interface, func, false);
         let sig = resolve.wasm_signature(mangling.export_variant(), func);
         let ty = self.define_wasm_sig(sig);
         let name = resolve.wasm_export_name(
             mangling,
             WasmExport::Func {
-                interface: key,
+                interface: export.interface,
                 func,
                 kind: WasmExportKind::Normal,
             },
         );
 
-        let (body, may_have_dynamic_lists_to_free) = bindgen::export(
+        let metadata_func_index = self.metadata.export_funcs.len();
+        let body = bindgen::export(
             self,
             resolve,
             func,
             mangling.export_variant(),
-            self.metadata.funcs.len(),
+            metadata_func_index,
         );
         self.define_func(&name, ty, body, true);
 
+        let mut async_export_task_return_elem_index = None;
         match mangling {
+            // For sync functions a post-return function is generated which
+            // cleans up the `cx` argument notably but also any list allocations
+            // and such as required.
             ManglingAndAbi::Standard32 | ManglingAndAbi::Legacy(LiftLowerAbi::Sync) => {
                 let post_return_name = resolve.wasm_export_name(
                     mangling,
                     WasmExport::Func {
-                        interface: key,
+                        interface: export.interface,
                         func,
                         kind: WasmExportKind::PostReturn,
                     },
@@ -654,8 +1132,7 @@ impl Adapter {
                     resolve,
                     func,
                     mangling.export_variant(),
-                    self.metadata.funcs.len(),
-                    may_have_dynamic_lists_to_free,
+                    metadata_func_index,
                 );
                 let mut sig = resolve.wasm_signature(mangling.export_variant(), func);
                 sig.params = mem::take(&mut sig.results);
@@ -663,20 +1140,62 @@ impl Adapter {
                 self.define_func(&post_return_name, post_return_ty, post_return, true);
             }
 
-            ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback) => unimplemented!(),
+            // For async exports in addition to the main entrypoint a
+            // `[callback]` function is generated which is invoked when progress
+            // is made on this function.
+            //
+            // Additionally a `task.return` function is generated to be invoked
+            // once the async export has completed.
+            ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback) => {
+                let callback_name = resolve.wasm_export_name(
+                    mangling,
+                    WasmExport::Func {
+                        interface: export.interface,
+                        func,
+                        kind: WasmExportKind::Callback,
+                    },
+                );
+                // The `[callback]` function is pretty simple, just delegate to
+                // the `wit_dylib_*` implementation with one extra contextual
+                // argument. It's the responsibility of the implementation to
+                // call `context.{get,set}` as appropriate.
+                let mut callback = Function::new([]);
+                let mut ins = callback.instructions();
+                ins.local_get(0);
+                ins.local_get(1);
+                ins.local_get(2);
+                ins.i32_const(metadata_func_index.try_into().unwrap());
+                let export_async_callback = self.intrinsics().export_async_callback;
+                ins.call(export_async_callback);
+                ins.end();
+                let callback_ty = self.define_ty([ValType::I32; 3], [ValType::I32]);
+                self.define_func(&callback_name, callback_ty, callback, true);
+
+                let task_return = bindgen::task_return(
+                    self,
+                    resolve,
+                    func,
+                    mangling.export_variant(),
+                    export.async_task_return_index.unwrap(),
+                );
+                let task_return_ty = self.define_ty([ValType::I32], []);
+                let task_return = self.define_func(
+                    &format!("task.return {}", func.name),
+                    task_return_ty,
+                    task_return,
+                    false,
+                );
+                async_export_task_return_elem_index = Some(self.push_elem(task_return));
+            }
 
             ManglingAndAbi::Legacy(LiftLowerAbi::AsyncStackful) => unimplemented!(),
         }
 
-        self.metadata.funcs.push(metadata::Func {
-            interface: key.map(|k| resolve.name_world_key(k)),
+        self.metadata.export_funcs.push(metadata::ExportFunc {
+            interface: export.interface.map(|k| resolve.name_world_key(k)),
             name: func.name.clone(),
-            elem_index: None,
-            args: func
-                .params
-                .iter()
-                .map(|(_, ty)| self.lookup_ty(ty))
-                .collect(),
+            async_export_task_return_elem_index,
+            args: func.params.iter().map(|p| self.lookup_ty(&p.ty)).collect(),
             result: func.result.map(|t| self.lookup_ty(&t)),
         })
     }
@@ -688,7 +1207,7 @@ impl Adapter {
         resource: TypeId,
         index: usize,
     ) {
-        let mangling = self.mangling();
+        let mangling = self.resource_intrinsic_mangling();
         let name = resolve.wasm_export_name(
             mangling,
             WasmExport::ResourceDtor {
@@ -723,10 +1242,6 @@ impl Adapter {
 
     fn intrinsics(&self) -> &bindgen::WitInterpreterIntrinsics {
         self.intrinsics.as_ref().unwrap()
-    }
-
-    fn stack_pointer(&self) -> u32 {
-        self.stack_pointer.unwrap()
     }
 
     fn memory_base(&self) -> u32 {
@@ -908,7 +1423,7 @@ fn imported_types_used_by_exported_interfaces(resolve: &Resolve, world: WorldId)
                 exported_interfaces.insert(*id);
                 live_export_types.add_interface(resolve, *id)
             }
-            WorldItem::Type(_) => unreachable!(),
+            WorldItem::Type { .. } => unreachable!(),
         }
     }
 
@@ -933,5 +1448,64 @@ fn dealias(resolve: &Resolve, mut id: TypeId) -> TypeId {
             TypeDefKind::Type(Type::Id(other)) => id = other,
             _ => break id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wasmparser::{Operator, Parser, Payload};
+    use wit_parser::Resolve;
+
+    #[derive(Copy, Clone)]
+    enum Which {
+        S8,
+        S16,
+    }
+
+    #[test]
+    fn s8_uses_signed_load() {
+        assert!(find_signed_load(Which::S8));
+    }
+
+    #[test]
+    fn s16_uses_signed_load() {
+        assert!(find_signed_load(Which::S16));
+    }
+
+    fn find_signed_load(which: Which) -> bool {
+        let mut resolve = Resolve::default();
+        let ty = match which {
+            Which::S8 => "s8",
+            Which::S16 => "s16",
+        };
+        let package = resolve
+            .push_str(
+                "wit",
+                &format!(
+                    "package test:test;
+world w {{
+  export foo: func(v: list<{ty}>);
+}}
+"
+                ),
+            )
+            .unwrap();
+        let world = resolve.select_world(&[package], None).unwrap();
+        let adapter = super::create(&resolve, world, None).unwrap();
+        for payload in Parser::new(0).parse_all(&adapter) {
+            match payload.unwrap() {
+                Payload::CodeSectionEntry(body) => {
+                    for operator in body.get_operators_reader().unwrap() {
+                        match (operator.unwrap(), which) {
+                            (Operator::I32Load16S { .. }, Which::S16)
+                            | (Operator::I32Load8S { .. }, Which::S8) => return true,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 }

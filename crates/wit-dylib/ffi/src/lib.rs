@@ -11,6 +11,10 @@
 #![allow(unsafe_code)]
 #![allow(clippy::allow_attributes_without_reason)]
 
+#[cfg(all(feature = "async-runtime", feature = "async-raw"))]
+compile_error!("cannot enable both `async-runtime` and `async-raw` features");
+
+use std::alloc::Layout;
 use std::ptr;
 
 /// Macro to specify a struct name which implements the `Interpreter` trait.
@@ -20,281 +24,302 @@ use std::ptr;
 #[macro_export]
 macro_rules! export {
     ($name:ident) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_initialize(ptr: *const u8) {
             unsafe { <$name as $crate::RawInterpreter>::raw_initialize(ptr) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_dealloc_bytes(
+            cx: *mut u8,
             ptr: *mut u8,
             byte_size: usize,
             align: usize,
+            defer: bool,
         ) {
-            unsafe { <$name as $crate::RawInterpreter>::raw_dealloc_bytes(ptr, byte_size, align) }
+            unsafe {
+                <$name as $crate::RawInterpreter>::raw_dealloc_bytes(
+                    cx, ptr, byte_size, align, defer,
+                )
+            }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn wit_dylib_export_start(which: usize) -> *mut u8 {
             unsafe { <$name as $crate::RawInterpreter>::raw_export_start(which) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn wit_dylib_export_call(cx: *mut u8, which: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_export_call(cx, which) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn wit_dylib_export_async_call(cx: *mut u8, which: usize) -> u32 {
+            unsafe { <$name as $crate::RawInterpreter>::raw_export_async_call(cx, which) }
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn wit_dylib_export_async_callback(
+            a: u32,
+            b: u32,
+            c: u32,
+            which: usize,
+        ) -> u32 {
+            unsafe { <$name as $crate::RawInterpreter>::raw_export_async_callback(a, b, c, which) }
+        }
+
+        #[unsafe(no_mangle)]
         pub extern "C" fn wit_dylib_export_finish(cx: *mut u8, which: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_export_finish(cx, which) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_resource_dtor(ty: usize, handle: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_resource_dtor(ty, handle) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_u8(cx: *mut u8) -> u8 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_u8(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_u8(cx: *mut u8, val: u8) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_u8(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_s8(cx: *mut u8) -> i8 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_s8(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_s8(cx: *mut u8, val: i8) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_s8(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_u16(cx: *mut u8) -> u16 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_u16(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_u16(cx: *mut u8, val: u16) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_u16(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_s16(cx: *mut u8) -> i16 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_s16(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_s16(cx: *mut u8, val: i16) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_s16(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_u32(cx: *mut u8) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_u32(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_u32(cx: *mut u8, val: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_u32(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_s32(cx: *mut u8) -> i32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_s32(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_s32(cx: *mut u8, val: i32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_s32(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_u64(cx: *mut u8) -> u64 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_u64(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_u64(cx: *mut u8, val: u64) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_u64(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_s64(cx: *mut u8) -> i64 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_s64(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_s64(cx: *mut u8, val: i64) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_s64(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_bool(cx: *mut u8) -> bool {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_bool(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_bool(cx: *mut u8, val: bool) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_bool(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_char(cx: *mut u8) -> char {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_char(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_char(cx: *mut u8, val: char) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_char(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_f32(cx: *mut u8) -> f32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_f32(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_f32(cx: *mut u8, val: f32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_f32(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_f64(cx: *mut u8) -> f64 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_f64(cx) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_f64(cx: *mut u8, val: f64) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_f64(cx, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_enum(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_enum(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_enum(cx: *mut u8, ty: usize, val: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_enum(cx, ty, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_flags(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_flags(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_flags(cx: *mut u8, ty: usize, val: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_flags(cx, ty, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_borrow(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_borrow(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_borrow(cx: *mut u8, ty: usize, val: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_borrow(cx, ty, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_own(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_own(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_own(cx: *mut u8, ty: usize, val: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_own(cx, ty, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_future(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_future(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_future(cx: *mut u8, ty: usize, val: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_future(cx, ty, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_stream(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_stream(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_stream(cx: *mut u8, ty: usize, val: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_stream(cx, ty, val) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_record(cx: *mut u8, ty: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_record(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_record(cx: *mut u8, ty: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_record(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_tuple(cx: *mut u8, ty: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_tuple(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_tuple(cx: *mut u8, ty: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_tuple(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_option(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_option(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_option(cx: *mut u8, ty: usize, discr: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_option(cx, ty, discr) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_result(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_result(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_result(cx: *mut u8, ty: usize, discr: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_result(cx, ty, discr) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_variant(cx: *mut u8, ty: usize) -> u32 {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_variant(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_variant(cx: *mut u8, ty: usize, discr: u32) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_variant(cx, ty, discr) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_string(cx: *mut u8, ptr: &mut *const u8) -> usize {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_string(cx, ptr) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_string(cx: *mut u8, ptr: *mut u8, len: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_string(cx, ptr, len) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_pop_list(
             cx: *mut u8,
             ty: usize,
@@ -303,17 +328,17 @@ macro_rules! export {
             unsafe { <$name as $crate::RawInterpreter>::raw_pop_list(cx, ty, ptr) }
         }
 
-        #[no_mangle]
-        pub unsafe extern "C" fn wit_dylib_pop_iter_next(cx: *mut u8, ty: usize) {
-            unsafe { <$name as $crate::RawInterpreter>::raw_pop_iter_next(cx, ty) }
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn wit_dylib_pop_list_iter_next(cx: *mut u8, ty: usize) {
+            unsafe { <$name as $crate::RawInterpreter>::raw_pop_list_iter_next(cx, ty) }
         }
 
-        #[no_mangle]
-        pub unsafe extern "C" fn wit_dylib_pop_iter(cx: *mut u8, ty: usize) {
-            unsafe { <$name as $crate::RawInterpreter>::raw_pop_iter(cx, ty) }
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn wit_dylib_pop_list_iter(cx: *mut u8, ty: usize) {
+            unsafe { <$name as $crate::RawInterpreter>::raw_pop_list_iter(cx, ty) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_push_list(
             cx: *mut u8,
             ty: usize,
@@ -323,9 +348,34 @@ macro_rules! export {
             unsafe { <$name as $crate::RawInterpreter>::raw_push_list(cx, ty, ptr, len) }
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn wit_dylib_list_append(cx: *mut u8, ty: usize) {
             unsafe { <$name as $crate::RawInterpreter>::raw_list_append(cx, ty) }
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn wit_dylib_pop_map(cx: *mut u8, ty: usize) -> usize {
+            unsafe { <$name as $crate::RawInterpreter>::raw_pop_map(cx, ty) }
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn wit_dylib_pop_map_iter_next(cx: *mut u8, ty: usize) {
+            unsafe { <$name as $crate::RawInterpreter>::raw_pop_map_iter_next(cx, ty) }
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn wit_dylib_pop_map_iter(cx: *mut u8, ty: usize) {
+            unsafe { <$name as $crate::RawInterpreter>::raw_pop_map_iter(cx, ty) }
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn wit_dylib_push_map(cx: *mut u8, ty: usize, len: usize) {
+            unsafe { <$name as $crate::RawInterpreter>::raw_push_map(cx, ty, len) }
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn wit_dylib_map_append(cx: *mut u8, ty: usize) {
+            unsafe { <$name as $crate::RawInterpreter>::raw_map_append(cx, ty) }
         }
 
         fn main() {
@@ -338,7 +388,7 @@ macro_rules! export {
 ///
 /// `Self::Borrow` and `Self::Own` must have same in-memory representation and
 /// generally represent correct ownership semantics.
-pub trait Interpreter {
+pub trait Interpreter: 'static {
     type CallCx<'a>: Call;
 
     /// Startup hook if necessary.
@@ -346,30 +396,39 @@ pub trait Interpreter {
         let _ = wit;
     }
 
-    fn export_start<'a>(wit: Wit, func: Function) -> Box<Self::CallCx<'a>>;
+    fn export_start<'a>(wit: Wit, func: ExportFunction) -> Box<Self::CallCx<'a>>;
 
-    fn export_call(wit: Wit, func: Function, cx: &mut Self::CallCx<'_>);
+    fn export_call(wit: Wit, func: ExportFunction, cx: &mut Self::CallCx<'_>);
 
-    fn export_finish(cx: Box<Self::CallCx<'_>>, func: Function) {
+    #[cfg(feature = "async-runtime")]
+    fn export_call_async(
+        wit: Wit,
+        func: ExportFunction,
+        cx: Box<Self::CallCx<'static>>,
+    ) -> impl std::future::Future<Output = ()>;
+
+    #[cfg(feature = "async-raw")]
+    fn export_async_start(wit: Wit, func: ExportFunction, cx: Box<Self::CallCx<'static>>) -> u32;
+
+    #[cfg(feature = "async-raw")]
+    fn export_async_callback(event0: u32, event1: u32, event2: u32) -> u32;
+
+    fn export_finish(cx: Box<Self::CallCx<'_>>, func: ExportFunction) {
         let _ = func;
         let _ = cx;
     }
 
     fn import_call(wit: Wit, interface: Option<&str>, func: &str, cx: &mut Self::CallCx<'_>) {
         let func = wit.unwrap_import(interface, func);
-
-        // Invoke the actual import which is provided through metadata.
-        let import_impl = func.import_impl().unwrap();
-        unsafe {
-            let cx: *mut _ = cx;
-            import_impl(cx.cast());
-        }
+        func.call_import_sync(cx)
     }
 
     fn resource_dtor(ty: Resource, handle: usize);
 }
 
 pub trait Call {
+    unsafe fn defer_deallocate(&mut self, ptr: *mut u8, layout: Layout);
+
     fn pop_u8(&mut self) -> u8;
     fn pop_u16(&mut self) -> u16;
     fn pop_u32(&mut self) -> u32;
@@ -400,8 +459,12 @@ pub trait Call {
         None
     }
     fn pop_list(&mut self, ty: List) -> usize;
-    fn pop_iter_next(&mut self, ty: List);
-    fn pop_iter(&mut self, ty: List);
+    fn pop_list_iter_next(&mut self, ty: List);
+    fn pop_list_iter(&mut self, ty: List);
+
+    fn pop_map(&mut self, ty: Map) -> usize;
+    fn pop_map_iter_next(&mut self, ty: Map);
+    fn pop_map_iter(&mut self, ty: Map);
 
     fn push_bool(&mut self, val: bool);
     fn push_char(&mut self, val: char);
@@ -433,13 +496,15 @@ pub trait Call {
     }
     fn push_list(&mut self, ty: List, capacity: usize);
     fn list_append(&mut self, ty: List);
+    fn push_map(&mut self, ty: Map, capacity: usize);
+    fn map_append(&mut self, ty: Map);
 }
 
 static mut WIT_T: *const ffi::wit_t = ptr::null_mut();
 
 macro_rules! debug_println {
     ($($t:tt)*) => (
-        if cfg!(debug_assertions) && false {
+        if false {
             eprintln!($($t)*);
         }
     )
@@ -457,11 +522,21 @@ pub trait RawInterpreter: Interpreter {
         }
     }
 
-    unsafe fn raw_dealloc_bytes(ptr: *mut u8, byte_size: usize, align: usize) {
-        debug_println!("dealloc_bytes({ptr:?}, {byte_size:#x}, {align:#x})");
+    unsafe fn raw_dealloc_bytes(
+        cx: *mut u8,
+        ptr: *mut u8,
+        byte_size: usize,
+        align: usize,
+        defer: bool,
+    ) {
+        debug_println!("dealloc_bytes({cx:?}, {ptr:?}, {byte_size:#x}, {align:#x}, {defer})");
         unsafe {
             let layout = std::alloc::Layout::from_size_align(byte_size, align).unwrap();
-            std::alloc::dealloc(ptr, layout);
+            if defer {
+                Self::cx_mut(cx).defer_deallocate(ptr, layout);
+            } else {
+                std::alloc::dealloc(ptr, layout);
+            }
         }
     }
 
@@ -469,7 +544,7 @@ pub trait RawInterpreter: Interpreter {
         debug_println!("export_start({which})");
         unsafe {
             let wit = Wit::from_raw(WIT_T);
-            let func = wit.func(which);
+            let func = wit.export_func(which);
             Box::into_raw(Self::export_start(wit, func)).cast()
         }
     }
@@ -478,8 +553,50 @@ pub trait RawInterpreter: Interpreter {
         debug_println!("export_call({cx:?}, {which})");
         unsafe {
             let wit = Wit::from_raw(WIT_T);
-            let func = wit.func(which);
+            let func = wit.export_func(which);
             Self::export_call(wit, func, Self::cx_mut(cx))
+        }
+    }
+
+    unsafe fn raw_export_async_call(cx: *mut u8, which: usize) -> u32 {
+        debug_println!("export_async_call({cx:?}, {which})");
+        unsafe {
+            let wit = Wit::from_raw(WIT_T);
+            let func = wit.export_func(which);
+            #[cfg(feature = "async-runtime")]
+            {
+                wit_bindgen::rt::async_support::start_task(Self::export_call_async(
+                    wit,
+                    func,
+                    Box::from_raw(cx.cast()),
+                ))
+                .cast_unsigned()
+            }
+            #[cfg(feature = "async-raw")]
+            {
+                Self::export_async_start(wit, func, Box::from_raw(cx.cast()))
+            }
+            #[cfg(not(any(feature = "async-runtime", feature = "async-raw")))]
+            {
+                _ = func;
+                panic!("no async features enabled")
+            }
+        }
+    }
+
+    unsafe fn raw_export_async_callback(a: u32, b: u32, c: u32, which: usize) -> u32 {
+        debug_println!("export_async_callback({a:#x}, {b:#x}, {c:#x}, {which})");
+        #[cfg(feature = "async-runtime")]
+        unsafe {
+            wit_bindgen::rt::async_support::callback(a, b, c)
+        }
+        #[cfg(feature = "async-raw")]
+        {
+            Self::export_async_callback(a, b, c)
+        }
+        #[cfg(not(any(feature = "async-runtime", feature = "async-raw")))]
+        {
+            panic!("no async features enabled")
         }
     }
 
@@ -487,7 +604,7 @@ pub trait RawInterpreter: Interpreter {
         debug_println!("export_finish({cx:?}, {which})");
         unsafe {
             let wit = Wit::from_raw(WIT_T);
-            let func = wit.func(which);
+            let func = wit.export_func(which);
             Self::export_finish(Box::from_raw(cx.cast()), func)
         }
     }
@@ -678,19 +795,43 @@ pub trait RawInterpreter: Interpreter {
         }
     }
 
-    unsafe fn raw_pop_iter_next(cx: *mut u8, ty: usize) {
-        debug_println!("pop_iter_next({cx:?}, {ty})");
+    unsafe fn raw_pop_list_iter_next(cx: *mut u8, ty: usize) {
+        debug_println!("pop_list_iter_next({cx:?}, {ty})");
         unsafe {
             let wit = Wit::from_raw(WIT_T);
-            Self::cx_mut(cx).pop_iter_next(wit.list(ty))
+            Self::cx_mut(cx).pop_list_iter_next(wit.list(ty))
         }
     }
 
-    unsafe fn raw_pop_iter(cx: *mut u8, ty: usize) {
-        debug_println!("pop_iter({cx:?}, {ty})");
+    unsafe fn raw_pop_list_iter(cx: *mut u8, ty: usize) {
+        debug_println!("pop_list_iter({cx:?}, {ty})");
         unsafe {
             let wit = Wit::from_raw(WIT_T);
-            Self::cx_mut(cx).pop_iter(wit.list(ty))
+            Self::cx_mut(cx).pop_list_iter(wit.list(ty))
+        }
+    }
+
+    unsafe fn raw_pop_map(cx: *mut u8, ty: usize) -> usize {
+        debug_println!("pop_map({cx:?}, {ty})");
+        unsafe {
+            let wit = Wit::from_raw(WIT_T);
+            Self::cx_mut(cx).pop_map(wit.map(ty))
+        }
+    }
+
+    unsafe fn raw_pop_map_iter_next(cx: *mut u8, ty: usize) {
+        debug_println!("pop_map_iter_next({cx:?}, {ty})");
+        unsafe {
+            let wit = Wit::from_raw(WIT_T);
+            Self::cx_mut(cx).pop_map_iter_next(wit.map(ty))
+        }
+    }
+
+    unsafe fn raw_pop_map_iter(cx: *mut u8, ty: usize) {
+        debug_println!("pop_map_iter({cx:?}, {ty})");
+        unsafe {
+            let wit = Wit::from_raw(WIT_T);
+            Self::cx_mut(cx).pop_map_iter(wit.map(ty))
         }
     }
 
@@ -871,6 +1012,22 @@ pub trait RawInterpreter: Interpreter {
         unsafe {
             let wit = Wit::from_raw(WIT_T);
             Self::cx_mut(cx).list_append(wit.list(ty))
+        }
+    }
+
+    unsafe fn raw_push_map(cx: *mut u8, ty: usize, len: usize) {
+        debug_println!("push_map({cx:?}, {ty}, {len})");
+        unsafe {
+            let wit = Wit::from_raw(WIT_T);
+            Self::cx_mut(cx).push_map(wit.map(ty), len);
+        }
+    }
+
+    unsafe fn raw_map_append(cx: *mut u8, ty: usize) {
+        debug_println!("map_append({cx:?}, {ty})");
+        unsafe {
+            let wit = Wit::from_raw(WIT_T);
+            Self::cx_mut(cx).map_append(wit.map(ty))
         }
     }
 }

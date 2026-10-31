@@ -1,4 +1,7 @@
-use std::{
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::{
     cmp::Ordering,
     num::NonZeroUsize,
     ops::{Add, AddAssign},
@@ -21,8 +24,8 @@ impl Default for Alignment {
     }
 }
 
-impl std::fmt::Debug for Alignment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Alignment {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Alignment::Pointer => f.write_str("ptr"),
             Alignment::Bytes(b) => f.write_fmt(format_args!("{}", b.get())),
@@ -42,19 +45,19 @@ impl Ord for Alignment {
     /// as a Pointer is either four or eight byte aligned, depending on the architecture
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (Alignment::Pointer, Alignment::Pointer) => std::cmp::Ordering::Equal,
+            (Alignment::Pointer, Alignment::Pointer) => Ordering::Equal,
             (Alignment::Pointer, Alignment::Bytes(b)) => {
                 if b.get() > 4 {
-                    std::cmp::Ordering::Less
+                    Ordering::Less
                 } else {
-                    std::cmp::Ordering::Greater
+                    Ordering::Greater
                 }
             }
             (Alignment::Bytes(b), Alignment::Pointer) => {
                 if b.get() > 4 {
-                    std::cmp::Ordering::Greater
+                    Ordering::Greater
                 } else {
-                    std::cmp::Ordering::Less
+                    Ordering::Less
                 }
             }
             (Alignment::Bytes(a), Alignment::Bytes(b)) => a.cmp(b),
@@ -121,8 +124,8 @@ impl From<Alignment> for ArchitectureSize {
     }
 }
 
-impl std::fmt::Debug for ArchitectureSize {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ArchitectureSize {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.format("ptrsz"))
     }
 }
@@ -132,7 +135,7 @@ impl ArchitectureSize {
         Self { bytes, pointers }
     }
 
-    pub fn max<B: std::borrow::Borrow<Self>>(&self, other: B) -> Self {
+    pub fn max<B: core::borrow::Borrow<Self>>(&self, other: B) -> Self {
         let other = other.borrow();
         let self32 = self.size_wasm32();
         let self64 = self.size_wasm64();
@@ -249,29 +252,37 @@ pub struct SizeAlign {
 }
 
 impl SizeAlign {
-    pub fn fill(&mut self, resolve: &Resolve) {
+    pub fn fill(&mut self, resolve: &Resolve) -> anyhow::Result<()> {
         self.map = Vec::new();
         for (_, ty) in resolve.types.iter() {
-            let pair = self.calculate(ty);
+            let pair = self.calculate(ty)?;
             self.map.push(pair);
         }
+        Ok(())
     }
 
-    fn calculate(&self, ty: &TypeDef) -> ElementInfo {
-        match &ty.kind {
+    fn calculate(&self, ty: &TypeDef) -> anyhow::Result<ElementInfo> {
+        Ok(match &ty.kind {
             TypeDefKind::Type(t) => ElementInfo::new(self.size(t), self.align(t)),
-            TypeDefKind::FixedSizeList(t, size) => {
+            TypeDefKind::FixedLengthList(t, size) => {
                 let field_align = self.align(t);
                 let field_size = self.size(t);
-                ElementInfo::new(
-                    ArchitectureSize::new(
-                        field_size.bytes.checked_mul(*size as usize).unwrap(),
-                        field_size.pointers.checked_mul(*size as usize).unwrap(),
-                    ),
-                    field_align,
-                )
+                let bytes = field_size.bytes.checked_mul(*size as usize).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "size of fixed-length list of {size} elements overflows the target architecture's address space"
+                    )
+                })?;
+                let pointers = field_size.pointers.checked_mul(*size as usize).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "size of fixed-length list of {size} elements overflows the target architecture's address space"
+                    )
+                })?;
+                ElementInfo::new(ArchitectureSize::new(bytes, pointers), field_align)
             }
             TypeDefKind::List(_) => {
+                ElementInfo::new(ArchitectureSize::new(0, 2), Alignment::Pointer)
+            }
+            TypeDefKind::Map(_, _) => {
                 ElementInfo::new(ArchitectureSize::new(0, 2), Alignment::Pointer)
             }
             TypeDefKind::Record(r) => self.record(r.fields.iter().map(|f| &f.ty)),
@@ -302,7 +313,7 @@ impl SizeAlign {
                 Alignment::Bytes(NonZeroUsize::new(usize::MAX).unwrap()),
             ),
             TypeDefKind::Unknown => unreachable!(),
-        }
+        })
     }
 
     pub fn size(&self, ty: &Type) -> ArchitectureSize {
@@ -451,6 +462,8 @@ pub fn align_to_arch(val: ArchitectureSize, align: Alignment) -> ArchitectureSiz
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
 
     #[test]
     fn align() {
@@ -551,13 +564,17 @@ mod test {
     fn resource_size() {
         // keep it identical to the old behavior
         let obj = SizeAlign::default();
-        let elem = obj.calculate(&TypeDef {
-            name: None,
-            kind: TypeDefKind::Resource,
-            owner: crate::TypeOwner::None,
-            docs: Default::default(),
-            stability: Default::default(),
-        });
+        let elem = obj
+            .calculate(&TypeDef {
+                name: None,
+                kind: TypeDefKind::Resource,
+                owner: crate::TypeOwner::None,
+                docs: Default::default(),
+                stability: Default::default(),
+                span: Default::default(),
+                external_id: Default::default(),
+            })
+            .unwrap();
         assert_eq!(elem.size, ArchitectureSize::new(usize::MAX, 0));
         assert_eq!(
             elem.align,
@@ -577,21 +594,75 @@ mod test {
             owner: crate::TypeOwner::None,
             docs: Default::default(),
             stability: Default::default(),
+            span: Default::default(),
+            external_id: Default::default(),
         });
-        obj.fill(&resolve);
+        obj.fill(&resolve).unwrap();
         let my_result = crate::Result_ {
             ok: Some(Type::String),
             err: Some(Type::Id(id)),
         };
-        let elem = obj.calculate(&TypeDef {
+        let elem = obj
+            .calculate(&TypeDef {
+                name: None,
+                kind: TypeDefKind::Result(my_result),
+                owner: crate::TypeOwner::None,
+                docs: Default::default(),
+                stability: Default::default(),
+                span: Default::default(),
+                external_id: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(elem.size, ArchitectureSize::new(8, 2));
+        assert_eq!(elem.align, Alignment::Pointer);
+    }
+
+    #[test]
+    fn fixed_length_list_size_overflow_returns_error_instead_of_panicking() {
+        // Regression test: a fixed-length list whose element-size * length
+        // overflows `usize` used to panic via `.unwrap()` on a `None` from
+        // `checked_mul`. It must now return an `Err` instead.
+        let mut obj = SizeAlign::default();
+        let mut resolve = Resolve::default();
+
+        // `type a = list<u64, 4294967295>;`
+        let a = resolve.types.alloc(TypeDef {
             name: None,
-            kind: TypeDefKind::Result(my_result),
+            kind: TypeDefKind::FixedLengthList(Type::U64, u32::MAX),
             owner: crate::TypeOwner::None,
             docs: Default::default(),
             stability: Default::default(),
+            span: Default::default(),
+            external_id: Default::default(),
         });
-        assert_eq!(elem.size, ArchitectureSize::new(8, 2));
-        assert_eq!(elem.align, Alignment::Pointer);
+        // `type b = list<a, 4294967295>;` -- `a`'s size (8 * u32::MAX) times
+        // `u32::MAX` again overflows `usize` on both 32- and 64-bit targets.
+        resolve.types.alloc(TypeDef {
+            name: None,
+            kind: TypeDefKind::FixedLengthList(Type::Id(a), u32::MAX),
+            owner: crate::TypeOwner::None,
+            docs: Default::default(),
+            stability: Default::default(),
+            span: Default::default(),
+            external_id: Default::default(),
+        });
+
+        let err = obj.fill(&resolve).unwrap_err();
+        assert!(err.to_string().contains("overflows"));
+
+        // A benign, non-overflowing fixed-length list still computes fine.
+        let mut obj = SizeAlign::default();
+        let mut resolve = Resolve::default();
+        resolve.types.alloc(TypeDef {
+            name: None,
+            kind: TypeDefKind::FixedLengthList(Type::U64, 2),
+            owner: crate::TypeOwner::None,
+            docs: Default::default(),
+            stability: Default::default(),
+            span: Default::default(),
+            external_id: Default::default(),
+        });
+        obj.fill(&resolve).unwrap();
     }
     #[test]
     fn result_ptr_64bit() {
@@ -602,21 +673,27 @@ mod test {
                     name: String::new(),
                     ty: Type::String,
                     docs: Default::default(),
+                    span: Default::default(),
                 },
                 crate::Field {
                     name: String::new(),
                     ty: Type::U64,
                     docs: Default::default(),
+                    span: Default::default(),
                 },
             ],
         };
-        let elem = obj.calculate(&TypeDef {
-            name: None,
-            kind: TypeDefKind::Record(my_record),
-            owner: crate::TypeOwner::None,
-            docs: Default::default(),
-            stability: Default::default(),
-        });
+        let elem = obj
+            .calculate(&TypeDef {
+                name: None,
+                kind: TypeDefKind::Record(my_record),
+                owner: crate::TypeOwner::None,
+                docs: Default::default(),
+                stability: Default::default(),
+                span: Default::default(),
+                external_id: Default::default(),
+            })
+            .unwrap();
         assert_eq!(elem.size, ArchitectureSize::new(8, 2));
         assert_eq!(elem.align, Alignment::Bytes(NonZeroUsize::new(8).unwrap()));
     }

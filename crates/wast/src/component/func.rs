@@ -54,19 +54,18 @@ pub enum CoreFuncKind<'a> {
     ThreadSpawnRef(CanonThreadSpawnRef<'a>),
     ThreadSpawnIndirect(CanonThreadSpawnIndirect<'a>),
     ThreadAvailableParallelism(CanonThreadAvailableParallelism),
-    BackpressureSet,
     BackpressureInc,
     BackpressureDec,
     TaskReturn(CanonTaskReturn<'a>),
     TaskCancel,
-    ContextGet(u32),
-    ContextSet(u32),
-    ThreadYield(CanonThreadYield),
+    ContextGet(crate::core::ValType<'a>, u32),
+    ContextSet(crate::core::ValType<'a>, u32),
     SubtaskDrop,
     SubtaskCancel(CanonSubtaskCancel),
     StreamNew(CanonStreamNew<'a>),
     StreamRead(CanonStreamRead<'a>),
     StreamWrite(CanonStreamWrite<'a>),
+    StreamForward(CanonStreamForward<'a>),
     StreamCancelRead(CanonStreamCancelRead<'a>),
     StreamCancelWrite(CanonStreamCancelWrite<'a>),
     StreamDropReadable(CanonStreamDropReadable<'a>),
@@ -74,6 +73,7 @@ pub enum CoreFuncKind<'a> {
     FutureNew(CanonFutureNew<'a>),
     FutureRead(CanonFutureRead<'a>),
     FutureWrite(CanonFutureWrite<'a>),
+    FutureForward(CanonFutureForward<'a>),
     FutureCancelRead(CanonFutureCancelRead<'a>),
     FutureCancelWrite(CanonFutureCancelWrite<'a>),
     FutureDropReadable(CanonFutureDropReadable<'a>),
@@ -88,10 +88,13 @@ pub enum CoreFuncKind<'a> {
     WaitableJoin,
     ThreadIndex,
     ThreadNewIndirect(CanonThreadNewIndirect<'a>),
-    ThreadSwitchTo(CanonThreadSwitchTo),
-    ThreadSuspend(CanonThreadSuspend),
     ThreadResumeLater,
-    ThreadYieldTo(CanonThreadYieldTo),
+    ThreadSuspend,
+    ThreadYield,
+    ThreadSuspendThenResume,
+    ThreadYieldThenResume,
+    ThreadSuspendThenPromote,
+    ThreadYieldThenPromote,
 }
 
 impl<'a> Parse<'a> for CoreFuncKind<'a> {
@@ -126,9 +129,6 @@ impl<'a> CoreFuncKind<'a> {
             Ok(CoreFuncKind::ThreadSpawnIndirect(parser.parse()?))
         } else if l.peek::<kw::thread_available_parallelism>()? {
             Ok(CoreFuncKind::ThreadAvailableParallelism(parser.parse()?))
-        } else if l.peek::<kw::backpressure_set>()? {
-            parser.parse::<kw::backpressure_set>()?;
-            Ok(CoreFuncKind::BackpressureSet)
         } else if l.peek::<kw::backpressure_inc>()? {
             parser.parse::<kw::backpressure_inc>()?;
             Ok(CoreFuncKind::BackpressureInc)
@@ -142,14 +142,12 @@ impl<'a> CoreFuncKind<'a> {
             Ok(CoreFuncKind::TaskCancel)
         } else if l.peek::<kw::context_get>()? {
             parser.parse::<kw::context_get>()?;
-            parser.parse::<kw::i32>()?;
-            Ok(CoreFuncKind::ContextGet(parser.parse()?))
+            let ty = parser.parse()?;
+            Ok(CoreFuncKind::ContextGet(ty, parser.parse()?))
         } else if l.peek::<kw::context_set>()? {
             parser.parse::<kw::context_set>()?;
-            parser.parse::<kw::i32>()?;
-            Ok(CoreFuncKind::ContextSet(parser.parse()?))
-        } else if l.peek::<kw::thread_yield>()? {
-            Ok(CoreFuncKind::ThreadYield(parser.parse()?))
+            let ty = parser.parse()?;
+            Ok(CoreFuncKind::ContextSet(ty, parser.parse()?))
         } else if l.peek::<kw::subtask_drop>()? {
             parser.parse::<kw::subtask_drop>()?;
             Ok(CoreFuncKind::SubtaskDrop)
@@ -161,6 +159,8 @@ impl<'a> CoreFuncKind<'a> {
             Ok(CoreFuncKind::StreamRead(parser.parse()?))
         } else if l.peek::<kw::stream_write>()? {
             Ok(CoreFuncKind::StreamWrite(parser.parse()?))
+        } else if l.peek::<kw::stream_forward>()? {
+            Ok(CoreFuncKind::StreamForward(parser.parse()?))
         } else if l.peek::<kw::stream_cancel_read>()? {
             Ok(CoreFuncKind::StreamCancelRead(parser.parse()?))
         } else if l.peek::<kw::stream_cancel_write>()? {
@@ -175,6 +175,8 @@ impl<'a> CoreFuncKind<'a> {
             Ok(CoreFuncKind::FutureRead(parser.parse()?))
         } else if l.peek::<kw::future_write>()? {
             Ok(CoreFuncKind::FutureWrite(parser.parse()?))
+        } else if l.peek::<kw::future_forward>()? {
+            Ok(CoreFuncKind::FutureForward(parser.parse()?))
         } else if l.peek::<kw::future_cancel_read>()? {
             Ok(CoreFuncKind::FutureCancelRead(parser.parse()?))
         } else if l.peek::<kw::future_cancel_write>()? {
@@ -208,15 +210,33 @@ impl<'a> CoreFuncKind<'a> {
             Ok(CoreFuncKind::ThreadIndex)
         } else if l.peek::<kw::thread_new_indirect>()? {
             Ok(CoreFuncKind::ThreadNewIndirect(parser.parse()?))
-        } else if l.peek::<kw::thread_switch_to>()? {
-            Ok(CoreFuncKind::ThreadSwitchTo(parser.parse()?))
-        } else if l.peek::<kw::thread_suspend>()? {
-            Ok(CoreFuncKind::ThreadSuspend(parser.parse()?))
         } else if l.peek::<kw::thread_resume_later>()? {
             parser.parse::<kw::thread_resume_later>()?;
             Ok(CoreFuncKind::ThreadResumeLater)
-        } else if l.peek::<kw::thread_yield_to>()? {
-            Ok(CoreFuncKind::ThreadYieldTo(parser.parse()?))
+        } else if l.peek::<kw::thread_suspend>()? {
+            parser.parse::<kw::thread_suspend>()?;
+            error_on_legacy_cancellable(parser)?;
+            Ok(CoreFuncKind::ThreadSuspend)
+        } else if l.peek::<kw::thread_yield>()? {
+            parser.parse::<kw::thread_yield>()?;
+            error_on_legacy_cancellable(parser)?;
+            Ok(CoreFuncKind::ThreadYield)
+        } else if l.peek::<kw::thread_suspend_then_resume>()? {
+            parser.parse::<kw::thread_suspend_then_resume>()?;
+            error_on_legacy_cancellable(parser)?;
+            Ok(CoreFuncKind::ThreadSuspendThenResume)
+        } else if l.peek::<kw::thread_yield_then_resume>()? {
+            parser.parse::<kw::thread_yield_then_resume>()?;
+            error_on_legacy_cancellable(parser)?;
+            Ok(CoreFuncKind::ThreadYieldThenResume)
+        } else if l.peek::<kw::thread_suspend_then_promote>()? {
+            parser.parse::<kw::thread_suspend_then_promote>()?;
+            error_on_legacy_cancellable(parser)?;
+            Ok(CoreFuncKind::ThreadSuspendThenPromote)
+        } else if l.peek::<kw::thread_yield_then_promote>()? {
+            parser.parse::<kw::thread_yield_then_promote>()?;
+            error_on_legacy_cancellable(parser)?;
+            Ok(CoreFuncKind::ThreadYieldThenPromote)
         } else {
             Err(l.error())
         }
@@ -459,7 +479,7 @@ impl Default for CanonLower<'_> {
 #[derive(Debug)]
 pub struct CanonResourceNew<'a> {
     /// The resource type that this intrinsic creates an owned reference to.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonResourceNew<'a> {
@@ -467,7 +487,7 @@ impl<'a> Parse<'a> for CanonResourceNew<'a> {
         parser.parse::<kw::resource_new>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -476,9 +496,7 @@ impl<'a> Parse<'a> for CanonResourceNew<'a> {
 #[derive(Debug)]
 pub struct CanonResourceDrop<'a> {
     /// The resource type that this intrinsic is dropping.
-    pub ty: Index<'a>,
-    /// Whether or not this function is async
-    pub async_: bool,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonResourceDrop<'a> {
@@ -486,8 +504,7 @@ impl<'a> Parse<'a> for CanonResourceDrop<'a> {
         parser.parse::<kw::resource_drop>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
-            async_: parser.parse::<Option<kw::r#async>>()?.is_some(),
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -496,7 +513,7 @@ impl<'a> Parse<'a> for CanonResourceDrop<'a> {
 #[derive(Debug)]
 pub struct CanonResourceRep<'a> {
     /// The resource type that this intrinsic is accessing.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonResourceRep<'a> {
@@ -504,16 +521,16 @@ impl<'a> Parse<'a> for CanonResourceRep<'a> {
         parser.parse::<kw::resource_rep>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
 
-/// Information relating to the `thread.spawn_ref` intrinsic.
+/// Information relating to the `thread.spawn-ref` intrinsic.
 #[derive(Debug)]
 pub struct CanonThreadSpawnRef<'a> {
     /// The function type that is being spawned.
-    pub ty: Index<'a>,
+    pub ty: CoreItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonThreadSpawnRef<'a> {
@@ -521,18 +538,18 @@ impl<'a> Parse<'a> for CanonThreadSpawnRef<'a> {
         parser.parse::<kw::thread_spawn_ref>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<CorePrefixedRef<'_, _, false>>()?.0,
         })
     }
 }
 
-/// Information relating to the `thread.spawn_indirect` intrinsic.
+/// Information relating to the `thread.spawn-indirect` intrinsic.
 ///
 /// This should look quite similar to parsing of `CallIndirect`.
 #[derive(Debug)]
 pub struct CanonThreadSpawnIndirect<'a> {
     /// The function type that is being spawned.
-    pub ty: Index<'a>,
+    pub ty: CoreItemRef<'a, kw::r#type>,
     /// The table that this spawn is going to be indexing.
     pub table: CoreItemRef<'a, kw::table>,
 }
@@ -540,8 +557,8 @@ pub struct CanonThreadSpawnIndirect<'a> {
 impl<'a> Parse<'a> for CanonThreadSpawnIndirect<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         parser.parse::<kw::thread_spawn_indirect>()?;
-        let ty = parser.parse()?;
-        let table = parser.parens(|p| p.parse())?;
+        let ty = parser.parse::<CorePrefixedRef<'_, _, false>>()?.0;
+        let table = parser.parse::<CorePrefixedRef<'_, _, true>>()?.0;
         Ok(Self { ty, table })
     }
 }
@@ -584,12 +601,19 @@ impl<'a> Parse<'a> for CanonTaskReturn<'a> {
     }
 }
 
+fn error_on_legacy_cancellable(parser: Parser<'_>) -> Result<()> {
+    if parser.parse::<Option<kw::cancellable>>()?.is_some() {
+        return Err(parser.error(
+            "the `cancellable` option is no longer \
+             supported after WebAssembly/component-model#716",
+        ));
+    }
+    Ok(())
+}
+
 /// Information relating to the `waitable-set.wait` intrinsic.
 #[derive(Debug)]
 pub struct CanonWaitableSetWait<'a> {
-    /// If true, the component instance may be reentered during a call to this
-    /// intrinsic.
-    pub async_: bool,
     /// The memory to use when returning an event to the caller.
     pub memory: CoreItemRef<'a, kw::memory>,
 }
@@ -597,19 +621,19 @@ pub struct CanonWaitableSetWait<'a> {
 impl<'a> Parse<'a> for CanonWaitableSetWait<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         parser.parse::<kw::waitable_set_wait>()?;
-        let async_ = parser.parse::<Option<kw::cancellable>>()?.is_some();
-        let memory = parser.parens(|p| p.parse())?;
+        error_on_legacy_cancellable(parser)?;
+        let memory = parser.parens(|p| {
+            let kind = p.parse::<kw::memory>()?;
+            parse_core_prefixed_contents(p, kind)
+        })?;
 
-        Ok(Self { async_, memory })
+        Ok(Self { memory })
     }
 }
 
 /// Information relating to the `waitable-set.poll` intrinsic.
 #[derive(Debug)]
 pub struct CanonWaitableSetPoll<'a> {
-    /// If true, the component instance may be reentered during a call to this
-    /// intrinsic.
-    pub async_: bool,
     /// The memory to use when returning an event to the caller.
     pub memory: CoreItemRef<'a, kw::memory>,
 }
@@ -617,27 +641,13 @@ pub struct CanonWaitableSetPoll<'a> {
 impl<'a> Parse<'a> for CanonWaitableSetPoll<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         parser.parse::<kw::waitable_set_poll>()?;
-        let async_ = parser.parse::<Option<kw::cancellable>>()?.is_some();
-        let memory = parser.parens(|p| p.parse())?;
+        error_on_legacy_cancellable(parser)?;
+        let memory = parser.parens(|p| {
+            let kind = p.parse::<kw::memory>()?;
+            parse_core_prefixed_contents(p, kind)
+        })?;
 
-        Ok(Self { async_, memory })
-    }
-}
-
-/// Information relating to the `thread.yield` intrinsic.
-#[derive(Debug)]
-pub struct CanonThreadYield {
-    /// If true, the component instance may be reentered during a call to this
-    /// intrinsic.
-    pub cancellable: bool,
-}
-
-impl<'a> Parse<'a> for CanonThreadYield {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        parser.parse::<kw::thread_yield>()?;
-        let cancellable = parser.parse::<Option<kw::cancellable>>()?.is_some();
-
-        Ok(Self { cancellable })
+        Ok(Self { memory })
     }
 }
 
@@ -662,7 +672,7 @@ impl<'a> Parse<'a> for CanonSubtaskCancel {
 #[derive(Debug)]
 pub struct CanonStreamNew<'a> {
     /// The stream type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonStreamNew<'a> {
@@ -670,7 +680,7 @@ impl<'a> Parse<'a> for CanonStreamNew<'a> {
         parser.parse::<kw::stream_new>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -679,7 +689,7 @@ impl<'a> Parse<'a> for CanonStreamNew<'a> {
 #[derive(Debug)]
 pub struct CanonStreamRead<'a> {
     /// The stream type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
     /// The canonical options for storing values.
     pub opts: Vec<CanonOpt<'a>>,
 }
@@ -689,7 +699,7 @@ impl<'a> Parse<'a> for CanonStreamRead<'a> {
         parser.parse::<kw::stream_read>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
             opts: parser.parse()?,
         })
     }
@@ -699,7 +709,7 @@ impl<'a> Parse<'a> for CanonStreamRead<'a> {
 #[derive(Debug)]
 pub struct CanonStreamWrite<'a> {
     /// The stream type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
     /// The canonical options for loading values.
     pub opts: Vec<CanonOpt<'a>>,
 }
@@ -709,8 +719,25 @@ impl<'a> Parse<'a> for CanonStreamWrite<'a> {
         parser.parse::<kw::stream_write>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
             opts: parser.parse()?,
+        })
+    }
+}
+
+/// Information relating to the `stream.forward` intrinsic.
+#[derive(Debug)]
+pub struct CanonStreamForward<'a> {
+    /// The stream type to forward.
+    pub ty: ItemRef<'a, kw::r#type>,
+}
+
+impl<'a> Parse<'a> for CanonStreamForward<'a> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        parser.parse::<kw::stream_forward>()?;
+
+        Ok(Self {
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -719,7 +746,7 @@ impl<'a> Parse<'a> for CanonStreamWrite<'a> {
 #[derive(Debug)]
 pub struct CanonStreamCancelRead<'a> {
     /// The stream type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
     /// If false, block until cancel is finished; otherwise return BLOCKED if
     /// necessary.
     pub async_: bool,
@@ -730,7 +757,7 @@ impl<'a> Parse<'a> for CanonStreamCancelRead<'a> {
         parser.parse::<kw::stream_cancel_read>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
             async_: parser.parse::<Option<kw::r#async>>()?.is_some(),
         })
     }
@@ -740,7 +767,7 @@ impl<'a> Parse<'a> for CanonStreamCancelRead<'a> {
 #[derive(Debug)]
 pub struct CanonStreamCancelWrite<'a> {
     /// The stream type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
     /// If false, block until cancel is finished; otherwise return BLOCKED if
     /// necessary.
     pub async_: bool,
@@ -751,7 +778,7 @@ impl<'a> Parse<'a> for CanonStreamCancelWrite<'a> {
         parser.parse::<kw::stream_cancel_write>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
             async_: parser.parse::<Option<kw::r#async>>()?.is_some(),
         })
     }
@@ -761,7 +788,7 @@ impl<'a> Parse<'a> for CanonStreamCancelWrite<'a> {
 #[derive(Debug)]
 pub struct CanonStreamDropReadable<'a> {
     /// The stream type to drop.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonStreamDropReadable<'a> {
@@ -769,7 +796,7 @@ impl<'a> Parse<'a> for CanonStreamDropReadable<'a> {
         parser.parse::<kw::stream_drop_readable>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -778,7 +805,7 @@ impl<'a> Parse<'a> for CanonStreamDropReadable<'a> {
 #[derive(Debug)]
 pub struct CanonStreamDropWritable<'a> {
     /// The stream type to drop.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonStreamDropWritable<'a> {
@@ -786,7 +813,7 @@ impl<'a> Parse<'a> for CanonStreamDropWritable<'a> {
         parser.parse::<kw::stream_drop_writable>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -795,7 +822,7 @@ impl<'a> Parse<'a> for CanonStreamDropWritable<'a> {
 #[derive(Debug)]
 pub struct CanonFutureNew<'a> {
     /// The future type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonFutureNew<'a> {
@@ -803,7 +830,7 @@ impl<'a> Parse<'a> for CanonFutureNew<'a> {
         parser.parse::<kw::future_new>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -812,7 +839,7 @@ impl<'a> Parse<'a> for CanonFutureNew<'a> {
 #[derive(Debug)]
 pub struct CanonFutureRead<'a> {
     /// The future type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
     /// The canonical options for storing values.
     pub opts: Vec<CanonOpt<'a>>,
 }
@@ -822,7 +849,7 @@ impl<'a> Parse<'a> for CanonFutureRead<'a> {
         parser.parse::<kw::future_read>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
             opts: parser.parse()?,
         })
     }
@@ -832,7 +859,7 @@ impl<'a> Parse<'a> for CanonFutureRead<'a> {
 #[derive(Debug)]
 pub struct CanonFutureWrite<'a> {
     /// The future type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
     /// The canonical options for loading values.
     pub opts: Vec<CanonOpt<'a>>,
 }
@@ -842,8 +869,25 @@ impl<'a> Parse<'a> for CanonFutureWrite<'a> {
         parser.parse::<kw::future_write>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
             opts: parser.parse()?,
+        })
+    }
+}
+
+/// Information relating to the `future.forward` intrinsic.
+#[derive(Debug)]
+pub struct CanonFutureForward<'a> {
+    /// The future type to forward.
+    pub ty: ItemRef<'a, kw::r#type>,
+}
+
+impl<'a> Parse<'a> for CanonFutureForward<'a> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        parser.parse::<kw::future_forward>()?;
+
+        Ok(Self {
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -852,7 +896,7 @@ impl<'a> Parse<'a> for CanonFutureWrite<'a> {
 #[derive(Debug)]
 pub struct CanonFutureCancelRead<'a> {
     /// The future type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
     /// If false, block until cancel is finished; otherwise return BLOCKED if
     /// necessary.
     pub async_: bool,
@@ -863,7 +907,7 @@ impl<'a> Parse<'a> for CanonFutureCancelRead<'a> {
         parser.parse::<kw::future_cancel_read>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
             async_: parser.parse::<Option<kw::r#async>>()?.is_some(),
         })
     }
@@ -873,7 +917,7 @@ impl<'a> Parse<'a> for CanonFutureCancelRead<'a> {
 #[derive(Debug)]
 pub struct CanonFutureCancelWrite<'a> {
     /// The future type to instantiate.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
     /// If false, block until cancel is finished; otherwise return BLOCKED if
     /// necessary.
     pub async_: bool,
@@ -884,7 +928,7 @@ impl<'a> Parse<'a> for CanonFutureCancelWrite<'a> {
         parser.parse::<kw::future_cancel_write>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
             async_: parser.parse::<Option<kw::r#async>>()?.is_some(),
         })
     }
@@ -894,7 +938,7 @@ impl<'a> Parse<'a> for CanonFutureCancelWrite<'a> {
 #[derive(Debug)]
 pub struct CanonFutureDropReadable<'a> {
     /// The future type to drop.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonFutureDropReadable<'a> {
@@ -902,7 +946,7 @@ impl<'a> Parse<'a> for CanonFutureDropReadable<'a> {
         parser.parse::<kw::future_drop_readable>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -911,7 +955,7 @@ impl<'a> Parse<'a> for CanonFutureDropReadable<'a> {
 #[derive(Debug)]
 pub struct CanonFutureDropWritable<'a> {
     /// The future type to drop.
-    pub ty: Index<'a>,
+    pub ty: ItemRef<'a, kw::r#type>,
 }
 
 impl<'a> Parse<'a> for CanonFutureDropWritable<'a> {
@@ -919,7 +963,7 @@ impl<'a> Parse<'a> for CanonFutureDropWritable<'a> {
         parser.parse::<kw::future_drop_writable>()?;
 
         Ok(Self {
-            ty: parser.parse()?,
+            ty: parser.parse::<IndexOrRef<'_, _>>()?.0,
         })
     }
 }
@@ -958,11 +1002,11 @@ impl<'a> Parse<'a> for CanonErrorContextDebugMessage<'a> {
     }
 }
 
-/// Information relating to the `thread.new_indirect` intrinsic.
+/// Information relating to the `thread.new-indirect` intrinsic.
 #[derive(Debug)]
 pub struct CanonThreadNewIndirect<'a> {
     /// The function type for the thread start function.
-    pub ty: Index<'a>,
+    pub ty: CoreItemRef<'a, kw::r#type>,
     /// The table to index.
     pub table: CoreItemRef<'a, kw::table>,
 }
@@ -970,52 +1014,9 @@ pub struct CanonThreadNewIndirect<'a> {
 impl<'a> Parse<'a> for CanonThreadNewIndirect<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         parser.parse::<kw::thread_new_indirect>()?;
-        let ty = parser.parse()?;
-        let table = parser.parens(|p| p.parse())?;
+        let ty = parser.parse::<CorePrefixedRef<'_, _, false>>()?.0;
+        let table = parser.parse::<CorePrefixedRef<'_, _, true>>()?.0;
         Ok(Self { ty, table })
-    }
-}
-
-/// Information relating to the `thread.switch-to` intrinsic.
-#[derive(Debug)]
-pub struct CanonThreadSwitchTo {
-    /// Whether the thread can be cancelled while suspended at this point.
-    pub cancellable: bool,
-}
-
-impl<'a> Parse<'a> for CanonThreadSwitchTo {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        parser.parse::<kw::thread_switch_to>()?;
-        let cancellable = parser.parse::<Option<kw::cancellable>>()?.is_some();
-        Ok(Self { cancellable })
-    }
-}
-
-/// Information relating to the `thread.suspend` intrinsic.
-#[derive(Debug)]
-pub struct CanonThreadSuspend {
-    /// Whether the thread can be cancelled while suspended at this point.
-    pub cancellable: bool,
-}
-impl<'a> Parse<'a> for CanonThreadSuspend {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        parser.parse::<kw::thread_suspend>()?;
-        let cancellable = parser.parse::<Option<kw::cancellable>>()?.is_some();
-        Ok(Self { cancellable })
-    }
-}
-
-/// Information relating to the `thread.yield-to` intrinsic.
-#[derive(Debug)]
-pub struct CanonThreadYieldTo {
-    /// Whether the thread can be cancelled while yielding at this point.
-    pub cancellable: bool,
-}
-impl<'a> Parse<'a> for CanonThreadYieldTo {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        parser.parse::<kw::thread_yield_to>()?;
-        let cancellable = parser.parse::<Option<kw::cancellable>>()?.is_some();
-        Ok(Self { cancellable })
     }
 }
 
@@ -1072,26 +1073,29 @@ impl<'a> Parse<'a> for CanonOpt<'a> {
             parser.parens(|parser| {
                 let mut l = parser.lookahead1();
                 if l.peek::<kw::memory>()? {
-                    Ok(CanonOpt::Memory(parser.parse()?))
+                    let kind = parser.parse::<kw::memory>()?;
+                    Ok(CanonOpt::Memory(parse_core_prefixed_contents(
+                        parser, kind,
+                    )?))
                 } else if l.peek::<kw::realloc>()? {
                     parser.parse::<kw::realloc>()?;
                     Ok(CanonOpt::Realloc(
-                        parser.parse::<IndexOrCoreRef<'_, _>>()?.0,
+                        parser.parse::<CorePrefixedRef<'_, _, true>>()?.0,
                     ))
                 } else if l.peek::<kw::post_return>()? {
                     parser.parse::<kw::post_return>()?;
                     Ok(CanonOpt::PostReturn(
-                        parser.parse::<IndexOrCoreRef<'_, _>>()?.0,
+                        parser.parse::<CorePrefixedRef<'_, _, true>>()?.0,
                     ))
                 } else if l.peek::<kw::callback>()? {
                     parser.parse::<kw::callback>()?;
                     Ok(CanonOpt::Callback(
-                        parser.parse::<IndexOrCoreRef<'_, _>>()?.0,
+                        parser.parse::<CorePrefixedRef<'_, _, true>>()?.0,
                     ))
                 } else if l.peek::<kw::core_type>()? {
                     parser.parse::<kw::core_type>()?;
                     Ok(CanonOpt::CoreType(
-                        parser.parse::<IndexOrCoreRef<'_, _>>()?.0,
+                        parser.parse::<CorePrefixedRef<'_, _, true>>()?.0,
                     ))
                 } else {
                     Err(l.error())

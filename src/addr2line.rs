@@ -31,7 +31,7 @@ impl<'a> Addr2lineModules<'a> {
                 } => {
                     assert!(cur_module.is_none());
                     cur_module = Some(Module {
-                        range: range.start as u64..0,
+                        range: range.start..0,
                         code_start: None,
                         custom_sections: HashMap::new(),
                         context: None,
@@ -43,14 +43,16 @@ impl<'a> Addr2lineModules<'a> {
                         cur.custom_sections.insert(s.name(), s.data());
                     }
                 }
-                Payload::CodeSectionStart { range, .. } => {
+                Payload::CodeSectionStart {
+                    unchecked_range, ..
+                } => {
                     assert!(cur_module.is_some());
-                    cur_module.as_mut().unwrap().code_start = Some(range.start as u64);
+                    cur_module.as_mut().unwrap().code_start = Some(unchecked_range.start);
                 }
 
                 Payload::End(offset) => {
                     if let Some(mut module) = cur_module.take() {
-                        module.range.end = offset as u64;
+                        module.range.end = offset;
                         modules.push(module);
                     }
                 }

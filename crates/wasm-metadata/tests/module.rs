@@ -28,7 +28,7 @@ fn add_to_empty_module() {
     let json_str = r#"{"packages":[{"name":"adler","version":"0.2.3","source":"registry"}]}"#;
     let info = VersionInfo::from_str(json_str).unwrap();
     let mut component = Module::new();
-    component.section(&Dependencies::new(info.clone()));
+    component.section(&Dependencies::new(info.clone()).unwrap());
     let module = component.finish();
     let module = add.to_wasm(&module).unwrap();
 
@@ -36,7 +36,7 @@ fn add_to_empty_module() {
         Payload::Module(Metadata {
             name,
             producers,
-            authors: author,
+            authors,
             licenses,
             source,
             range,
@@ -57,7 +57,7 @@ fn add_to_empty_module() {
                 "1.0"
             );
 
-            assert_eq!(author.unwrap(), Authors::new("Chashu Cat"));
+            assert_eq!(authors.unwrap(), Authors::new("Chashu Cat"));
             assert_eq!(description.unwrap(), Description::new("Chashu likes tuna"));
             assert_eq!(
                 licenses.unwrap(),

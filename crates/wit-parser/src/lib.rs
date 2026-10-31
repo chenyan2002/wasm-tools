@@ -1,11 +1,36 @@
+#![no_std]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
+
 use crate::abi::AbiVariant;
-use anyhow::{Context, Result, bail};
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use id_arena::{Arena, Id};
-use indexmap::IndexMap;
 use semver::Version;
-use std::borrow::Cow;
-use std::fmt;
-use std::hash::{Hash, Hasher};
+
+#[cfg(feature = "std")]
+pub type IndexMap<K, V> = indexmap::IndexMap<K, V, std::hash::RandomState>;
+#[cfg(feature = "std")]
+pub type IndexSet<T> = indexmap::IndexSet<T, std::hash::RandomState>;
+#[cfg(not(feature = "std"))]
+pub type IndexMap<K, V> = indexmap::IndexMap<K, V, hashbrown::DefaultHashBuilder>;
+#[cfg(not(feature = "std"))]
+pub type IndexSet<T> = indexmap::IndexSet<T, hashbrown::DefaultHashBuilder>;
+
+#[cfg(feature = "std")]
+pub(crate) use std::collections::{HashMap, HashSet};
+
+#[cfg(not(feature = "std"))]
+pub(crate) use hashbrown::{HashMap, HashSet};
+
+use alloc::borrow::Cow;
+use core::fmt;
+use core::hash::{Hash, Hasher};
+#[cfg(feature = "std")]
 use std::path::Path;
 
 #[cfg(feature = "decoding")]
@@ -17,12 +42,14 @@ pub use metadata::PackageMetadata;
 
 pub mod abi;
 mod ast;
-pub use ast::SourceMap;
-use ast::lex::Span;
+pub use ast::error::*;
+pub use ast::lex::Span;
+pub use ast::{ItemName, SourceMap, SpanLocation};
 pub use ast::{ParsedUsePath, parse_use_path};
 mod sizealign;
 pub use sizealign::*;
 mod resolve;
+pub use resolve::error::*;
 pub use resolve::*;
 mod live;
 pub use live::{LiveTypes, TypeIdVisitor};
@@ -35,9 +62,46 @@ mod serde_;
 use serde_::*;
 
 /// Checks if the given string is a legal identifier in wit.
-pub fn validate_id(s: &str) -> Result<()> {
+pub fn validate_id(s: &str) -> anyhow::Result<()> {
     ast::validate_id(0, s)?;
     Ok(())
+}
+
+/// Parses a component model name. [wasmparser::names::ComponentName::new]
+/// cannot be used on its own because any name-related features that are not
+/// yet default would be rejected.
+pub(crate) fn parse_component_name(
+    name: &str,
+) -> wasmparser::Result<wasmparser::names::ComponentName> {
+    wasmparser::names::ComponentName::new_with_features(name, 0, wasmparser::WasmFeatures::all())
+}
+
+/// Renders an [`anyhow::Error`] chain produced by this crate, substituting
+/// snippet-bearing output for any [`ResolveError`] or [`ParseError`] layers.
+///
+/// For each layer in the chain, this calls [`ResolveError::render`] or
+/// [`ParseError::render`] to format typed errors with file/line/column and
+/// a source snippet. Other layers are formatted via their [`fmt::Display`]
+/// impl. Layers are joined with `": "`, matching `format!("{err:#}")`.
+///
+/// `source_map` must be the [`SourceMap`] in which every typed error's spans
+/// are valid; combining typed errors from different source maps in one chain
+/// is unsupported. For errors from [`Resolve`] methods, prefer
+/// [`Resolve::render_error`].
+#[cfg(feature = "std")]
+pub fn render_anyhow_error(err: &anyhow::Error, source_map: &SourceMap) -> String {
+    err.chain()
+        .map(|layer| {
+            if let Some(re) = layer.downcast_ref::<ResolveError>() {
+                re.render(source_map)
+            } else if let Some(pe) = layer.downcast_ref::<ParseError>() {
+                pe.render(source_map)
+            } else {
+                layer.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 pub type WorldId = Id<World>;
@@ -69,7 +133,7 @@ pub type TypeId = Id<TypeDef>;
 /// will connect the `foreign_deps` field of this structure to packages
 /// previously inserted within the [`Resolve`]. Embedders are responsible for
 /// performing this resolution themselves.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnresolvedPackage {
     /// The namespace, name, and version information for this package.
     pub name: PackageName,
@@ -103,22 +167,51 @@ pub struct UnresolvedPackage {
     /// interface name followed by the identifier within `self.interfaces`. The
     /// fields of `self.interfaces` describes the required types that are from
     /// each foreign interface.
-    pub foreign_deps: IndexMap<PackageName, IndexMap<String, AstItem>>,
+    pub foreign_deps: IndexMap<PackageName, IndexMap<String, (AstItem, Vec<Stability>)>>,
 
     /// Doc comments for this package.
     pub docs: Docs,
 
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     package_name_span: Span,
     unknown_type_spans: Vec<Span>,
-    interface_spans: Vec<InterfaceSpan>,
-    world_spans: Vec<WorldSpan>,
-    type_spans: Vec<Span>,
     foreign_dep_spans: Vec<Span>,
     required_resource_types: Vec<(TypeId, Span)>,
 }
 
+impl UnresolvedPackage {
+    /// Adjusts all spans in this package by adding the given byte offset.
+    ///
+    /// This is used when merging source maps to update spans to point to the
+    /// correct location in the combined source map.
+    pub(crate) fn adjust_spans(&mut self, offset: u32) {
+        // Adjust parallel vec spans
+        self.package_name_span.adjust(offset);
+        for span in &mut self.unknown_type_spans {
+            span.adjust(offset);
+        }
+        for span in &mut self.foreign_dep_spans {
+            span.adjust(offset);
+        }
+        for (_, span) in &mut self.required_resource_types {
+            span.adjust(offset);
+        }
+
+        // Adjust spans on arena items
+        for (_, world) in self.worlds.iter_mut() {
+            world.adjust_spans(offset);
+        }
+        for (_, iface) in self.interfaces.iter_mut() {
+            iface.adjust_spans(offset);
+        }
+        for (_, ty) in self.types.iter_mut() {
+            ty.adjust_spans(offset);
+        }
+    }
+}
+
 /// Tracks a set of packages, all pulled from the same group of WIT source files.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnresolvedPackageGroup {
     /// The "main" package in this package group which was found at the root of
     /// the WIT files.
@@ -133,21 +226,7 @@ pub struct UnresolvedPackageGroup {
     pub source_map: SourceMap,
 }
 
-#[derive(Clone)]
-struct WorldSpan {
-    span: Span,
-    imports: Vec<Span>,
-    exports: Vec<Span>,
-    includes: Vec<Span>,
-}
-
-#[derive(Clone)]
-struct InterfaceSpan {
-    span: Span,
-    funcs: Vec<Span>,
-}
-
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum AstItem {
@@ -192,7 +271,8 @@ impl PackageName {
         s
     }
 
-    /// Determines the "semver compatible track" for the given version.
+    /// Determines the "semver compatible track" for the given version,
+    /// and its version suffix.
     ///
     /// This method implements the logic from the component model where semver
     /// versions can be compatible with one another. For example versions 1.2.0
@@ -204,39 +284,32 @@ impl PackageName {
     /// determine whether two imports can be merged together. This is
     /// additionally used when creating components to match up imports in
     /// core wasm to imports in worlds.
-    pub fn version_compat_track(version: &Version) -> Version {
+    pub fn version_compat_track(version: &Version) -> (Version, Option<String>) {
+        let (_, suffix) = Self::version_compat_track_string(version);
         let mut version = version.clone();
         version.build = semver::BuildMetadata::EMPTY;
-        if !version.pre.is_empty() {
-            return version;
+        if version.pre.is_empty() {
+            if version.major != 0 {
+                version.minor = 0;
+                version.patch = 0;
+            } else if version.minor != 0 {
+                version.patch = 0;
+            }
         }
-        if version.major != 0 {
-            version.minor = 0;
-            version.patch = 0;
-            return version;
-        }
-        if version.minor != 0 {
-            version.patch = 0;
-            return version;
-        }
-        version
+        (version, suffix)
     }
 
     /// Returns the string corresponding to
     /// [`PackageName::version_compat_track`]. This is done to match the
     /// component model's expected naming scheme of imports and exports.
-    pub fn version_compat_track_string(version: &Version) -> String {
-        let version = Self::version_compat_track(version);
-        if !version.pre.is_empty() {
-            return version.to_string();
-        }
-        if version.major != 0 {
-            return format!("{}", version.major);
-        }
-        if version.minor != 0 {
-            return format!("{}.{}", version.major, version.minor);
-        }
-        version.to_string()
+    ///
+    /// See [`wasmparser::names::split_canonical_version`] for more
+    /// information.
+    pub fn version_compat_track_string(version: &Version) -> (String, Option<String>) {
+        let version = version.to_string();
+        let (track, suffix) = wasmparser::names::split_canonical_version(&version)
+            .expect("a `Version` should always display as a valid version");
+        (track.to_string(), suffix.map(|s| s.to_string()))
     }
 }
 
@@ -250,112 +323,24 @@ impl fmt::Display for PackageName {
     }
 }
 
-#[derive(Debug)]
-struct Error {
-    span: Span,
-    msg: String,
-    highlighted: Option<String>,
-}
-
-impl Error {
-    fn new(span: Span, msg: impl Into<String>) -> Error {
-        Error {
-            span,
-            msg: msg.into(),
-            highlighted: None,
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.highlighted.as_ref().unwrap_or(&self.msg).fmt(f)
-    }
-}
-
-impl std::error::Error for Error {}
-
-#[derive(Debug)]
-struct PackageNotFoundError {
-    span: Span,
-    requested: PackageName,
-    known: Vec<PackageName>,
-    highlighted: Option<String>,
-}
-
-impl PackageNotFoundError {
-    pub fn new(span: Span, requested: PackageName, known: Vec<PackageName>) -> Self {
-        Self {
-            span,
-            requested,
-            known,
-            highlighted: None,
-        }
-    }
-}
-
-impl fmt::Display for PackageNotFoundError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(highlighted) = &self.highlighted {
-            return highlighted.fmt(f);
-        }
-        if self.known.is_empty() {
-            write!(
-                f,
-                "package '{}' not found. no known packages.",
-                self.requested
-            )?;
-        } else {
-            write!(
-                f,
-                "package '{}' not found. known packages:\n",
-                self.requested
-            )?;
-            for known in self.known.iter() {
-                write!(f, "    {known}\n")?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for PackageNotFoundError {}
-
 impl UnresolvedPackageGroup {
     /// Parses the given string as a wit document.
     ///
     /// The `path` argument is used for error reporting. The `contents` provided
     /// are considered to be the contents of `path`. This function does not read
     /// the filesystem.
-    pub fn parse(path: impl AsRef<Path>, contents: &str) -> Result<UnresolvedPackageGroup> {
+    ///
+    /// On failure the constructed [`SourceMap`] is returned alongside the
+    /// typed [`ParseError`] so the caller can render a snippet via
+    /// [`ParseError::render`] or merge the source map elsewhere.
+    #[cfg(feature = "std")]
+    pub fn parse(
+        path: impl AsRef<Path>,
+        contents: &str,
+    ) -> Result<UnresolvedPackageGroup, (SourceMap, ParseError)> {
         let mut map = SourceMap::default();
         map.push(path.as_ref(), contents);
         map.parse()
-    }
-
-    /// Parse a WIT package at the provided path.
-    ///
-    /// The path provided is inferred whether it's a file or a directory. A file
-    /// is parsed with [`UnresolvedPackageGroup::parse_file`] and a directory is
-    /// parsed with [`UnresolvedPackageGroup::parse_dir`].
-    pub fn parse_path(path: impl AsRef<Path>) -> Result<UnresolvedPackageGroup> {
-        let path = path.as_ref();
-        if path.is_dir() {
-            UnresolvedPackageGroup::parse_dir(path)
-        } else {
-            UnresolvedPackageGroup::parse_file(path)
-        }
-    }
-
-    /// Parses a WIT package from the file provided.
-    ///
-    /// The return value represents all packages found in the WIT file which
-    /// might be either one or multiple depending on the syntax used.
-    pub fn parse_file(path: impl AsRef<Path>) -> Result<UnresolvedPackageGroup> {
-        let path = path.as_ref();
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read file {path:?}"))?;
-        Self::parse(path, &contents)
     }
 
     /// Parses a WIT package from the directory provided.
@@ -364,36 +349,18 @@ impl UnresolvedPackageGroup {
     /// `*.wit` files are parsed and assumed to be part of the same package
     /// grouping. This is useful when a WIT package is split across multiple
     /// files.
-    pub fn parse_dir(path: impl AsRef<Path>) -> Result<UnresolvedPackageGroup> {
-        let path = path.as_ref();
+    #[cfg(feature = "std")]
+    pub fn parse_dir(path: impl AsRef<Path>) -> anyhow::Result<UnresolvedPackageGroup> {
         let mut map = SourceMap::default();
-        let cx = || format!("failed to read directory {path:?}");
-        for entry in path.read_dir().with_context(&cx)? {
-            let entry = entry.with_context(&cx)?;
-            let path = entry.path();
-            let ty = entry.file_type().with_context(&cx)?;
-            if ty.is_dir() {
-                continue;
-            }
-            if ty.is_symlink() {
-                if path.is_dir() {
-                    continue;
-                }
-            }
-            let filename = match path.file_name().and_then(|s| s.to_str()) {
-                Some(name) => name,
-                None => continue,
-            };
-            if !filename.ends_with(".wit") {
-                continue;
-            }
-            map.push_file(&path)?;
-        }
-        map.parse()
+        map.push_dir(path.as_ref())?;
+        map.parse().map_err(|(map, e)| {
+            let rendered = e.render(&map);
+            anyhow::Error::from(e).context(rendered)
+        })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct World {
     /// The WIT identifier name of this world.
@@ -420,22 +387,52 @@ pub struct World {
     )]
     pub stability: Stability,
 
-    /// All the included worlds from this world. Empty if this is fully resolved
+    /// All the included worlds from this world. Empty if this is fully resolved.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub includes: Vec<(Stability, WorldId)>,
+    pub includes: Vec<WorldInclude>,
 
-    /// All the included worlds names. Empty if this is fully resolved
+    /// Source span for this world.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub include_names: Vec<Vec<IncludeName>>,
+    pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+impl World {
+    /// Adjusts all spans in this world by adding the given byte offset.
+    pub(crate) fn adjust_spans(&mut self, offset: u32) {
+        self.span.adjust(offset);
+        for item in self.imports.values_mut().chain(self.exports.values_mut()) {
+            item.adjust_spans(offset);
+        }
+        for include in &mut self.includes {
+            include.span.adjust(offset);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncludeName {
     /// The name of the item
     pub name: String,
 
     /// The name to be replaced with
     pub as_: String,
+}
+
+/// An entry in the `includes` list of a world, representing an `include`
+/// statement in WIT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldInclude {
+    /// The stability annotation on this include.
+    pub stability: Stability,
+
+    /// The world being included.
+    pub id: WorldId,
+
+    /// Names being renamed as part of this include.
+    pub names: Vec<IncludeName>,
+
+    /// Source span for this include statement.
+    pub span: Span,
 }
 
 /// The key to the import/export maps of a world. Either a kebab-name or a
@@ -450,39 +447,12 @@ pub enum WorldKey {
     Interface(InterfaceId),
 }
 
-/// Helper type to deduplicate kebab strings in maps.
-///
-/// The component model doesn't allow importing both `x` and `[async]x` and this
-/// type is what helps encapsulate that rule. This is similar ish to `KebabStr`
-/// inside of `wasmparser` except that it's only used here for hashing/equality
-/// of `WorldKey` to ensure that world items all hash/dedupe as expected.
-#[derive(PartialEq, Hash)]
-enum KebabDedupe<'a> {
-    Normal(&'a str),
-}
-
-impl<'a> From<&'a str> for KebabDedupe<'a> {
-    fn from(s: &'a str) -> KebabDedupe<'a> {
-        // If the name starts with `[async]` then strip it off. That conflicts
-        // with names without `[async]` so pretend it's the same.
-        if let Some(s) = s.strip_prefix("[async]") {
-            return KebabDedupe::Normal(s);
-        }
-
-        // Note that at this time there's no handling of `[method]` or
-        // `[static]` or similar. In theory that might work here but that's
-        // already handled via other means in `wit-parser` at this time and
-        // `[async]` is chosen to be handled here.
-        KebabDedupe::Normal(s)
-    }
-}
-
 impl Hash for WorldKey {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
         match self {
             WorldKey::Name(s) => {
                 0u8.hash(hasher);
-                KebabDedupe::from(s.as_str()).hash(hasher);
+                s.as_str().hash(hasher);
             }
             WorldKey::Interface(i) => {
                 1u8.hash(hasher);
@@ -495,9 +465,7 @@ impl Hash for WorldKey {
 impl PartialEq for WorldKey {
     fn eq(&self, other: &WorldKey) -> bool {
         match (self, other) {
-            (WorldKey::Name(a), WorldKey::Name(b)) => {
-                KebabDedupe::from(a.as_str()) == KebabDedupe::from(b.as_str())
-            }
+            (WorldKey::Name(a), WorldKey::Name(b)) => a.as_str() == b.as_str(),
             (WorldKey::Name(_), _) => false,
             (WorldKey::Interface(a), WorldKey::Interface(b)) => a == b,
             (WorldKey::Interface(_), _) => false,
@@ -525,7 +493,7 @@ impl WorldKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum WorldItem {
@@ -539,6 +507,16 @@ pub enum WorldItem {
             serde(skip_serializing_if = "Stability::is_unknown")
         )]
         stability: Stability,
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        external_id: Option<String>,
+        /// Documentation attached to the `import`/`export` statement.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Docs::is_empty")
+        )]
+        docs: Docs,
+        #[cfg_attr(feature = "serde", serde(skip))]
+        span: Span,
     },
 
     /// A function is being directly imported or exported from this world.
@@ -547,8 +525,8 @@ pub enum WorldItem {
     /// A type is being exported from this world.
     ///
     /// Note that types are never imported into worlds at this time.
-    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
-    Type(TypeId),
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id_ignore_span"))]
+    Type { id: TypeId, span: Span },
 }
 
 impl WorldItem {
@@ -556,12 +534,28 @@ impl WorldItem {
         match self {
             WorldItem::Interface { stability, .. } => stability,
             WorldItem::Function(f) => &f.stability,
-            WorldItem::Type(id) => &resolve.types[*id].stability,
+            WorldItem::Type { id, .. } => &resolve.types[*id].stability,
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        match self {
+            WorldItem::Interface { span, .. } => *span,
+            WorldItem::Function(f) => f.span,
+            WorldItem::Type { span, .. } => *span,
+        }
+    }
+
+    pub(crate) fn adjust_spans(&mut self, offset: u32) {
+        match self {
+            WorldItem::Function(f) => f.adjust_spans(offset),
+            WorldItem::Interface { span, .. } => span.adjust(offset),
+            WorldItem::Type { span, .. } => span.adjust(offset),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Interface {
     /// Optionally listed name of this interface.
@@ -593,9 +587,35 @@ pub struct Interface {
     /// The package that owns this interface.
     #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_optional_id"))]
     pub package: Option<PackageId>,
+
+    /// Source span for this interface.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub span: Span,
+
+    /// The interface that this one was cloned from, if any.
+    ///
+    /// Applicable for [`Resolve::generate_nominal_type_ids`].
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_optional_id",
+        )
+    )]
+    pub clone_of: Option<InterfaceId>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl Interface {
+    /// Adjusts all spans in this interface by adding the given byte offset.
+    pub(crate) fn adjust_spans(&mut self, offset: u32) {
+        self.span.adjust(offset);
+        for func in self.functions.values_mut() {
+            func.adjust_spans(offset);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct TypeDef {
     pub name: Option<String>,
@@ -609,6 +629,44 @@ pub struct TypeDef {
         serde(skip_serializing_if = "Stability::is_unknown")
     )]
     pub stability: Stability,
+    /// Source span for this type.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub span: Span,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub external_id: Option<String>,
+}
+
+impl TypeDef {
+    /// Adjusts all spans in this type definition by adding the given byte offset.
+    ///
+    /// This is used when merging source maps to update spans to point to the
+    /// correct location in the combined source map.
+    pub(crate) fn adjust_spans(&mut self, offset: u32) {
+        self.span.adjust(offset);
+        match &mut self.kind {
+            TypeDefKind::Record(r) => {
+                for field in &mut r.fields {
+                    field.span.adjust(offset);
+                }
+            }
+            TypeDefKind::Variant(v) => {
+                for case in &mut v.cases {
+                    case.span.adjust(offset);
+                }
+            }
+            TypeDefKind::Enum(e) => {
+                for case in &mut e.cases {
+                    case.span.adjust(offset);
+                }
+            }
+            TypeDefKind::Flags(f) => {
+                for flag in &mut f.flags {
+                    flag.span.adjust(offset);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
@@ -625,7 +683,8 @@ pub enum TypeDefKind {
     Option(Type),
     Result(Result_),
     List(Type),
-    FixedSizeList(Type, u32),
+    Map(Type, Type),
+    FixedLengthList(Type, u32),
     Future(Option<Type>),
     Stream(Option<Type>),
     Type(Type),
@@ -654,7 +713,8 @@ impl TypeDefKind {
             TypeDefKind::Option(_) => "option",
             TypeDefKind::Result(_) => "result",
             TypeDefKind::List(_) => "list",
-            TypeDefKind::FixedSizeList(..) => "fixed size list",
+            TypeDefKind::Map(_, _) => "map",
+            TypeDefKind::FixedLengthList(..) => "fixed-length list",
             TypeDefKind::Future(_) => "future",
             TypeDefKind::Stream(_) => "stream",
             TypeDefKind::Type(_) => "type",
@@ -689,7 +749,7 @@ pub enum Handle {
     Borrow(TypeId),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Clone)]
 pub enum Type {
     Bool,
     U8,
@@ -730,6 +790,9 @@ pub struct Field {
     pub ty: Type,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Docs::is_empty"))]
     pub docs: Docs,
+    /// Source span for this field.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
@@ -744,6 +807,9 @@ pub struct Flag {
     pub name: String,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Docs::is_empty"))]
     pub docs: Docs,
+    /// Source span for this flag.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -794,6 +860,9 @@ pub struct Case {
     pub ty: Option<Type>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Docs::is_empty"))]
     pub docs: Docs,
+    /// Source span for this variant case.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub span: Span,
 }
 
 impl Variant {
@@ -814,6 +883,9 @@ pub struct EnumCase {
     pub name: String,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Docs::is_empty"))]
     pub docs: Docs,
+    /// Source span for this enum case.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub span: Span,
 }
 
 impl Enum {
@@ -826,9 +898,9 @@ impl Enum {
 fn discriminant_type(num_cases: usize) -> Int {
     match num_cases.checked_sub(1) {
         None => Int::U8,
-        Some(n) if n <= u8::max_value() as usize => Int::U8,
-        Some(n) if n <= u16::max_value() as usize => Int::U16,
-        Some(n) if n <= u32::max_value() as usize => Int::U32,
+        Some(n) if n <= u8::MAX as usize => Int::U8,
+        Some(n) if n <= u16::MAX as usize => Int::U16,
+        Some(n) if n <= u32::MAX as usize => Int::U32,
         _ => panic!("too many cases to fit in a repr"),
     }
 }
@@ -854,11 +926,21 @@ impl Docs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct Param {
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "String::is_empty"))]
+    pub name: String,
+    #[cfg_attr(feature = "serde", serde(rename = "type"))]
+    pub ty: Type,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Function {
     pub name: String,
     pub kind: FunctionKind,
-    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_params"))]
-    pub params: Vec<(String, Type)>,
+    pub params: Vec<Param>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub result: Option<Type>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Docs::is_empty"))]
@@ -869,6 +951,12 @@ pub struct Function {
         serde(skip_serializing_if = "Stability::is_unknown")
     )]
     pub stability: Stability,
+
+    /// Source span for this function.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub span: Span,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub external_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -892,6 +980,25 @@ pub enum FunctionKind {
     /// }
     /// ```
     AsyncFreestanding,
+
+    /// A getter function, which takes no parameters and returns a value.
+    ///
+    /// ```wit
+    /// interface foo {
+    ///     the-prop: get() -> u32;
+    /// }
+    /// ```
+    Getter,
+
+    /// A setter function, which takes one parameter and returns either nothing
+    /// or `result<_, error?>`.
+    ///
+    /// ```wit
+    /// interface foo {
+    ///     the-prop: set(value: u32);
+    /// }
+    /// ```
+    Setter,
 
     /// A resource method where the first parameter is implicitly
     /// `borrow<T>`.
@@ -919,6 +1026,30 @@ pub enum FunctionKind {
     #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
     AsyncMethod(TypeId),
 
+    /// A resource getter where the first parameter is implicitly `borrow<T>`.
+    ///
+    /// ```wit
+    /// interface foo {
+    ///     resource r {
+    ///         the-prop: get() -> u32;
+    ///     }
+    /// }
+    /// ```
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
+    MethodGetter(TypeId),
+
+    /// A resource setter where the first parameter is implicitly `borrow<T>`.
+    ///
+    /// ```wit
+    /// interface foo {
+    ///     resource r {
+    ///         the-prop: set(value: u32);
+    ///     }
+    /// }
+    /// ```
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
+    MethodSetter(TypeId),
+
     /// A static resource method.
     ///
     /// ```wit
@@ -943,6 +1074,30 @@ pub enum FunctionKind {
     #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
     AsyncStatic(TypeId),
 
+    /// A static resource getter.
+    ///
+    /// ```wit
+    /// interface foo {
+    ///     resource r {
+    ///         the-prop: static get() -> u32;
+    ///     }
+    /// }
+    /// ```
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
+    StaticGetter(TypeId),
+
+    /// A static resource setter.
+    ///
+    /// ```wit
+    /// interface foo {
+    ///     resource r {
+    ///         the-prop: static set(value: u32);
+    ///     }
+    /// }
+    /// ```
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
+    StaticSetter(TypeId),
+
     /// A resource constructor where the return value is implicitly `own<T>`.
     ///
     /// ```wit
@@ -957,28 +1112,143 @@ pub enum FunctionKind {
 }
 
 impl FunctionKind {
+    /// Returns whether this is an async function or not.
+    pub fn is_async(&self) -> bool {
+        match self {
+            FunctionKind::Freestanding
+            | FunctionKind::Method(_)
+            | FunctionKind::Static(_)
+            | FunctionKind::Constructor(_)
+            | FunctionKind::Getter
+            | FunctionKind::Setter
+            | FunctionKind::MethodGetter(_)
+            | FunctionKind::MethodSetter(_)
+            | FunctionKind::StaticGetter(_)
+            | FunctionKind::StaticSetter(_) => false,
+            FunctionKind::AsyncFreestanding
+            | FunctionKind::AsyncMethod(_)
+            | FunctionKind::AsyncStatic(_) => true,
+        }
+    }
+
+    /// Returns whether this function is a getter or a setter.
+    pub fn accessor(&self) -> Option<AccessorKind> {
+        match self {
+            FunctionKind::Getter
+            | FunctionKind::MethodGetter(_)
+            | FunctionKind::StaticGetter(_) => Some(AccessorKind::Getter),
+            FunctionKind::Setter
+            | FunctionKind::MethodSetter(_)
+            | FunctionKind::StaticSetter(_) => Some(AccessorKind::Setter),
+            FunctionKind::Freestanding
+            | FunctionKind::AsyncFreestanding
+            | FunctionKind::Method(_)
+            | FunctionKind::AsyncMethod(_)
+            | FunctionKind::Static(_)
+            | FunctionKind::AsyncStatic(_)
+            | FunctionKind::Constructor(_) => None,
+        }
+    }
+
     /// Returns the resource, if present, that this function kind refers to.
     pub fn resource(&self) -> Option<TypeId> {
         match self {
-            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => None,
+            FunctionKind::Freestanding
+            | FunctionKind::AsyncFreestanding
+            | FunctionKind::Getter
+            | FunctionKind::Setter => None,
             FunctionKind::Method(id)
             | FunctionKind::Static(id)
             | FunctionKind::Constructor(id)
             | FunctionKind::AsyncMethod(id)
-            | FunctionKind::AsyncStatic(id) => Some(*id),
+            | FunctionKind::AsyncStatic(id)
+            | FunctionKind::MethodGetter(id)
+            | FunctionKind::MethodSetter(id)
+            | FunctionKind::StaticGetter(id)
+            | FunctionKind::StaticSetter(id) => Some(*id),
         }
     }
 
     /// Returns the resource, if present, that this function kind refers to.
     pub fn resource_mut(&mut self) -> Option<&mut TypeId> {
         match self {
-            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => None,
+            FunctionKind::Freestanding
+            | FunctionKind::AsyncFreestanding
+            | FunctionKind::Getter
+            | FunctionKind::Setter => None,
             FunctionKind::Method(id)
             | FunctionKind::Static(id)
             | FunctionKind::Constructor(id)
             | FunctionKind::AsyncMethod(id)
-            | FunctionKind::AsyncStatic(id) => Some(id),
+            | FunctionKind::AsyncStatic(id)
+            | FunctionKind::MethodGetter(id)
+            | FunctionKind::MethodSetter(id)
+            | FunctionKind::StaticGetter(id)
+            | FunctionKind::StaticSetter(id) => Some(id),
         }
+    }
+}
+
+/// Whether an accessor function is a getter or a setter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum AccessorKind {
+    /// A `get` function, encoded with a `[get]` name.
+    Getter,
+    /// A `set` function, encoded with a `[set]` name.
+    Setter,
+}
+
+/// Reorders `items` so that every setter immediately follows its getter. (WIT
+/// allows functions to be declared in any order, but the component binary
+/// format requires getters to precede setters.)
+pub(crate) fn place_setters_after_getters<K, V>(
+    items: &mut IndexMap<K, V>,
+    func: impl Fn(&V) -> Option<&Function>,
+) {
+    // This function basically does a very limited linear "sort" by moving
+    // setters forward if we haven't seen their getter yet. When we do this, we
+    // simply don't bump the loop index and then continue iterating from
+    // whatever item slid back into the setter's place. We will eventually see
+    // that same setter again but that's fine.
+
+    let mut getters_seen = HashSet::new();
+    let mut i = 0;
+    while let Some((_, item)) = items.get_index(i) {
+        match func(item) {
+            Some(f) => match f.kind.accessor() {
+                Some(AccessorKind::Getter) => {
+                    getters_seen.insert(f.name.clone());
+                }
+                Some(AccessorKind::Setter) => {
+                    let getter_name = f.name.replacen("[set]", "[get]", 1);
+                    if !getters_seen.contains(&getter_name) {
+                        // The getter, if present, is somewhere after `i`.
+                        let getter_index = (i + 1..items.len())
+                            .find(|&j| func(&items[j]).is_some_and(|g| g.name == getter_name));
+                        if let Some(g) = getter_index {
+                            // Moving the setter to follow the getter will move
+                            // the intermediate items back, so we continue here
+                            // without incrementing i.
+                            items.move_index(i, g);
+                            continue;
+                        }
+                    }
+                }
+                None => {}
+            },
+            None => {}
+        }
+        i += 1;
+    }
+}
+
+/// Helper for [`place_setters_after_getters`] over a world's imports/exports.
+pub(crate) fn world_item_func(item: &WorldItem) -> Option<&Function> {
+    match item {
+        WorldItem::Function(f) => Some(f),
+        _ => None,
     }
 }
 
@@ -996,15 +1266,15 @@ pub enum Mangling {
     Legacy,
 }
 
-impl std::str::FromStr for Mangling {
+impl core::str::FromStr for Mangling {
     type Err = anyhow::Error;
 
-    fn from_str(s: &str) -> Result<Mangling> {
+    fn from_str(s: &str) -> anyhow::Result<Mangling> {
         match s {
             "legacy" => Ok(Mangling::Legacy),
             "standard32" => Ok(Mangling::Standard32),
             _ => {
-                bail!(
+                anyhow::bail!(
                     "unknown name mangling `{s}`, \
                      supported values are `legacy` or `standard32`"
                 )
@@ -1109,17 +1379,56 @@ impl ManglingAndAbi {
             | Self::Legacy(LiftLowerAbi::AsyncStackful) => true,
         }
     }
+
+    pub fn mangling(&self) -> Mangling {
+        match self {
+            Self::Standard32 => Mangling::Standard32,
+            Self::Legacy(_) => Mangling::Legacy,
+        }
+    }
+
+    /// Returns a suitable [`ManglingAndAbi`], based on `self`, to use for
+    /// `func`.
+    ///
+    /// This handles the case where `func` is a synchronous function which means
+    /// that it's forced to use the sync ABI no matter what.
+    pub fn for_func(&self, func: &Function) -> Self {
+        match self {
+            Self::Standard32 => *self,
+            Self::Legacy(abi) => {
+                if !func.kind.is_async() {
+                    Self::Legacy(LiftLowerAbi::Sync)
+                } else {
+                    Self::Legacy(*abi)
+                }
+            }
+        }
+    }
 }
 
 impl Function {
+    /// Adjusts all spans in this function by adding the given byte offset.
+    pub(crate) fn adjust_spans(&mut self, offset: u32) {
+        self.span.adjust(offset);
+        for param in &mut self.params {
+            param.span.adjust(offset);
+        }
+    }
+
     pub fn item_name(&self) -> &str {
         match &self.kind {
-            FunctionKind::Freestanding => &self.name,
-            FunctionKind::AsyncFreestanding => &self.name["[async]".len()..],
+            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => &self.name,
             FunctionKind::Method(_)
             | FunctionKind::Static(_)
             | FunctionKind::AsyncMethod(_)
-            | FunctionKind::AsyncStatic(_) => &self.name[self.name.find('.').unwrap() + 1..],
+            | FunctionKind::AsyncStatic(_)
+            | FunctionKind::MethodGetter(_)
+            | FunctionKind::MethodSetter(_)
+            | FunctionKind::StaticGetter(_)
+            | FunctionKind::StaticSetter(_) => &self.name[self.name.find('.').unwrap() + 1..],
+            FunctionKind::Getter | FunctionKind::Setter => {
+                &self.name[self.name.find(']').unwrap() + 1..]
+            }
             FunctionKind::Constructor(_) => "constructor",
         }
     }
@@ -1129,7 +1438,7 @@ impl Function {
     /// Note that this iterator is not transitive, it only iterates over the
     /// direct references to types that this function has.
     pub fn parameter_and_result_types(&self) -> impl Iterator<Item = Type> + '_ {
-        self.params.iter().map(|(_, t)| *t).chain(self.result)
+        self.params.iter().map(|p| p.ty).chain(self.result)
     }
 
     /// Gets the core export name for this function.
@@ -1174,8 +1483,8 @@ impl Function {
     /// indicate a call to `stream.new` for `stream<u8>`.
     pub fn find_futures_and_streams(&self, resolve: &Resolve) -> Vec<TypeId> {
         let mut results = Vec::new();
-        for (_, ty) in self.params.iter() {
-            find_futures_and_streams(resolve, *ty, &mut results);
+        for param in self.params.iter() {
+            find_futures_and_streams(resolve, param.ty, &mut results);
         }
         if let Some(ty) = self.result {
             find_futures_and_streams(resolve, ty, &mut results);
@@ -1200,6 +1509,41 @@ impl Function {
 
         return containing_resource_id == returned_resource_id;
     }
+
+    /// Returns the `module`, `name`, and signature to use when importing this
+    /// function's `task.return` intrinsic using the `mangling` specified.
+    pub fn task_return_import(
+        &self,
+        resolve: &Resolve,
+        interface: Option<&WorldKey>,
+        mangling: Mangling,
+    ) -> (String, String, abi::WasmSignature) {
+        match mangling {
+            Mangling::Standard32 => todo!(),
+            Mangling::Legacy => {}
+        }
+        // For exported async functions, generate a `task.return` intrinsic.
+        let module = match interface {
+            Some(key) => format!("[export]{}", resolve.name_world_key(key)),
+            None => "[export]$root".to_string(),
+        };
+        let name = format!("[task-return]{}", self.name);
+
+        let mut func_tmp = self.clone();
+        func_tmp.params = Vec::new();
+        func_tmp.result = None;
+        if let Some(ty) = self.result {
+            func_tmp.params.push(Param {
+                name: "x".to_string(),
+                ty,
+                span: Default::default(),
+            });
+        }
+        let sig = resolve.wasm_signature(AbiVariant::GuestImport, &func_tmp);
+        (module, name, sig)
+    }
+
+    // push_imported_future_and_stream_intrinsics(wat, resolve, "[export]", interface, func);
 }
 
 fn find_futures_and_streams(resolve: &Resolve, ty: Type, results: &mut Vec<TypeId>) {
@@ -1231,9 +1575,13 @@ fn find_futures_and_streams(resolve: &Resolve, ty: Type, results: &mut Vec<TypeI
         }
         TypeDefKind::Option(ty)
         | TypeDefKind::List(ty)
-        | TypeDefKind::FixedSizeList(ty, ..)
+        | TypeDefKind::FixedLengthList(ty, ..)
         | TypeDefKind::Type(ty) => {
             find_futures_and_streams(resolve, *ty, results);
+        }
+        TypeDefKind::Map(k, v) => {
+            find_futures_and_streams(resolve, *k, results);
+            find_futures_and_streams(resolve, *v, results);
         }
         TypeDefKind::Result(r) => {
             if let Some(ty) = r.ok {
@@ -1332,6 +1680,7 @@ impl Default for Stability {
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn test_discriminant_type() {
@@ -1354,6 +1703,8 @@ mod test {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::Unknown,
+            span: Default::default(),
+            external_id: Default::default(),
         });
         let t1 = resolve.types.alloc(TypeDef {
             name: None,
@@ -1361,6 +1712,8 @@ mod test {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::Unknown,
+            span: Default::default(),
+            external_id: Default::default(),
         });
         let t2 = resolve.types.alloc(TypeDef {
             name: None,
@@ -1368,19 +1721,87 @@ mod test {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::Unknown,
+            span: Default::default(),
+            external_id: Default::default(),
         });
         let found = Function {
             name: "foo".into(),
             kind: FunctionKind::Freestanding,
-            params: vec![("p1".into(), Type::Id(t1)), ("p2".into(), Type::U32)],
+            params: vec![
+                Param {
+                    name: "p1".into(),
+                    ty: Type::Id(t1),
+                    span: Default::default(),
+                },
+                Param {
+                    name: "p2".into(),
+                    ty: Type::U32,
+                    span: Default::default(),
+                },
+            ],
             result: Some(Type::Id(t2)),
             docs: Docs::default(),
             stability: Stability::Unknown,
+            span: Default::default(),
+            external_id: Default::default(),
         }
         .find_futures_and_streams(&resolve);
         assert_eq!(3, found.len());
         assert_eq!(t0, found[0]);
         assert_eq!(t1, found[1]);
         assert_eq!(t2, found[2]);
+    }
+
+    #[test]
+    fn test_canon_version_split() {
+        use semver::Version;
+
+        let v = Version::parse("1.2.3").unwrap();
+        assert_eq!(
+            PackageName::version_compat_track_string(&v),
+            ("1".to_string(), Some(".2.3".to_string()))
+        );
+
+        let v = Version::parse("101.201.301").unwrap();
+        assert_eq!(
+            PackageName::version_compat_track_string(&v),
+            ("101".to_string(), Some(".201.301".to_string()))
+        );
+
+        let v = Version::parse("0.2.6-rc.1").unwrap();
+        assert_eq!(
+            PackageName::version_compat_track_string(&v),
+            ("0.2.6-rc.1".to_string(), None)
+        );
+
+        let v = Version::parse("0.10.0+build.1").unwrap();
+        assert_eq!(
+            PackageName::version_compat_track_string(&v),
+            ("0.10".to_string(), Some(".0+build.1".to_string()))
+        );
+
+        let v = Version::parse("0.0.1-alpha+build.1").unwrap();
+        assert_eq!(
+            PackageName::version_compat_track_string(&v),
+            ("0.0.1-alpha".to_string(), Some("+build.1".to_string()))
+        );
+
+        let v = Version::parse("0.0.0").unwrap();
+        assert_eq!(
+            PackageName::version_compat_track_string(&v),
+            ("0.0.0".to_string(), None)
+        );
+
+        let v = Version::parse("1.0.0-beta.1").unwrap();
+        assert_eq!(
+            PackageName::version_compat_track_string(&v),
+            ("1.0.0-beta.1".to_string(), None)
+        );
+
+        let v = Version::parse("0.0.100+build.1").unwrap();
+        assert_eq!(
+            PackageName::version_compat_track_string(&v),
+            ("0.0.100".to_string(), Some("+build.1".to_string()))
+        );
     }
 }

@@ -1,7 +1,8 @@
 use super::CORE_TYPE_SORT;
 use crate::{
-    Alias, ComponentExportKind, ComponentOuterAliasKind, ComponentSection, ComponentSectionId,
-    ComponentTypeRef, CoreTypeEncoder, Encode, EntityType, ValType, encode_section,
+    Alias, ComponentExportKind, ComponentExternName, ComponentOuterAliasKind, ComponentSection,
+    ComponentSectionId, ComponentTypeRef, CoreTypeEncoder, Encode, EntityType, ValType,
+    encode_section,
 };
 use alloc::vec::Vec;
 
@@ -225,9 +226,13 @@ impl ComponentType {
     }
 
     /// Defines an import in this component type.
-    pub fn import(&mut self, name: &str, ty: ComponentTypeRef) -> &mut Self {
+    pub fn import<'a>(
+        &mut self,
+        name: impl Into<ComponentExternName<'a>>,
+        ty: ComponentTypeRef,
+    ) -> &mut Self {
         self.bytes.push(0x03);
-        crate::encode_component_import_name(&mut self.bytes, name);
+        name.into().encode(&mut self.bytes);
         ty.encode(&mut self.bytes);
         self.num_added += 1;
         match ty {
@@ -239,9 +244,13 @@ impl ComponentType {
     }
 
     /// Defines an export in this component type.
-    pub fn export(&mut self, name: &str, ty: ComponentTypeRef) -> &mut Self {
+    pub fn export<'a>(
+        &mut self,
+        name: impl Into<ComponentExternName<'a>>,
+        ty: ComponentTypeRef,
+    ) -> &mut Self {
         self.bytes.push(0x04);
-        crate::encode_component_export_name(&mut self.bytes, name);
+        name.into().encode(&mut self.bytes);
         ty.encode(&mut self.bytes);
         self.num_added += 1;
         match ty {
@@ -310,7 +319,11 @@ impl InstanceType {
     }
 
     /// Defines an export in this instance type.
-    pub fn export(&mut self, name: &str, ty: ComponentTypeRef) -> &mut Self {
+    pub fn export<'a>(
+        &mut self,
+        name: impl Into<ComponentExternName<'a>>,
+        ty: ComponentTypeRef,
+    ) -> &mut Self {
         self.0.export(name, ty);
         self
     }
@@ -353,6 +366,7 @@ impl Encode for InstanceType {
 /// Used to encode component function types.
 #[derive(Debug)]
 pub struct ComponentFuncTypeEncoder<'a> {
+    async_encoded: bool,
     params_encoded: bool,
     results_encoded: bool,
     sink: &'a mut Vec<u8>,
@@ -360,12 +374,34 @@ pub struct ComponentFuncTypeEncoder<'a> {
 
 impl<'a> ComponentFuncTypeEncoder<'a> {
     fn new(sink: &'a mut Vec<u8>) -> Self {
-        sink.push(0x40);
         Self {
+            async_encoded: false,
             params_encoded: false,
             results_encoded: false,
             sink,
         }
+    }
+
+    /// Indicates whether this is an `async` function or not.
+    ///
+    /// If this function is not invoked then the function type will not be
+    /// `async`.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if parameters or results have already been
+    /// encoded.
+    pub fn async_(&mut self, is_async: bool) -> &mut Self {
+        assert!(!self.params_encoded);
+        assert!(!self.results_encoded);
+        assert!(!self.async_encoded);
+        self.async_encoded = true;
+        if is_async {
+            self.sink.push(0x43);
+        } else {
+            self.sink.push(0x40);
+        }
+        self
     }
 
     /// Defines named parameters.
@@ -383,6 +419,9 @@ impl<'a> ComponentFuncTypeEncoder<'a> {
         T: Into<ComponentValType>,
     {
         assert!(!self.params_encoded);
+        if !self.async_encoded {
+            self.async_(false);
+        }
         self.params_encoded = true;
         let params = params.into_iter();
         params.len().encode(self.sink);
@@ -402,6 +441,7 @@ impl<'a> ComponentFuncTypeEncoder<'a> {
     /// This method will panic if the function is called twice, called before
     /// the `params` method, or called in addition to the `results` method.
     pub fn result(&mut self, ty: Option<ComponentValType>) -> &mut Self {
+        assert!(self.async_encoded);
         assert!(self.params_encoded);
         assert!(!self.results_encoded);
         self.results_encoded = true;
@@ -574,16 +614,16 @@ impl ComponentDefinedTypeEncoder<'_> {
     /// Define a variant type.
     pub fn variant<'a, C>(self, cases: C)
     where
-        C: IntoIterator<Item = (&'a str, Option<ComponentValType>, Option<u32>)>,
+        C: IntoIterator<Item = (&'a str, Option<ComponentValType>)>,
         C::IntoIter: ExactSizeIterator,
     {
         let cases = cases.into_iter();
         self.0.push(0x71);
         cases.len().encode(self.0);
-        for (name, ty, refines) in cases {
+        for (name, ty) in cases {
             name.encode(self.0);
             ty.encode(self.0);
-            refines.encode(self.0);
+            self.0.push(0x00);
         }
     }
 
@@ -593,8 +633,15 @@ impl ComponentDefinedTypeEncoder<'_> {
         ty.into().encode(self.0);
     }
 
-    /// Define a fixed size list type.
-    pub fn fixed_size_list(self, ty: impl Into<ComponentValType>, elements: u32) {
+    /// Define a map type.
+    pub fn map(self, key: impl Into<ComponentValType>, value: impl Into<ComponentValType>) {
+        self.0.push(0x63);
+        key.into().encode(self.0);
+        value.into().encode(self.0);
+    }
+
+    /// Define a fixed-length list type.
+    pub fn fixed_length_list(self, ty: impl Into<ComponentValType>, elements: u32) {
         self.0.push(0x67);
         ty.into().encode(self.0);
         elements.encode(self.0);

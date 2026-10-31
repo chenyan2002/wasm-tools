@@ -23,9 +23,18 @@ impl<'a> Parse<'a> for ComponentImport<'a> {
     }
 }
 
-/// The different ways an import can be named.
+/// Identifiers, and metadata, for component imports and exports.
 #[derive(Debug, Copy, Clone)]
-pub struct ComponentExternName<'a>(pub &'a str);
+pub struct ComponentExternName<'a> {
+    /// The string name this is referring to.
+    pub name: &'a str,
+    /// For imports, an optional `(implements "...")` directive.
+    pub implements: Option<&'a str>,
+    /// For imports, an optional `(version-suffix "...")` directive.
+    pub version_suffix: Option<&'a str>,
+    /// For imports, an optional `(external-id "...")` directive.
+    pub external_id: Option<&'a str>,
+}
 
 impl<'a> Parse<'a> for ComponentExternName<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
@@ -43,8 +52,47 @@ impl<'a> Parse<'a> for ComponentExternName<'a> {
         } else {
             parser.parse()?
         };
-        Ok(ComponentExternName(name))
+        // Attributes are an unordered list in the text format, so accept them
+        // in any order, but each kind may only be specified once.
+        let mut implements = None;
+        let mut version_suffix = None;
+        let mut external_id = None;
+        loop {
+            if parser.peek2::<kw::implements>()? {
+                parse_extern_name_attribute::<kw::implements>(parser, &mut implements)?;
+            } else if parser.peek2::<kw::version_suffix>()? {
+                parse_extern_name_attribute::<kw::version_suffix>(parser, &mut version_suffix)?;
+            } else if parser.peek2::<kw::external_id>()? {
+                parse_extern_name_attribute::<kw::external_id>(parser, &mut external_id)?;
+            } else {
+                break;
+            }
+        }
+        Ok(ComponentExternName {
+            name,
+            implements,
+            version_suffix,
+            external_id,
+        })
     }
+}
+
+/// Parses a single `(<kw> "...")` attribute of a [`ComponentExternName`] into
+/// `slot`, returning an error if `slot` was already filled in by a previous
+/// attribute of the same kind.
+fn parse_extern_name_attribute<'a, K>(parser: Parser<'a>, slot: &mut Option<&'a str>) -> Result<()>
+where
+    K: Parse<'a> + Peek,
+{
+    parser.parens(|p| {
+        let span = p.cur_span();
+        p.parse::<K>()?;
+        if slot.is_some() {
+            return Err(p.error_at(span, format!("duplicate {} attribute", K::display())));
+        }
+        *slot = Some(p.parse()?);
+        Ok(())
+    })
 }
 
 /// An item signature for imported items.

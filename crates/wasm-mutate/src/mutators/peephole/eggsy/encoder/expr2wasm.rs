@@ -6,7 +6,7 @@ use crate::{
     mutators::peephole::{EG, Lang, MemArg, eggsy::encoder::TraversalEvent},
 };
 use egg::{Id, Language, RecExpr};
-use rand::Rng;
+use rand::RngExt;
 use std::num::Wrapping;
 use wasm_encoder::Function;
 
@@ -682,7 +682,8 @@ impl From<&MemArg> for wasm_encoder::MemArg {
         wasm_encoder::MemArg {
             offset: arg.static_offset,
             align: arg.align.into(),
-            memory_index: arg.mem,
+            target: wasm_encoder::MemArgTarget::Memory(arg.mem),
+            ordering: None,
         }
     }
 }

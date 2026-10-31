@@ -3,9 +3,60 @@ use clap::Parser;
 
 /// Print the textual form of a WebAssembly binary.
 #[derive(Parser)]
+#[clap(after_help = "\
+Examples:
+
+    # Print the textual form of `foo.wasm` to stdout.
+    $ wasm-tools print foo.wasm
+(module
+  (type (;0;) (func (param i32 i32) (result i32)))
+  (func $add (;0;) (type 0) (param $lhs i32) (param $rhs i32) (result i32)
+    local.get $lhs
+    local.get $rhs
+    i32.add
+ )
+
+    # Print a \"skeleton\" form of `foo.wasm` to stdout.
+    $ wasm-tools print foo.wasm --skeleton
+(module
+  (type (;0;) (func (param i32 i32) (result i32)))
+  (func $add (;0;) (type 0) (param $lhs i32) (param $rhs i32) (result i32) ...)
+
+    # Print the textual form of `foo.wasm` to stdout, with folded instructions,
+    # binary offsets, and indented 6 spaces.
+    $ wasm-tools print foo.wasm -p -f --indent 6
+(module
+(;@b     ;)      (type (;0;) (func (param i32 i32) (result i32)))
+(;@37    ;)      (func $add (;0;) (type 0) (param $lhs i32) (param $rhs i32) (result i32)
+(;@3c    ;)            (i32.add
+(;@38    ;)                  (local.get $lhs)
+(;@3a    ;)                  (local.get $rhs))
+                 )
+
+    # Print the textual form of `foo.wasm` to stdout, with synthesized names for
+    # items without a name in the `name` section. (Notice below that the type
+    # denoted by ;0; in the previous examples has been given a name.)
+    $ wasm-tools print foo.wasm --name-unnamed
+(module
+  (type $#type0 (;0;) (func (param i32 i32) (result i32)))
+  (func $add (;0;) (type $#type0) (param $lhs i32) (param $rhs i32) (result i32)
+...
+
+    # Print the textual form of `foo.wasm` to the file `foo.wat`.
+    $ wasm-tools print foo.wasm -o foo.wat
+
+Exit status:
+    0 on success,
+    nonzero if the input file fails to parse.
+")]
+// `-f` is already taken by `--fold-instructions`, so `--features` is long-only.
+#[clap(mut_arg("features", |a| a.short(None)))]
 pub struct Opts {
     #[clap(flatten)]
     generate_dwarf: wasm_tools::GenerateDwarfArg,
+
+    #[clap(flatten)]
+    features: wasm_tools::CliFeatures,
 
     #[clap(flatten)]
     io: wasm_tools::InputOutput,
@@ -31,6 +82,7 @@ pub struct Opts {
     name_unnamed: bool,
 
     /// Print instructions in the folded format.
+    /// (See https://webassembly.github.io/spec/core/text/instructions.html#folded-instructions)
     #[clap(short, long)]
     fold_instructions: bool,
 
@@ -55,6 +107,7 @@ impl Opts {
         let wasm = self.io.get_input_wasm(Some(&self.generate_dwarf))?;
 
         let mut config = wasmprinter::Config::new();
+        config.features(self.features.features_from(wasmparser::WasmFeatures::all()));
         config.print_offsets(self.print_offsets);
         config.print_skeleton(self.skeleton);
         config.name_unnamed(self.name_unnamed);

@@ -77,6 +77,9 @@ impl Operator<'_> {
         #[cfg_attr(not(feature = "simd"), allow(unused_macro_rules))]
         macro_rules! operator_arity {
             ($visit:ident $args:tt arity $a:tt -> $b:tt) => (Some(($a, $b)));
+            ($visit:ident { $memarg:ident $($rest:ident)* } arity memarg $a:tt -> $b:tt) => {
+                Some(($a + memarg_extra_operands(&$memarg), $b))
+            };
             ($visit:ident { $($args:ident)* } arity custom) => ($visit(module, $($args),*));
         }
         macro_rules! define_arity {
@@ -94,6 +97,13 @@ impl Operator<'_> {
             );
         }
         crate::for_each_operator!(define_arity)
+    }
+}
+
+fn memarg_extra_operands(memarg: &crate::MemArg) -> u32 {
+    match memarg.target {
+        crate::MemArgTarget::Memory(_) => 0,
+        crate::MemArgTarget::Array(_) => 1,
     }
 }
 
@@ -160,8 +170,15 @@ fn visit_call_indirect(module: &dyn ModuleArity, ty: u32, _table: u32) -> Option
 }
 
 fn visit_struct_new(module: &dyn ModuleArity, ty: u32) -> Option<(u32, u32)> {
-    let (params, _results) = module.sub_type_arity(module.sub_type_at(ty)?)?;
+    let ty = module.sub_type_at(ty)?;
+    let (params, _results) = module.sub_type_arity(ty)?;
     Some((params, 1))
+}
+
+fn visit_struct_new_desc(module: &dyn ModuleArity, ty: u32) -> Option<(u32, u32)> {
+    let ty = module.sub_type_at(ty)?;
+    let (params, _results) = module.sub_type_arity(ty)?;
+    Some((params + 1, 1))
 }
 
 fn visit_array_new_fixed(_module: &dyn ModuleArity, _ty: u32, size: u32) -> Option<(u32, u32)> {
@@ -278,6 +295,16 @@ fn visit_resume_throw(
     Some((params + 1, results))
 }
 
+fn visit_resume_throw_ref(
+    module: &dyn ModuleArity,
+    cont: u32,
+    _table: ResumeTable,
+) -> Option<(u32, u32)> {
+    let (_, results) = module.sub_type_arity(module.sub_type_at(cont)?)?;
+    // in: [exnref, cont], out: [result(cont)]
+    Some((2, results))
+}
+
 fn visit_switch(module: &dyn ModuleArity, cont: u32, _tag: u32) -> Option<(u32, u32)> {
     let (params, _) = module.sub_type_arity(module.sub_type_at(cont)?)?;
     let st = &module.sub_type_at(cont)?.composite_type.inner;
@@ -288,4 +315,24 @@ fn visit_switch(module: &dyn ModuleArity, cont: u32, _tag: u32) -> Option<(u32, 
     let (cont_params, _) =
         module.sub_type_arity(module.sub_type_of_ref_type(&last_param.as_reference_type()?)?)?;
     Some((params, cont_params))
+}
+
+fn visit_br_on_cast_desc_eq(
+    module: &dyn ModuleArity,
+    depth: u32,
+    _from: RefType,
+    _to: RefType,
+) -> Option<(u32, u32)> {
+    let (params, _) = visit_br(module, depth)?;
+    Some((params + 1, params))
+}
+
+fn visit_br_on_cast_desc_eq_fail(
+    module: &dyn ModuleArity,
+    depth: u32,
+    _from: RefType,
+    _to: RefType,
+) -> Option<(u32, u32)> {
+    let (params, _) = visit_br(module, depth)?;
+    Some((params + 1, params))
 }

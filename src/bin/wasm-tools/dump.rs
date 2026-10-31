@@ -30,7 +30,7 @@ impl Opts {
 
 struct Dump<'a> {
     bytes: &'a [u8],
-    cur: usize,
+    cur: u64,
     state: String,
     dst: Box<dyn WriteColor + 'a>,
     nesting: u32,
@@ -82,7 +82,7 @@ impl<'a> Dump<'a> {
 
     fn run(&mut self) -> Result<()> {
         self.print_module()?;
-        assert_eq!(self.cur, self.bytes.len());
+        assert_eq!(self.cur as usize, self.bytes.len());
         Ok(())
     }
 
@@ -111,26 +111,68 @@ impl<'a> Dump<'a> {
                         if explicit {
                             me.print(offset)?;
                         }
-                        write!(me.state, "[type {}] {ty:?}", inc(&mut i.core_types))?;
+                        write!(me.state, "[type {}] {ty}", inc(&mut i.core_types))?;
                     }
                     me.print(end)
                 })?,
-                Payload::ImportSection(s) => self.section(s, "import", |me, end, imp| {
-                    write!(me.state, "import ")?;
-                    match imp.ty {
-                        TypeRef::Func(_) => write!(me.state, "[func {}]", inc(&mut i.core_funcs))?,
-                        TypeRef::Memory(_) => {
-                            write!(me.state, "[memory {}]", inc(&mut i.core_memories))?
+                Payload::ImportSection(s) => self.section(s, "import", |me, end, imports| {
+                    let mut print_ty = |me: &mut Dump, ty: TypeRef| -> std::fmt::Result {
+                        match ty {
+                            TypeRef::Func(_) => {
+                                write!(me.state, "[func {}]", inc(&mut i.core_funcs))?
+                            }
+                            TypeRef::FuncExact(_) => {
+                                write!(me.state, "[func_exact {}]", inc(&mut i.core_funcs))?
+                            }
+                            TypeRef::Memory(_) => {
+                                write!(me.state, "[memory {}]", inc(&mut i.core_memories))?
+                            }
+                            TypeRef::Tag(_) => write!(me.state, "[tag {}]", inc(&mut i.core_tags))?,
+                            TypeRef::Table(_) => {
+                                write!(me.state, "[table {}]", inc(&mut i.core_tables))?
+                            }
+                            TypeRef::Global(_) => {
+                                write!(me.state, "[global {}]", inc(&mut i.core_globals))?
+                            }
                         }
-                        TypeRef::Tag(_) => write!(me.state, "[tag {}]", inc(&mut i.core_tags))?,
-                        TypeRef::Table(_) => {
-                            write!(me.state, "[table {}]", inc(&mut i.core_tables))?
+                        Ok(())
+                    };
+
+                    match imports {
+                        Imports::Single(_, imp) => {
+                            write!(me.state, "import ")?;
+                            print_ty(me, imp.ty)?;
+                            write!(me.state, " {imp:?}")?;
                         }
-                        TypeRef::Global(_) => {
-                            write!(me.state, "[global {}]", inc(&mut i.core_globals))?
+                        Imports::Compact1 { module, items } => {
+                            writeln!(me.dst, "--- import group (common module) ---")?;
+                            write!(me.state, "module: {0:?}, count: {1}", module, items.count())?;
+                            for item in items.into_iter_with_offsets() {
+                                let (offset, imp) = item?;
+                                me.print(offset)?;
+                                write!(me.state, "import ")?;
+                                print_ty(me, imp.ty)?;
+                                write!(me.state, " {imp:?}")?;
+                            }
+                        }
+                        Imports::Compact2 { module, ty, names } => {
+                            writeln!(me.dst, "--- import group (common module and type) ---")?;
+                            write!(
+                                me.state,
+                                "module: {0:?}, type: {1:?}, count: {2}",
+                                module,
+                                ty,
+                                names.count()
+                            )?;
+                            for item in names.into_iter_with_offsets() {
+                                let (offset, imp) = item?;
+                                me.print(offset)?;
+                                write!(me.state, "import ")?;
+                                print_ty(me, ty)?;
+                                write!(me.state, " {imp:?}")?;
+                            }
                         }
                     }
-                    write!(me.state, " {imp:?}")?;
                     me.print(end)
                 })?,
                 Payload::FunctionSection(s) => {
@@ -223,7 +265,7 @@ impl<'a> Dump<'a> {
                     match i.kind {
                         DataKind::Passive => {
                             write!(me.state, "data passive")?;
-                            me.print(end - i.data.len())?;
+                            me.print(end - i.data.len() as u64)?;
                         }
                         DataKind::Active {
                             memory_index,
@@ -243,11 +285,15 @@ impl<'a> Dump<'a> {
                     Ok(())
                 })?,
 
-                Payload::CodeSectionStart { count, range, size } => {
+                Payload::CodeSectionStart {
+                    count,
+                    unchecked_range,
+                    size,
+                } => {
                     write!(self.state, "code section")?;
-                    self.color_print(range.start)?;
+                    self.color_print(unchecked_range.start)?;
                     write!(self.state, "{count} count")?;
-                    self.print(range.end - size as usize)?;
+                    self.print(unchecked_range.end - size as u64)?;
                 }
 
                 Payload::CodeSectionEntry(body) => {
@@ -366,7 +412,9 @@ impl<'a> Dump<'a> {
                                 ..
                             } => ("component", inc(&mut i.components)),
                             ComponentAlias::CoreInstanceExport { kind, .. } => match kind {
-                                ExternalKind::Func => ("core func", inc(&mut i.core_funcs)),
+                                ExternalKind::Func | ExternalKind::FuncExact => {
+                                    ("core func", inc(&mut i.core_funcs))
+                                }
                                 ExternalKind::Table => ("core table", inc(&mut i.core_tables)),
                                 ExternalKind::Memory => ("core memory", inc(&mut i.core_memories)),
                                 ExternalKind::Global => ("core global", inc(&mut i.core_globals)),
@@ -417,12 +465,10 @@ impl<'a> Dump<'a> {
                             CanonicalFunction::Lower { .. }
                             | CanonicalFunction::ResourceNew { .. }
                             | CanonicalFunction::ResourceDrop { .. }
-                            | CanonicalFunction::ResourceDropAsync { .. }
                             | CanonicalFunction::ResourceRep { .. }
                             | CanonicalFunction::ThreadSpawnRef { .. }
                             | CanonicalFunction::ThreadSpawnIndirect { .. }
                             | CanonicalFunction::ThreadAvailableParallelism
-                            | CanonicalFunction::BackpressureSet
                             | CanonicalFunction::BackpressureInc
                             | CanonicalFunction::BackpressureDec
                             | CanonicalFunction::TaskReturn { .. }
@@ -434,12 +480,12 @@ impl<'a> Dump<'a> {
                             | CanonicalFunction::WaitableSetPoll { .. }
                             | CanonicalFunction::WaitableSetDrop
                             | CanonicalFunction::WaitableJoin
-                            | CanonicalFunction::ThreadYield { .. }
                             | CanonicalFunction::SubtaskDrop
                             | CanonicalFunction::SubtaskCancel { .. }
                             | CanonicalFunction::StreamNew { .. }
                             | CanonicalFunction::StreamRead { .. }
                             | CanonicalFunction::StreamWrite { .. }
+                            | CanonicalFunction::StreamForward { .. }
                             | CanonicalFunction::StreamCancelRead { .. }
                             | CanonicalFunction::StreamCancelWrite { .. }
                             | CanonicalFunction::StreamDropReadable { .. }
@@ -447,6 +493,7 @@ impl<'a> Dump<'a> {
                             | CanonicalFunction::FutureNew { .. }
                             | CanonicalFunction::FutureRead { .. }
                             | CanonicalFunction::FutureWrite { .. }
+                            | CanonicalFunction::FutureForward { .. }
                             | CanonicalFunction::FutureCancelRead { .. }
                             | CanonicalFunction::FutureCancelWrite { .. }
                             | CanonicalFunction::FutureDropReadable { .. }
@@ -456,10 +503,13 @@ impl<'a> Dump<'a> {
                             | CanonicalFunction::ErrorContextDrop
                             | CanonicalFunction::ThreadIndex
                             | CanonicalFunction::ThreadNewIndirect { .. }
-                            | CanonicalFunction::ThreadSwitchTo { .. }
-                            | CanonicalFunction::ThreadSuspend { .. }
                             | CanonicalFunction::ThreadResumeLater { .. }
-                            | CanonicalFunction::ThreadYieldTo { .. } => {
+                            | CanonicalFunction::ThreadSuspend { .. }
+                            | CanonicalFunction::ThreadYield { .. }
+                            | CanonicalFunction::ThreadSuspendThenResume { .. }
+                            | CanonicalFunction::ThreadYieldThenResume { .. }
+                            | CanonicalFunction::ThreadSuspendThenPromote { .. }
+                            | CanonicalFunction::ThreadYieldThenPromote { .. } => {
                                 ("core func", &mut i.core_funcs)
                             }
                         };
@@ -490,7 +540,7 @@ impl<'a> Dump<'a> {
                     self.print(c.data_offset())?;
                     match c.as_known() {
                         KnownCustom::Name(iter) => {
-                            self.print_subsections(iter, |me, item, pos| {
+                            self.print_subsections(iter.sections, |me, item, pos| {
                                 me.print_core_name(item, pos)
                             })?;
                         }
@@ -566,7 +616,7 @@ impl<'a> Dump<'a> {
                                 write!(self.dst, "---")?;
                             }
                             writeln!(self.dst, "-| ... {} bytes of data", c.data().len())?;
-                            self.cur += c.data().len();
+                            self.cur = c.range().end;
                         }
                     }
                 }
@@ -584,8 +634,9 @@ impl<'a> Dump<'a> {
                         for _ in 0..NBYTES {
                             write!(self.dst, "---")?;
                         }
-                        writeln!(self.dst, "-| ... {} bytes of data", range.len())?;
-                        self.cur += range.len();
+                        let len = (range.start as usize..range.end as usize).len();
+                        writeln!(self.dst, "-| ... {len} bytes of data")?;
+                        self.cur = range.end;
                     }
                     None => {
                         bail!("unsupported payload {other:?}")
@@ -598,10 +649,14 @@ impl<'a> Dump<'a> {
     }
 
     fn print_name_map(&mut self, thing: &str, n: NameMap<'_>) -> Result<()> {
-        self.section(n, &format!("{thing} name"), |me, end, naming| {
-            write!(me.state, "{naming:?}")?;
-            me.print(end)
-        })
+        self.section(
+            n.names.into(),
+            &format!("{thing} name"),
+            |me, end, naming| {
+                write!(me.state, "{naming:?}")?;
+                me.print(end)
+            },
+        )
     }
 
     fn print_indirect_name_map(
@@ -610,7 +665,7 @@ impl<'a> Dump<'a> {
         thing_b: &str,
         n: IndirectNameMap<'_>,
     ) -> Result<()> {
-        self.section(n, thing_b, |me, _end, naming| {
+        self.section(n.names.into(), thing_b, |me, _end, naming| {
             write!(me.state, "{} {} ", thing_a, naming.index)?;
             me.print_name_map(thing_b, naming.names)
         })
@@ -619,7 +674,7 @@ impl<'a> Dump<'a> {
     fn print_subsections<'b, T>(
         &mut self,
         mut section: Subsections<'b, T>,
-        print_item: impl Fn(&mut Self, T, usize) -> Result<()>,
+        print_item: impl Fn(&mut Self, T, u64) -> Result<()>,
     ) -> Result<()>
     where
         T: wasmparser::Subsection<'b>,
@@ -655,7 +710,7 @@ impl<'a> Dump<'a> {
         Ok(())
     }
 
-    fn print_core_name(&mut self, name: Name<'_>, end: usize) -> Result<()> {
+    fn print_core_name(&mut self, name: Name<'_>, end: u64) -> Result<()> {
         match name {
             Name::Module { name, name_range } => {
                 write!(self.state, "module name")?;
@@ -674,6 +729,8 @@ impl<'a> Dump<'a> {
             Name::Data(n) => self.print_name_map("data", n)?,
             Name::Field(n) => self.print_indirect_name_map("type", "field", n)?,
             Name::Tag(n) => self.print_name_map("tag", n)?,
+            Name::Parameter(n) => self.print_indirect_name_map("func", "param", n)?,
+            Name::TagParameter(n) => self.print_indirect_name_map("tag", "param", n)?,
             Name::Unknown { ty, range, .. } => {
                 write!(self.state, "unknown names: {ty}")?;
                 self.print(range.start)?;
@@ -683,7 +740,7 @@ impl<'a> Dump<'a> {
         Ok(())
     }
 
-    fn print_component_name(&mut self, name: ComponentName<'_>, end: usize) -> Result<()> {
+    fn print_component_name(&mut self, name: ComponentName<'_>, end: u64) -> Result<()> {
         match name {
             ComponentName::Component { name, name_range } => {
                 write!(self.state, "component name")?;
@@ -713,7 +770,7 @@ impl<'a> Dump<'a> {
         Ok(())
     }
 
-    fn print_linking_subsection(&mut self, s: Linking<'_>, end: usize) -> Result<()> {
+    fn print_linking_subsection(&mut self, s: Linking<'_>, end: u64) -> Result<()> {
         match s {
             Linking::SegmentInfo(map) => self.section(map, "segment info", |me, pos, item| {
                 write!(me.state, "{item:?}")?;
@@ -731,6 +788,10 @@ impl<'a> Dump<'a> {
                 write!(me.state, "{item:?}")?;
                 me.print(pos)
             }),
+            Linking::TargetArch(arch) => {
+                write!(self.state, "target arch: {arch:?}")?;
+                self.print(end)
+            }
             Linking::Unknown { ty, range, .. } => {
                 write!(self.state, "unknown subsection: {ty}")?;
                 self.print(range.start)?;
@@ -743,7 +804,7 @@ impl<'a> Dump<'a> {
         &mut self,
         iter: SectionLimited<'b, T>,
         name: &str,
-        print: impl FnMut(&mut Self, usize, T) -> Result<()>,
+        print: impl FnMut(&mut Self, u64, T) -> Result<()>,
     ) -> Result<()>
     where
         T: FromReader<'b>,
@@ -756,7 +817,7 @@ impl<'a> Dump<'a> {
     fn print_iter<'b, T>(
         &mut self,
         iter: SectionLimited<'b, T>,
-        mut print: impl FnMut(&mut Self, usize, T) -> Result<()>,
+        mut print: impl FnMut(&mut Self, u64, T) -> Result<()>,
     ) -> Result<()>
     where
         T: FromReader<'b>,
@@ -781,15 +842,15 @@ impl<'a> Dump<'a> {
         Ok(())
     }
 
-    fn color_print(&mut self, end: usize) -> Result<()> {
+    fn color_print(&mut self, end: u64) -> Result<()> {
         self.print_(end, true)
     }
 
-    fn print(&mut self, end: usize) -> Result<()> {
+    fn print(&mut self, end: u64) -> Result<()> {
         self.print_(end, false)
     }
 
-    fn print_(&mut self, end: usize, color: bool) -> Result<()> {
+    fn print_(&mut self, end: u64, color: bool) -> Result<()> {
         assert!(
             self.cur < end,
             "{:#x} >= {:#x}\ntrying to print: {}",
@@ -797,7 +858,8 @@ impl<'a> Dump<'a> {
             end,
             self.state,
         );
-        let bytes = &self.bytes[self.cur..end];
+        let range = self.cur as usize..end as usize;
+        let bytes = &self.bytes[range];
         self.print_byte_header()?;
         for (i, chunk) in bytes.chunks(NBYTES).enumerate() {
             if i > 0 {

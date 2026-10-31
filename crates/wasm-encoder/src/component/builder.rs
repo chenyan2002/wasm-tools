@@ -327,14 +327,19 @@ impl ComponentBuilder {
     }
 
     /// Imports a new item into this component with the `name` and `ty` specified.
-    pub fn import(&mut self, name: &str, ty: ComponentTypeRef) -> u32 {
+    pub fn import<'a>(
+        &mut self,
+        name: impl Into<ComponentExternName<'a>>,
+        ty: ComponentTypeRef,
+    ) -> u32 {
+        let name = name.into();
         let ret = match &ty {
-            ComponentTypeRef::Instance(_) => self.instances.add(Some(name)),
-            ComponentTypeRef::Func(_) => self.funcs.add(Some(name)),
-            ComponentTypeRef::Type(..) => self.types.add(Some(name)),
-            ComponentTypeRef::Component(_) => self.components.add(Some(name)),
-            ComponentTypeRef::Module(_) => self.core_modules.add(Some(name)),
-            ComponentTypeRef::Value(_) => self.values.add(Some(name)),
+            ComponentTypeRef::Instance(_) => self.instances.add(Some(&name.name)),
+            ComponentTypeRef::Func(_) => self.funcs.add(Some(&name.name)),
+            ComponentTypeRef::Type(..) => self.types.add(Some(&name.name)),
+            ComponentTypeRef::Component(_) => self.components.add(Some(&name.name)),
+            ComponentTypeRef::Module(_) => self.core_modules.add(Some(&name.name)),
+            ComponentTypeRef::Value(_) => self.values.add(Some(&name.name)),
         };
         self.imports().import(name, ty);
         ret
@@ -345,15 +350,16 @@ impl ComponentBuilder {
     ///
     /// The `idx` is the item to export and the `ty` is an optional type to
     /// ascribe to the export.
-    pub fn export(
+    pub fn export<'a>(
         &mut self,
-        name: &str,
+        name: impl Into<ComponentExternName<'a>>,
         kind: ComponentExportKind,
         idx: u32,
         ty: Option<ComponentTypeRef>,
     ) -> u32 {
-        self.exports().export(name, kind, idx, ty);
-        self.inc_kind(Some(name), kind)
+        let name = name.into();
+        self.exports().export(name.clone(), kind, idx, ty);
+        self.inc_kind(Some(&name.name), kind)
     }
 
     /// Creates a new encoder for the next core type in this component.
@@ -442,16 +448,57 @@ impl ComponentBuilder {
         self.instances.add(debug_name)
     }
 
+    /// Emits a component start section, invoking `function_index`
+    /// at instantiation time with `args` (each an index into the
+    /// component value index space) and producing `results` new
+    /// values.
+    ///
+    /// Returns the index of the FIRST produced value in the
+    /// component value index space (subsequent produced values
+    /// occupy `first+1`, `first+2`, …, `first+results-1`). If
+    /// `results == 0` the return value is still the current
+    /// value-index cursor but no new values are added; callers
+    /// typically ignore it in that case.
+    ///
+    /// The Component Model spec permits at most one start section
+    /// per component. This helper does NOT enforce that; passing
+    /// the responsibility to the caller matches how the underlying
+    /// `ComponentStartSection` encoder behaves.
+    pub fn start(&mut self, function_index: u32, args: Vec<u32>, results: u32) -> u32 {
+        // Component start is a singleton section rather than an
+        // aggregating one, so we don't route it through the
+        // section-accessor macro. Flush any last section first so
+        // section ordering stays coherent.
+        self.flush();
+        self.component.section(&ComponentStartSection {
+            function_index,
+            args,
+            results,
+        });
+        let base = self.values.count;
+        for _ in 0..results {
+            self.values.add(None);
+        }
+        base
+    }
+
+    /// Creates a new component instance from the `exports` provided.
+    ///
+    /// Returns the index of the component instance created.
+    pub fn instantiate_exports<'a, E, N>(&mut self, debug_name: Option<&str>, exports: E) -> u32
+    where
+        E: IntoIterator<Item = (N, ComponentExportKind, u32)>,
+        E::IntoIter: ExactSizeIterator,
+        N: Into<ComponentExternName<'a>>,
+    {
+        self.component_instances().export_items(exports);
+        self.instances.add(debug_name)
+    }
+
     /// Declares a new `resource.drop` intrinsic.
     pub fn resource_drop(&mut self, ty: u32) -> u32 {
         self.canonical_functions().resource_drop(ty);
         self.core_funcs.add(Some("resource.drop"))
-    }
-
-    /// Declares a new `resource.drop` intrinsic.
-    pub fn resource_drop_async(&mut self, ty: u32) -> u32 {
-        self.canonical_functions().resource_drop_async(ty);
-        self.core_funcs.add(Some("resource.drop async"))
     }
 
     /// Declares a new `resource.new` intrinsic.
@@ -476,12 +523,6 @@ impl ComponentBuilder {
     pub fn thread_available_parallelism(&mut self) -> u32 {
         self.canonical_functions().thread_available_parallelism();
         self.core_funcs.add(Some("thread.available-parallelism"))
-    }
-
-    /// Declares a new `backpressure.set` intrinsic.
-    pub fn backpressure_set(&mut self) -> u32 {
-        self.canonical_functions().backpressure_set();
-        self.core_funcs.add(Some("backpressure.set"))
     }
 
     /// Declares a new `backpressure.inc` intrinsic.
@@ -513,21 +554,15 @@ impl ComponentBuilder {
     }
 
     /// Declares a new `context.get` intrinsic.
-    pub fn context_get(&mut self, i: u32) -> u32 {
-        self.canonical_functions().context_get(i);
+    pub fn context_get(&mut self, ty: ValType, i: u32) -> u32 {
+        self.canonical_functions().context_get(ty, i);
         self.core_funcs.add(Some(&format!("context.get {i}")))
     }
 
     /// Declares a new `context.set` intrinsic.
-    pub fn context_set(&mut self, i: u32) -> u32 {
-        self.canonical_functions().context_set(i);
+    pub fn context_set(&mut self, ty: ValType, i: u32) -> u32 {
+        self.canonical_functions().context_set(ty, i);
         self.core_funcs.add(Some(&format!("context.set {i}")))
-    }
-
-    /// Declares a new `thread.yield` intrinsic.
-    pub fn thread_yield(&mut self, cancellable: bool) -> u32 {
-        self.canonical_functions().thread_yield(cancellable);
-        self.core_funcs.add(Some("thread.yield"))
     }
 
     /// Declares a new `subtask.drop` intrinsic.
@@ -566,6 +601,12 @@ impl ComponentBuilder {
     {
         self.canonical_functions().stream_write(ty, options);
         self.core_funcs.add(Some("stream.write"))
+    }
+
+    /// Declares a new `stream.forward` intrinsic.
+    pub fn stream_forward(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().stream_forward(ty);
+        self.core_funcs.add(Some("stream.forward"))
     }
 
     /// Declares a new `stream.cancel-read` intrinsic.
@@ -616,6 +657,12 @@ impl ComponentBuilder {
     {
         self.canonical_functions().future_write(ty, options);
         self.core_funcs.add(Some("future.write"))
+    }
+
+    /// Declares a new `future.forward` intrinsic.
+    pub fn future_forward(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().future_forward(ty);
+        self.core_funcs.add(Some("future.forward"))
     }
 
     /// Declares a new `future.cancel-read` intrinsic.
@@ -676,16 +723,14 @@ impl ComponentBuilder {
     }
 
     /// Declares a new `waitable-set.wait` intrinsic.
-    pub fn waitable_set_wait(&mut self, cancellable: bool, memory: u32) -> u32 {
-        self.canonical_functions()
-            .waitable_set_wait(cancellable, memory);
+    pub fn waitable_set_wait(&mut self, memory: u32) -> u32 {
+        self.canonical_functions().waitable_set_wait(memory);
         self.core_funcs.add(Some("waitable-set.wait"))
     }
 
     /// Declares a new `waitable-set.poll` intrinsic.
-    pub fn waitable_set_poll(&mut self, cancellable: bool, memory: u32) -> u32 {
-        self.canonical_functions()
-            .waitable_set_poll(cancellable, memory);
+    pub fn waitable_set_poll(&mut self, memory: u32) -> u32 {
+        self.canonical_functions().waitable_set_poll(memory);
         self.core_funcs.add(Some("waitable-set.poll"))
     }
 
@@ -707,23 +752,11 @@ impl ComponentBuilder {
         self.core_funcs.add(Some("thread.index"))
     }
 
-    /// Declares a new `thread.new_indirect` intrinsic.
+    /// Declares a new `thread.new-indirect` intrinsic.
     pub fn thread_new_indirect(&mut self, func_ty_idx: u32, table_index: u32) -> u32 {
         self.canonical_functions()
             .thread_new_indirect(func_ty_idx, table_index);
         self.core_funcs.add(Some("thread.new-indirect"))
-    }
-
-    /// Declares a new `thread.switch-to` intrinsic.
-    pub fn thread_switch_to(&mut self, cancellable: bool) -> u32 {
-        self.canonical_functions().thread_switch_to(cancellable);
-        self.core_funcs.add(Some("thread.switch-to"))
-    }
-
-    /// Declares a new `thread.suspend` intrinsic.
-    pub fn thread_suspend(&mut self, cancellable: bool) -> u32 {
-        self.canonical_functions().thread_suspend(cancellable);
-        self.core_funcs.add(Some("thread.suspend"))
     }
 
     /// Declares a new `thread.resume-later` intrinsic.
@@ -732,10 +765,40 @@ impl ComponentBuilder {
         self.core_funcs.add(Some("thread.resume-later"))
     }
 
-    /// Declares a new `thread.yield-to` intrinsic.
-    pub fn thread_yield_to(&mut self, cancellable: bool) -> u32 {
-        self.canonical_functions().thread_yield_to(cancellable);
-        self.core_funcs.add(Some("thread.yield-to"))
+    /// Declares a new `thread.suspend` intrinsic.
+    pub fn thread_suspend(&mut self) -> u32 {
+        self.canonical_functions().thread_suspend();
+        self.core_funcs.add(Some("thread.suspend"))
+    }
+
+    /// Declares a new `thread.yield` intrinsic.
+    pub fn thread_yield(&mut self) -> u32 {
+        self.canonical_functions().thread_yield();
+        self.core_funcs.add(Some("thread.yield"))
+    }
+
+    /// Declares a new `thread.suspend-then-resume` intrinsic.
+    pub fn thread_suspend_then_resume(&mut self) -> u32 {
+        self.canonical_functions().thread_suspend_then_resume();
+        self.core_funcs.add(Some("thread.suspend-then-resume"))
+    }
+
+    /// Declares a new `thread.yield-then-resume` intrinsic.
+    pub fn thread_yield_then_resume(&mut self) -> u32 {
+        self.canonical_functions().thread_yield_then_resume();
+        self.core_funcs.add(Some("thread.yield-then-resume"))
+    }
+
+    /// Declares a new `thread.suspend-then-promote` intrinsic.
+    pub fn thread_suspend_then_promote(&mut self) -> u32 {
+        self.canonical_functions().thread_suspend_then_promote();
+        self.core_funcs.add(Some("thread.suspend-then-promote"))
+    }
+
+    /// Declares a new `thread.yield-then-promote` intrinsic.
+    pub fn thread_yield_then_promote(&mut self) -> u32 {
+        self.canonical_functions().thread_yield_then_promote();
+        self.core_funcs.add(Some("thread.yield-then-resume"))
     }
 
     /// Adds a new custom section to this component.

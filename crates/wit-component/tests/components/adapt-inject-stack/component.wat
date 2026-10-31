@@ -9,7 +9,7 @@
   (import "new" (instance $new (;0;) (type $ty-new)))
   (core module $main (;0;)
     (type (;0;) (func (result i32)))
-    (import "old" "get_sum" (func (;0;) (type 0)))
+    (import "old" "get_sum" (func (;0;) (type 0) (result i32)))
     (memory (;0;) 1)
     (export "memory" (memory 0))
     (@producers
@@ -23,7 +23,7 @@
     (type (;2;) (func (param i32 i32 i32 i32) (result i32)))
     (type (;3;) (func))
     (import "env" "memory" (memory (;0;) 0))
-    (import "new" "get-two" (func $get_two (;0;) (type 0)))
+    (import "new" "get-two" (func $get_two (;0;) (type 0) (param i32)))
     (global $__stack_pointer (;0;) (mut i32) i32.const 0)
     (global $some_other_mutable_global (;1;) (mut i32) i32.const 0)
     (export "get_sum" (func 1))
@@ -48,7 +48,7 @@
       local.get 0
       global.set $__stack_pointer
     )
-    (func $realloc_via_memory_grow (;2;) (type 2) (param i32 i32 i32 i32) (result i32)
+    (func (;2;) (type 2) (param i32 i32 i32 i32) (result i32)
       (local i32)
       i32.const 0
       local.get 0
@@ -85,7 +85,7 @@
       i32.const 0
       i32.const 8
       i32.const 65536
-      call $realloc_via_memory_grow
+      call 2
       i32.const 65536
       i32.add
       global.set $__stack_pointer
@@ -107,17 +107,6 @@
       i32.const 1
       call_indirect (type 1)
     )
-    (@producers
-      (processed-by "wit-component" "$CARGO_PKG_VERSION")
-    )
-  )
-  (core module $wit-component-fixup (;3;)
-    (type (;0;) (func (result i32)))
-    (type (;1;) (func (param i32)))
-    (import "" "0" (func (;0;) (type 0)))
-    (import "" "1" (func (;1;) (type 1)))
-    (import "" "$imports" (table (;0;) 2 2 funcref))
-    (elem (;0;) (i32.const 0) func 0 1)
     (@producers
       (processed-by "wit-component" "$CARGO_PKG_VERSION")
     )
@@ -144,17 +133,27 @@
       (with "new" (instance $new))
     )
   )
-  (alias core export $wit-component-shim-instance "$imports" (core table $"shim table" (;0;)))
+  (core module $wit-component-fixup (;3;)
+    (type (;0;) (func (result i32)))
+    (type (;1;) (func (param i32)))
+    (import "actual" "0" (func $0 (;0;) (type 0) (result i32)))
+    (import "actual" "1" (func $1 (;1;) (type 1) (param i32)))
+    (import "shim" "$imports" (table (;0;) 2 2 funcref))
+    (elem (;0;) (i32.const 0) func $0 $1)
+    (@producers
+      (processed-by "wit-component" "$CARGO_PKG_VERSION")
+    )
+  )
   (alias core export $"#core-instance5 old" "get_sum" (core func $get_sum (;2;)))
   (alias export $new "get-two" (func $get-two (;0;)))
   (core func $"#core-func3 indirect-new-get-two" (@name "indirect-new-get-two") (;3;) (canon lower (func $get-two) (memory $memory)))
-  (core instance $fixup-args (;6;)
-    (export "$imports" (table $"shim table"))
+  (core instance $actual (;6;)
     (export "0" (func $get_sum))
     (export "1" (func $"#core-func3 indirect-new-get-two"))
   )
   (core instance $fixup (;7;) (instantiate $wit-component-fixup
-      (with "" (instance $fixup-args))
+      (with "actual" (instance $actual))
+      (with "shim" (instance $wit-component-shim-instance))
     )
   )
   (@producers

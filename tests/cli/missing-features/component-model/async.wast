@@ -21,25 +21,13 @@
     (import "foo" (func $foo (param "p1" u32) (result u32)))
     (core module $libc (memory (export "memory") 1))
     (core instance $libc (instantiate $libc))
-    (core func $foo (canon lower (func $foo) async (memory $libc "memory")))
+    (core func $foo (canon lower (func $foo) async (memory (core memory $libc "memory"))))
     (core module $m
       (func (import "" "foo") (param i32 i32) (result i32))
     )
     (core instance $i (instantiate $m (with "" (instance (export "foo" (func $foo))))))
   )
   "canonical option `async` requires the component model async feature"
-)
-
-;; backpressure.set
-(assert_invalid
-  (component
-    (core module $m
-      (import "" "backpressure.set" (func $backpressure-set (param i32)))
-    )
-    (core func $backpressure.set (canon backpressure.set))
-    (core instance $i (instantiate $m (with "" (instance (export "backpressure.set" (func $backpressure.set))))))
-  )
-  "`backpressure.set` requires the component model async feature"
 )
 
 ;; backpressure.inc
@@ -104,7 +92,7 @@
     (core module $m
       (import "" "waitable-set.wait" (func $waitable-set-wait (param i32) (result i32)))
     )
-    (core func $waitable-set-wait (canon waitable-set.wait (memory $libc "memory")))
+    (core func $waitable-set-wait (canon waitable-set.wait (memory (core memory $libc "memory"))))
     (core instance $i (instantiate $m (with "" (instance (export "waitable-set.wait" (func $waitable-set-wait))))))
   )
   "`waitable-set.wait` requires the component model async feature"
@@ -118,7 +106,7 @@
     (core module $m
       (import "" "waitable-set.poll" (func $waitable-set-poll (param i32) (result i32)))
     )
-    (core func $waitable-set-poll (canon waitable-set.poll (memory $libc "memory")))
+    (core func $waitable-set-poll (canon waitable-set.poll (memory (core memory $libc "memory"))))
     (core instance $i (instantiate $m (with "" (instance (export "waitable-set.poll" (func $waitable-set-poll))))))
   )
   "`waitable-set.poll` requires the component model async feature"
@@ -182,7 +170,7 @@
       (import "" "stream.read" (func $stream-read (param i32 i32 i32) (result i32)))
     )
     (type $stream-type (stream u8))
-    (core func $stream-read (canon stream.read $stream-type async (memory $libc "memory")))
+    (core func $stream-read (canon stream.read $stream-type async (memory (core memory $libc "memory"))))
     (core instance $i (instantiate $m (with "" (instance (export "stream.read" (func $stream-read))))))
   )
   "requires the component model async feature"
@@ -197,7 +185,7 @@
       (import "" "stream.write" (func $stream-write (param i32 i32 i32) (result i32)))
     )
     (type $stream-type (stream u8))
-    (core func $stream-write (canon stream.write $stream-type async (memory $libc "memory")))
+    (core func $stream-write (canon stream.write $stream-type async (memory (core memory $libc "memory"))))
     (core instance $i (instantiate $m (with "" (instance (export "stream.write" (func $stream-write))))))
   )
   "requires the component model async feature"
@@ -277,7 +265,7 @@
       (import "" "future.read" (func $future-read (param i32 i32) (result i32)))
     )
     (type $future-type (future u8))
-    (core func $future-read (canon future.read $future-type async (memory $libc "memory")))
+    (core func $future-read (canon future.read $future-type async (memory (core memory $libc "memory"))))
     (core instance $i (instantiate $m (with "" (instance (export "future.read" (func $future-read))))))
   )
   "requires the component model async feature"
@@ -292,7 +280,7 @@
       (import "" "future.write" (func $future-write (param i32 i32) (result i32)))
     )
     (type $future-type (future u8))
-    (core func $future-write (canon future.write $future-type async (memory $libc "memory")))
+    (core func $future-write (canon future.write $future-type async (memory (core memory $libc "memory"))))
     (core instance $i (instantiate $m (with "" (instance (export "future.write" (func $future-write))))))
   )
   "requires the component model async feature"
@@ -359,25 +347,9 @@
   (component (type (stream)))
   "requires the component model async feature"
 )
-(assert_invalid
-  (component
-    (type $t (resource (rep i32)))
-    (core func $f (canon resource.drop $t async))
-  )
-  "requires the component model async builtins feature"
-)
 
+;; async function types
 (assert_invalid
-  (component (import "[async]f" (func)))
-  "require the component model async feature"
-)
-
-(assert_invalid
-  (component (import "[async method]a.b" (func)))
-  "require the component model async feature"
-)
-
-(assert_invalid
-  (component (import "[async static]a.b" (func)))
-  "require the component model async feature"
+  (component (import "x" (func async)))
+  "async component functions require the component model async feature"
 )

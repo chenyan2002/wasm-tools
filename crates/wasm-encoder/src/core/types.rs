@@ -9,7 +9,7 @@ pub struct SubType {
     pub is_final: bool,
     /// The list of supertype indexes. As of GC MVP, there can be at most one
     /// supertype.
-    pub supertype_idx: Option<u32>,
+    pub supertype_idxs: Vec<u32>,
     /// The composite type of the subtype.
     pub composite_type: CompositeType,
 }
@@ -22,6 +22,10 @@ pub struct CompositeType {
     /// Whether the type is shared. This is part of the
     /// shared-everything-threads proposal.
     pub shared: bool,
+    /// Optional descriptor attribute.
+    pub descriptor: Option<u32>,
+    /// Optional describes attribute.
+    pub describes: Option<u32>,
 }
 
 /// A [`CompositeType`] can contain one of these types.
@@ -362,6 +366,8 @@ pub enum HeapType {
 
     /// A concrete Wasm-defined type at the given index.
     Concrete(u32),
+    /// An exact type.
+    Exact(u32),
 }
 
 impl HeapType {
@@ -402,6 +408,11 @@ impl Encode for HeapType {
             // Note that this is encoded as a signed type rather than unsigned
             // as it's decoded as an s33
             HeapType::Concrete(i) => i64::from(*i).encode(sink),
+            // Exact type is u32
+            HeapType::Exact(i) => {
+                sink.push(0x62);
+                u32::from(*i).encode(sink)
+            }
         }
     }
 }
@@ -655,7 +666,7 @@ impl<'a> CoreTypeEncoder<'a> {
         // We only need to emit a prefix byte before the actual composite type
         // when either the `sub` type is not final or it has a declared super
         // type (see notes on `push_prefix_if_component_core_type`).
-        if ty.supertype_idx.is_some() || !ty.is_final {
+        if !ty.supertype_idxs.is_empty() || !ty.is_final {
             if ty.is_final {
                 self.bytes.push(0x4f);
             } else {
@@ -664,10 +675,18 @@ impl<'a> CoreTypeEncoder<'a> {
                 }
                 self.bytes.push(0x50);
             }
-            ty.supertype_idx.encode(self.bytes);
+            ty.supertype_idxs.encode(self.bytes);
         }
         if ty.composite_type.shared {
             self.bytes.push(0x65);
+        }
+        if let Some(index) = ty.composite_type.describes {
+            self.bytes.push(0x4c);
+            index.encode(self.bytes);
+        }
+        if let Some(index) = ty.composite_type.descriptor {
+            self.bytes.push(0x4d);
+            index.encode(self.bytes);
         }
         match &ty.composite_type.inner {
             CompositeInnerType::Func(ty) => {
@@ -711,10 +730,12 @@ mod tests {
         let mut types = TypeSection::new();
         types.ty().subtype(&SubType {
             is_final: true,
-            supertype_idx: None,
+            supertype_idxs: Vec::new(),
             composite_type: CompositeType {
                 inner: CompositeInnerType::Func(FuncType::new([], [])),
                 shared: false,
+                descriptor: None,
+                describes: None,
             },
         });
 

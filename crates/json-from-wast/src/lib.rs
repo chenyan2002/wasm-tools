@@ -45,6 +45,7 @@ impl<'a> Wast<'a> {
 #[derive(Default)]
 pub struct Opts {
     dwarf: bool,
+    module_filename: Option<String>,
 }
 
 impl Opts {
@@ -52,6 +53,15 @@ impl Opts {
     /// modules.
     pub fn dwarf(&mut self, enable: bool) -> &mut Self {
         self.dwarf = enable;
+        self
+    }
+
+    /// Sets the stem used to name the emitted `*.wasm` and `*.wat` files. The
+    /// value is used verbatim and keeps any extension.
+    ///
+    /// Defaults to the stem of the source `*.wast` filename.
+    pub fn module_filename(&mut self, name: impl Into<String>) -> &mut Self {
+        self.module_filename = Some(name.into());
         self
     }
 
@@ -97,7 +107,21 @@ pub enum Command<'a> {
         #[serde(borrow)]
         text: Cow<'a, str>,
     },
+    AssertMalformedCustom {
+        line: u32,
+        #[serde(borrow, flatten)]
+        file: WasmFile<'a>,
+        #[serde(borrow)]
+        text: Cow<'a, str>,
+    },
     AssertInvalid {
+        line: u32,
+        #[serde(borrow, flatten)]
+        file: WasmFile<'a>,
+        #[serde(borrow)]
+        text: Cow<'a, str>,
+    },
+    AssertInvalidCustom {
         line: u32,
         #[serde(borrow, flatten)]
         file: WasmFile<'a>,
@@ -197,7 +221,9 @@ impl Command<'_> {
             | ModuleDefinition { line, .. }
             | ModuleInstance { line, .. }
             | AssertMalformed { line, .. }
+            | AssertMalformedCustom { line, .. }
             | AssertInvalid { line, .. }
+            | AssertInvalidCustom { line, .. }
             | Register { line, .. }
             | AssertUnlinkable { line, .. }
             | AssertUninstantiable { line, .. }
@@ -560,7 +586,7 @@ where
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", content = "value", rename_all = "lowercase")]
 pub enum ComponentConst<'a> {
     #[serde(borrow)]
     String(Cow<'a, str>),
@@ -578,6 +604,10 @@ pub enum ComponentConst<'a> {
     F64(IntString<u64>),
     #[serde(borrow)]
     List(Vec<ComponentConst<'a>>),
+    /// A `map<K, V>` value as an ordered list of `[key, value]` entries,
+    /// possibly with duplicate keys.
+    #[serde(borrow)]
+    Map(Vec<(ComponentConst<'a>, ComponentConst<'a>)>),
     #[serde(borrow)]
     Record(Vec<(Cow<'a, str>, ComponentConst<'a>)>),
     #[serde(borrow)]

@@ -1,0 +1,176 @@
+;; RUN: wast --assert default --snapshot tests/snapshots % -f cm-async
+
+;; async lift; no callback; with post-return
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "foo") (param i32) unreachable)
+      (func (export "post-return-foo") unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (export "foo") (param "p1" u32) (result u32)
+      (canon lift (core func $i "foo") async (post-return (core func $i "post-return-foo")))
+    )
+  )
+  "cannot specify post-return function in async"
+)
+
+;; async lift; with callback
+(component
+  (core module $m
+    (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+    (func (export "foo") (param i32) (result i32) unreachable)
+  )
+  (core instance $i (instantiate $m))
+
+  (func (export "foo") async (param "p1" u32) (result u32)
+    (canon lift (core func $i "foo") async (callback (core func $i "callback")))
+  )
+)
+
+;; async lift; with incorrectly-typed callback
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "callback") (param i32 f32 i32) (result i32) unreachable)
+      (func (export "foo") (param i32) (result i32) unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (export "foo") (param "p1" u32) (result u32)
+      (canon lift (core func $i "foo") async (callback (core func $i "callback")))
+    )
+  )
+  "canonical option `callback` uses a core function with an incorrect signature"
+)
+
+;; async lift; with even more incorrectly-typed callback
+;;
+;; See
+;; https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-32h6-97mm-8q3c
+;; for further details.
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "run") (result i32) unreachable)
+      (func (export "cb") (param i32 i32 i32)
+        (result i64 i64 i64 i64 i64 i64 i64 i64
+                i64 i64 i64 i64 i64 i64 i64 i64)
+        unreachable))
+    (core instance $i (instantiate $m))
+    (func (export "run") async
+      (canon lift (core func $i "run") async (callback (core func $i "cb"))))
+  )
+  "canonical option `callback` uses a core function with an incorrect signature"
+)
+
+;; async lift; with callback and post-return
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+      (func (export "foo") (param i32) (result i32) unreachable)
+      (func (export "post-return-foo") (param i32) unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (export "foo") (param "p1" u32) (result u32)
+      (canon lift (core func $i "foo") async (callback (core func $i "callback")) (post-return (core func $i "post-return-foo")))
+    )
+  )
+  "cannot specify post-return function in async"
+)
+
+;; async lift; with incorrectly-typed core function
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+      (func (export "foo") (param i32 i32) (result i32) unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (export "foo") async (param "p1" u32) (result u32)
+      (canon lift (core func $i "foo") async (callback (core func $i "callback")))
+    )
+  )
+  "lowered parameter types `[I32]` do not match parameter types `[I32, I32]` of core function 0"
+)
+
+;; async lift; with missing callback
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "foo") (param i32) (result i32) unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (export "foo") (param "p1" u32) (result u32)
+      (canon lift (core func $i "foo") async (callback (core func $i "callback")))
+    )
+  )
+  "core instance 0 has no export named `callback`"
+)
+
+;; sync lift; with redundant callback
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+      (func (export "foo") (param i32) (result i32) unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (export "foo") (param "p1" u32) (result u32)
+      (canon lift (core func $i "foo") (callback (core func $i "callback")))
+    )
+  )
+  "cannot specify callback without async"
+)
+
+;; async lift; missing memory (needed for string return value)
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+      (func (export "foo") (result i32) unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (export "foo") async (result string)
+      (canon lift (core func $i "foo") async (callback (core func $i "callback")))
+    )
+  )
+  "canonical option `memory` is required"
+)
+
+;; async lift; missing memory (needed for return value exceeding MAX_FLAT_PARAMS)
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+      (func (export "foo") (result i32) unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (export "foo") async (result (tuple u32 u32 u32 u32 u32 u32 u32 u32 u32 u32 u32 u32 u32 u32 u32 u32 u32))
+      (canon lift (core func $i "foo") async (callback (core func $i "callback")))
+    )
+  )
+  "canonical option `memory` is required"
+)
+
+;; `async` option requires as `async` function type
+(assert_invalid
+  (component
+    (core module $m
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+      (func (export "foo") (result i32) unreachable)
+    )
+    (core instance $i (instantiate $m))
+
+    (func (canon lift (core func $i "foo") async (callback (core func $i "callback"))))
+  )
+  "the `async` canonical option requires an async function type"
+)

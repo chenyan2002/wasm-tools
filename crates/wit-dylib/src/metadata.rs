@@ -1,12 +1,14 @@
 use indexmap::IndexMap;
 use std::mem;
 use wasm_encoder::{Function, MemArg};
+use wit_parser::TypeId;
 
-const VERSION: u32 = 0;
+const VERSION: u32 = 3;
 
 #[derive(Default)]
 pub struct Metadata {
-    pub funcs: Vec<Func>,
+    pub import_funcs: Vec<ImportFunc>,
+    pub export_funcs: Vec<ExportFunc>,
     pub resources: Vec<Resource>,
     pub records: Vec<Record>,
     pub flags: Vec<Flags>,
@@ -16,21 +18,34 @@ pub struct Metadata {
     pub options: Vec<WitOption>,
     pub results: Vec<WitResult>,
     pub lists: Vec<List>,
-    pub fixed_size_lists: Vec<FixedSizeList>,
+    pub maps: Vec<Map>,
+    pub fixed_length_lists: Vec<FixedLengthList>,
     pub futures: Vec<Future>,
     pub streams: Vec<Stream>,
     pub aliases: Vec<Alias>,
 }
 
-pub struct Func {
+pub struct ImportFunc {
     pub interface: Option<String>,
     pub name: String,
-    pub elem_index: Option<u32>,
+    pub sync_import_elem_index: Option<u32>,
+    pub async_import_elem_index: Option<u32>,
+    pub async_import_lift_results_elem_index: Option<u32>,
+    pub args: Vec<Type>,
+    pub result: Option<Type>,
+    pub async_abi_area: Option<(usize, usize)>,
+}
+
+pub struct ExportFunc {
+    pub interface: Option<String>,
+    pub name: String,
+    pub async_export_task_return_elem_index: Option<u32>,
     pub args: Vec<Type>,
     pub result: Option<Type>,
 }
 
 pub struct Resource {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: String,
     pub drop_elem_index: u32,
@@ -39,42 +54,49 @@ pub struct Resource {
 }
 
 pub struct Record {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: String,
     pub fields: Vec<(String, Type)>,
 }
 
 pub struct Flags {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: String,
     pub names: Vec<String>,
 }
 
 pub struct Tuple {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: Option<String>,
     pub types: Vec<Type>,
 }
 
 pub struct Variant {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: String,
     pub cases: Vec<(String, Option<Type>)>,
 }
 
 pub struct Enum {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: String,
     pub names: Vec<String>,
 }
 
 pub struct WitOption {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: Option<String>,
     pub ty: Type,
 }
 
 pub struct WitResult {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: Option<String>,
     pub ok: Option<Type>,
@@ -82,31 +104,66 @@ pub struct WitResult {
 }
 
 pub struct List {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: Option<String>,
     pub ty: Type,
 }
 
-pub struct FixedSizeList {
+pub struct FixedLengthList {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: Option<String>,
     pub len: u32,
     pub ty: Type,
 }
 
+pub struct Map {
+    pub id: TypeId,
+    pub interface: Option<String>,
+    pub name: Option<String>,
+    pub key_type: Type,
+    pub value_type: Type,
+}
+
 pub struct Future {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: Option<String>,
     pub ty: Option<Type>,
+    pub new_elem_index: u32,
+    pub read_elem_index: u32,
+    pub write_elem_index: u32,
+    pub cancel_read_elem_index: u32,
+    pub cancel_write_elem_index: u32,
+    pub drop_readable_elem_index: u32,
+    pub drop_writable_elem_index: u32,
+    pub lift_elem_index: Option<u32>,
+    pub lower_elem_index: Option<u32>,
+    pub abi_payload_size: usize,
+    pub abi_payload_align: usize,
 }
 
 pub struct Stream {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: Option<String>,
     pub ty: Option<Type>,
+    pub new_elem_index: u32,
+    pub read_elem_index: u32,
+    pub write_elem_index: u32,
+    pub cancel_read_elem_index: u32,
+    pub cancel_write_elem_index: u32,
+    pub drop_readable_elem_index: u32,
+    pub drop_writable_elem_index: u32,
+    pub lift_elem_index: Option<u32>,
+    pub lower_elem_index: Option<u32>,
+    pub abi_payload_size: usize,
+    pub abi_payload_align: usize,
 }
 
 pub struct Alias {
+    pub id: TypeId,
     pub interface: Option<String>,
     pub name: String,
     pub ty: Type,
@@ -138,7 +195,8 @@ pub enum Type {
     Option(usize),
     Result(usize),
     List(usize),
-    FixedSizeList(usize),
+    FixedLengthList(usize),
+    Map(usize),
     Future(usize),
     Stream(usize),
     Alias(usize),
@@ -183,7 +241,8 @@ impl Metadata {
             symbol_offsets: Vec::new(),
         };
 
-        let funcs = encoder.encode_list(&self.funcs, Encoder::encode_funcs);
+        let import_funcs = encoder.encode_list(&self.import_funcs, Encoder::encode_import_funcs);
+        let export_funcs = encoder.encode_list(&self.export_funcs, Encoder::encode_export_funcs);
         let resources = encoder.encode_list(&self.resources, Encoder::encode_resources);
         let records = encoder.encode_list(&self.records, Encoder::encode_records);
         let flags = encoder.encode_list(&self.flags, Encoder::encode_flags);
@@ -193,8 +252,9 @@ impl Metadata {
         let options = encoder.encode_list(&self.options, Encoder::encode_options);
         let results = encoder.encode_list(&self.results, Encoder::encode_results);
         let lists = encoder.encode_list(&self.lists, Encoder::encode_lists);
-        let fixed_size_lists =
-            encoder.encode_list(&self.fixed_size_lists, Encoder::encode_fixed_size_lists);
+        let maps = encoder.encode_list(&self.maps, Encoder::encode_maps);
+        let fixed_length_lists =
+            encoder.encode_list(&self.fixed_length_lists, Encoder::encode_fixed_length_lists);
         let futures = encoder.encode_list(&self.futures, Encoder::encode_futures);
         let streams = encoder.encode_list(&self.streams, Encoder::encode_streams);
         let aliases = encoder.encode_list(&self.aliases, Encoder::encode_aliases);
@@ -203,7 +263,8 @@ impl Metadata {
         encoder.bind(sym_metadata);
         encoder.put_u32(VERSION);
         for (sym, len) in [
-            funcs,
+            import_funcs,
+            export_funcs,
             resources,
             records,
             flags,
@@ -213,7 +274,8 @@ impl Metadata {
             options,
             results,
             lists,
-            fixed_size_lists,
+            maps,
+            fixed_length_lists,
             futures,
             streams,
             aliases,
@@ -249,19 +311,59 @@ impl Encoder {
         (ret, list.len())
     }
 
-    fn encode_funcs(&mut self, funcs: &[Func]) {
+    fn encode_import_funcs(&mut self, funcs: &[ImportFunc]) {
         let mut deferred_args = Vec::new();
         for func in funcs {
-            let Func {
+            let ImportFunc {
                 interface,
                 name,
-                elem_index,
+                sync_import_elem_index,
+                async_import_elem_index,
+                async_import_lift_results_elem_index,
+                args,
+                result,
+                async_abi_area,
+            } = func;
+            self.opt_string_ptr(interface.as_deref());
+            self.string_ptr(name);
+            self.opt_elem_index(*sync_import_elem_index);
+            self.opt_elem_index(*async_import_elem_index);
+            self.opt_elem_index(*async_import_lift_results_elem_index);
+            self.list(args, &mut deferred_args);
+            self.opt_ty(result.as_ref());
+            match async_abi_area {
+                Some((size, align)) => {
+                    self.put_usize(*size);
+                    self.put_usize(*align);
+                }
+                None => {
+                    self.put_usize(0);
+                    self.put_usize(0);
+                }
+            }
+        }
+
+        for (sym, args) in deferred_args {
+            self.bind(sym);
+            for arg in args {
+                self.ty(arg);
+            }
+        }
+    }
+
+    fn encode_export_funcs(&mut self, funcs: &[ExportFunc]) {
+        let mut deferred_args = Vec::new();
+        for func in funcs {
+            let ExportFunc {
+                interface,
+                name,
+                async_export_task_return_elem_index,
                 args,
                 result,
             } = func;
             self.opt_string_ptr(interface.as_deref());
             self.string_ptr(name);
-            self.opt_elem_index(*elem_index);
+            self.opt_elem_index(*async_export_task_return_elem_index);
             self.list(args, &mut deferred_args);
             self.opt_ty(result.as_ref());
         }
@@ -277,6 +379,7 @@ impl Encoder {
     fn encode_resources(&mut self, resources: &[Resource]) {
         for resource in resources {
             let Resource {
+                id: _,
                 interface,
                 name,
                 drop_elem_index,
@@ -295,6 +398,7 @@ impl Encoder {
         let mut deferred_fields = Vec::new();
         for record in records {
             let Record {
+                id: _,
                 interface,
                 name,
                 fields,
@@ -317,6 +421,7 @@ impl Encoder {
         let mut deferred = Vec::new();
         for flags in flags {
             let Flags {
+                id: _,
                 interface,
                 name,
                 names,
@@ -338,6 +443,7 @@ impl Encoder {
         let mut deferred = Vec::new();
         for tuple in tuples {
             let Tuple {
+                id: _,
                 interface,
                 name,
                 types,
@@ -359,6 +465,7 @@ impl Encoder {
         let mut deferred = Vec::new();
         for variant in variants {
             let Variant {
+                id: _,
                 interface,
                 name,
                 cases,
@@ -381,6 +488,7 @@ impl Encoder {
         let mut deferred = Vec::new();
         for e in enums {
             let Enum {
+                id: _,
                 interface,
                 name,
                 names,
@@ -401,6 +509,7 @@ impl Encoder {
     fn encode_options(&mut self, options: &[WitOption]) {
         for option in options {
             let WitOption {
+                id: _,
                 interface,
                 name,
                 ty,
@@ -414,6 +523,7 @@ impl Encoder {
     fn encode_results(&mut self, results: &[WitResult]) {
         for result in results {
             let WitResult {
+                id: _,
                 interface,
                 name,
                 ok,
@@ -429,6 +539,7 @@ impl Encoder {
     fn encode_lists(&mut self, lists: &[List]) {
         for list in lists {
             let List {
+                id: _,
                 interface,
                 name,
                 ty,
@@ -439,9 +550,26 @@ impl Encoder {
         }
     }
 
-    fn encode_fixed_size_lists(&mut self, lists: &[FixedSizeList]) {
+    fn encode_maps(&mut self, maps: &[Map]) {
+        for map in maps {
+            let Map {
+                id: _,
+                interface,
+                name,
+                key_type,
+                value_type,
+            } = map;
+            self.opt_string_ptr(interface.as_deref());
+            self.opt_string_ptr(name.as_deref());
+            self.ty(key_type);
+            self.ty(value_type);
+        }
+    }
+
+    fn encode_fixed_length_lists(&mut self, lists: &[FixedLengthList]) {
         for list in lists {
-            let FixedSizeList {
+            let FixedLengthList {
+                id: _,
                 interface,
                 name,
                 len,
@@ -457,32 +585,79 @@ impl Encoder {
     fn encode_futures(&mut self, futures: &[Future]) {
         for future in futures {
             let Future {
+                id: _,
                 interface,
                 name,
                 ty,
+                new_elem_index,
+                read_elem_index,
+                write_elem_index,
+                cancel_read_elem_index,
+                cancel_write_elem_index,
+                drop_readable_elem_index,
+                drop_writable_elem_index,
+                lift_elem_index,
+                lower_elem_index,
+                abi_payload_size,
+                abi_payload_align,
             } = future;
             self.opt_string_ptr(interface.as_deref());
             self.opt_string_ptr(name.as_deref());
             self.opt_ty(ty.as_ref());
+            self.elem_index(*new_elem_index);
+            self.elem_index(*read_elem_index);
+            self.elem_index(*write_elem_index);
+            self.elem_index(*cancel_read_elem_index);
+            self.elem_index(*cancel_write_elem_index);
+            self.elem_index(*drop_readable_elem_index);
+            self.elem_index(*drop_writable_elem_index);
+            self.opt_elem_index(*lift_elem_index);
+            self.opt_elem_index(*lower_elem_index);
+            self.put_usize(*abi_payload_size);
+            self.put_usize(*abi_payload_align);
         }
     }
 
     fn encode_streams(&mut self, streams: &[Stream]) {
         for stream in streams {
             let Stream {
+                id: _,
                 interface,
                 name,
                 ty,
+                new_elem_index,
+                read_elem_index,
+                write_elem_index,
+                cancel_read_elem_index,
+                cancel_write_elem_index,
+                drop_readable_elem_index,
+                drop_writable_elem_index,
+                lift_elem_index,
+                lower_elem_index,
+                abi_payload_size,
+                abi_payload_align,
             } = stream;
             self.opt_string_ptr(interface.as_deref());
             self.opt_string_ptr(name.as_deref());
             self.opt_ty(ty.as_ref());
+            self.elem_index(*new_elem_index);
+            self.elem_index(*read_elem_index);
+            self.elem_index(*write_elem_index);
+            self.elem_index(*cancel_read_elem_index);
+            self.elem_index(*cancel_write_elem_index);
+            self.elem_index(*drop_readable_elem_index);
+            self.elem_index(*drop_writable_elem_index);
+            self.opt_elem_index(*lift_elem_index);
+            self.opt_elem_index(*lower_elem_index);
+            self.put_usize(*abi_payload_size);
+            self.put_usize(*abi_payload_align);
         }
     }
 
     fn encode_aliases(&mut self, aliases: &[Alias]) {
         for alias in aliases {
             let Alias {
+                id: _,
                 interface,
                 name,
                 ty,
@@ -611,10 +786,11 @@ impl Encoder {
             Type::Option(i) => index(21, i),
             Type::Result(i) => index(22, i),
             Type::List(i) => index(23, i),
-            Type::FixedSizeList(i) => index(24, i),
-            Type::Future(i) => index(25, i),
-            Type::Stream(i) => index(26, i),
-            Type::Alias(i) => index(27, i),
+            Type::Map(i) => index(24, i),
+            Type::FixedLengthList(i) => index(25, i),
+            Type::Future(i) => index(26, i),
+            Type::Stream(i) => index(27, i),
+            Type::Alias(i) => index(28, i),
         };
         self.put_u32(val);
     }
@@ -670,8 +846,9 @@ impl Encoder {
             }
             ins.i32_store(MemArg {
                 align: 2,
-                memory_index: 0,
+                target: Default::default(),
                 offset: u64::try_from(reloc.offset).unwrap(),
+                ordering: None,
             });
         }
         ins.end();

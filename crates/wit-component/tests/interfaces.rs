@@ -3,6 +3,7 @@ use libtest_mimic::{Arguments, Trial};
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::Path;
+use wasmparser::WasmFeatures;
 use wit_component::WitPrinter;
 use wit_parser::{PackageId, Resolve, UnresolvedPackageGroup};
 
@@ -58,10 +59,10 @@ fn run_test(path: &Path, is_dir: bool) -> Result<()> {
     // First convert the WIT package to a binary WebAssembly output, then
     // convert that binary wasm to textual wasm, then assert it matches the
     // expectation.
-    let wasm = wit_component::encode(&resolve, package)?;
+    let wasm = wit_component::encode(&resolve, package, true)?;
     let wat = wasmprinter::print_bytes(&wasm)?;
     assert_output(&path.with_extension("wat"), &wat)?;
-    wasmparser::Validator::new()
+    wasmparser::Validator::new_with_features(WasmFeatures::all())
         .validate_all(&wasm)
         .context("failed to validate wasm output")?;
 
@@ -73,10 +74,9 @@ fn run_test(path: &Path, is_dir: bool) -> Result<()> {
     let resolve = decoded.resolve();
 
     assert_print(resolve, decoded.package(), path, is_dir)?;
-
     // Finally convert the decoded package to wasm again and make sure it
     // matches the prior wasm.
-    let wasm2 = wit_component::encode(resolve, decoded_package)?;
+    let wasm2 = wit_component::encode(resolve, decoded_package, true)?;
     if wasm != wasm2 {
         let wat2 = wasmprinter::print_bytes(&wasm)?;
         assert_eq!(wat, wat2, "document did not roundtrip correctly");
@@ -97,7 +97,9 @@ fn assert_print(resolve: &Resolve, pkg_id: PackageId, path: &Path, is_dir: bool)
     };
     assert_output(&expected, &output)?;
 
-    UnresolvedPackageGroup::parse("foo.wit", &output).context("failed to parse printed output")?;
+    UnresolvedPackageGroup::parse("foo.wit", &output)
+        .map_err(|(map, e)| anyhow::anyhow!("{}", e.render(&map)))
+        .context("failed to parse printed output")?;
     Ok(())
 }
 
@@ -107,6 +109,11 @@ fn assert_output(expected: &Path, actual: &str) -> Result<()> {
         "\"$CARGO_PKG_VERSION\"",
     );
     if std::env::var_os("BLESS").is_some() {
+        if let Ok(prev) = fs::read_to_string(&expected)
+            && prev == actual
+        {
+            return Ok(());
+        }
         fs::write(expected, actual).with_context(|| format!("failed to write {expected:?}"))?;
     } else {
         assert_eq!(

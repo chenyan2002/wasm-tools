@@ -49,7 +49,7 @@ pub struct StackEntry {
     pub operator_idx: usize,
 }
 
-/// DFG structre for a piece of Wasm's function
+/// DFG structure for a piece of Wasm's function
 #[derive(Clone, Default)]
 pub struct MiniDFG {
     /// Some of the operators have no stack entry
@@ -68,7 +68,7 @@ pub struct MiniDFG {
 
 impl MiniDFG {
     /// Return true if the coloring of the children subtrees is the same as the root
-    /// Notice that this value can be calcuated when the tree is built
+    /// Notice that this value can be calculated when the tree is built
     pub fn is_subtree_consistent(&self, current: usize) -> bool {
         let entry = &self.entries[current];
         let mut colors = vec![];
@@ -91,7 +91,7 @@ impl MiniDFG {
     }
 
     /// Return true if the coloring of the children subtrees is the same as the root
-    /// Notice that this value can be calcuated when the tree is built
+    /// Notice that this value can be calculated when the tree is built
     pub fn is_subtree_consistent_from_root(&self) -> bool {
         let current = self.entries.len() - 1;
         self.is_subtree_consistent(current)
@@ -131,13 +131,13 @@ impl MiniDFG {
         fn write_child(
             minidfg: &MiniDFG,
             entryidx: usize,
-            preffix: &str,
+            prefix: &str,
             entryformatter: &dyn Fn(&StackEntry) -> String,
             childrenpreffix: &str,
             builder: &mut String,
         ) {
             let entry = &minidfg.entries[entryidx];
-            builder.push_str(preffix);
+            builder.push_str(prefix);
             let color = get_ansi_term_color(entry.color);
             builder.push_str(
                 format!(
@@ -153,23 +153,23 @@ impl MiniDFG {
             for (idx, op) in entry.operator.children().iter().enumerate() {
                 if idx < entry.operator.children().len() - 1 {
                     // Has no next child
-                    let preffix = format!("{}{}", childrenpreffix, "├──");
+                    let prefix = format!("{}{}", childrenpreffix, "├──");
                     let childrenpreffix = format!("{}{}", childrenpreffix, "│   ");
                     write_child(
                         minidfg,
                         usize::from(*op),
-                        &preffix,
+                        &prefix,
                         entryformatter,
                         &childrenpreffix,
                         builder,
                     );
                 } else {
-                    let preffix = format!("{}{}", childrenpreffix, "└──");
+                    let prefix = format!("{}{}", childrenpreffix, "└──");
                     let childrenpreffix = format!("{}{}", childrenpreffix, "    ");
                     write_child(
                         minidfg,
                         usize::from(*op),
-                        &preffix,
+                        &prefix,
                         entryformatter,
                         &childrenpreffix,
                         builder,
@@ -244,7 +244,7 @@ impl<'a> DFGBuilder {
                 | Operator::BrTable { .. } => {
                     if !found {
                         // If the insertion point is a jump
-                        // Break inmediatly
+                        // Break immediately
                         return None;
                     }
                     range.start += 1; // Do not include the last jmp
@@ -643,6 +643,7 @@ impl<'a> DFGBuilder {
                 Operator::MemoryGrow { mem } => {
                     let arg = self.pop_operand(idx, false);
                     self.push_node(Lang::MemoryGrow(*mem, Id::from(arg)), idx);
+                    self.new_color();
                 }
                 Operator::MemorySize { mem } => {
                     self.push_node(Lang::MemorySize(*mem), idx);
@@ -654,6 +655,7 @@ impl<'a> DFGBuilder {
                         Lang::TableGrow(*table, [Id::from(size), Id::from(elem)]),
                         idx,
                     );
+                    self.new_color();
                 }
                 Operator::TableSize { table } => {
                     self.push_node(Lang::TableSize(*table), idx);
@@ -1253,7 +1255,10 @@ impl From<&wasmparser::MemArg> for MemArg {
     fn from(mem: &wasmparser::MemArg) -> MemArg {
         MemArg {
             align: mem.align,
-            mem: mem.memory,
+            mem: match mem.target {
+                wasmparser::MemArgTarget::Memory(i) => i,
+                wasmparser::MemArgTarget::Array(_) => unimplemented!(),
+            },
             static_offset: mem.offset,
         }
     }
@@ -1265,6 +1270,56 @@ mod tests {
     use crate::mutators::OperatorAndByteOffset;
     use crate::{ModuleInfo, WasmMutate};
     use wasmparser::Parser;
+
+    /// Returns whether the subtree rooted at the `idx`-th operator of the only
+    /// function in `wat` may be mutated when preserving semantics.
+    fn is_consistent_at(wat: &str, idx: usize) -> bool {
+        let wasm = wat::parse_str(wat).unwrap();
+        let mut config = WasmMutate::default();
+        config.preserve_semantics(true);
+        for payload in Parser::new(0).parse_all(&wasm) {
+            if let wasmparser::Payload::CodeSectionEntry(reader) = payload.unwrap() {
+                let operators = reader
+                    .get_operators_reader()
+                    .unwrap()
+                    .into_iter_with_offsets()
+                    .collect::<wasmparser::Result<Vec<OperatorAndByteOffset>>>()
+                    .unwrap();
+                let bb = DFGBuilder::new(&config)
+                    .get_bb_from_operator(idx, &operators)
+                    .unwrap();
+                let dfg = DFGBuilder::new(&config)
+                    .get_dfg(&ModuleInfo::default(), &operators, &bb)
+                    .unwrap();
+                return dfg.is_subtree_consistent(dfg.map[&idx]);
+            }
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn test_dfg_grow_starts_new_color() {
+        // memory.size, i32.const, <op>, i32.add
+        let add = 3;
+        assert!(is_consistent_at(
+            r#"(module (memory 1)
+                (func (result i32)
+                    (i32.add (memory.size) (i32.load (i32.const 1)))))"#,
+            add,
+        ));
+        assert!(!is_consistent_at(
+            r#"(module (memory 1)
+                (func (result i32)
+                    (i32.add (memory.size) (memory.grow (i32.const 1)))))"#,
+            add,
+        ));
+        assert!(!is_consistent_at(
+            r#"(module (table 1 funcref)
+                (func (result i32)
+                    (i32.add (table.size) (table.grow (ref.null func) (i32.const 1)))))"#,
+            add + 1,
+        ));
+    }
 
     #[test]
     fn test_dfg_getsinglebb() {

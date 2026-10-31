@@ -85,13 +85,20 @@ impl<'a> Resolver<'a> {
 
     fn register(&mut self, item: &ModuleField<'a>) -> Result<(), Error> {
         match item {
-            ModuleField::Import(i) => match &i.item.kind {
-                ItemKind::Func(_) => self.funcs.register(i.item.id, "func")?,
-                ItemKind::Memory(_) => self.memories.register(i.item.id, "memory")?,
-                ItemKind::Table(_) => self.tables.register(i.item.id, "table")?,
-                ItemKind::Global(_) => self.globals.register(i.item.id, "global")?,
-                ItemKind::Tag(_) => self.tags.register(i.item.id, "tag")?,
-            },
+            ModuleField::Import(imports) => {
+                for sig in imports.item_sigs() {
+                    match &sig.kind {
+                        ItemKind::Func(_) | ItemKind::FuncExact(_) => {
+                            self.funcs.register(sig.id, "func")?
+                        }
+                        ItemKind::Memory(_) => self.memories.register(sig.id, "memory")?,
+                        ItemKind::Table(_) => self.tables.register(sig.id, "table")?,
+                        ItemKind::Global(_) => self.globals.register(sig.id, "global")?,
+                        ItemKind::Tag(_) => self.tags.register(sig.id, "tag")?,
+                    };
+                }
+                return Ok(());
+            }
             ModuleField::Global(i) => self.globals.register(i.id, "global")?,
             ModuleField::Memory(i) => self.memories.register(i.id, "memory")?,
             ModuleField::Func(i) => self.funcs.register(i.id, "func")?,
@@ -121,8 +128,10 @@ impl<'a> Resolver<'a> {
 
     fn resolve_field(&self, field: &mut ModuleField<'a>) -> Result<(), Error> {
         match field {
-            ModuleField::Import(i) => {
-                self.resolve_item_sig(&mut i.item)?;
+            ModuleField::Import(imports) => {
+                for sig in imports.unique_sigs_mut() {
+                    self.resolve_item_sig(sig)?;
+                }
                 Ok(())
             }
 
@@ -245,7 +254,10 @@ impl<'a> Resolver<'a> {
             ModuleField::Tag(t) => {
                 match &mut t.ty {
                     TagType::Exception(ty) => {
-                        self.resolve_type_use(ty)?;
+                        let (_, inline) = self.resolve_type_use(ty)?;
+                        // Preserve the `inline` field since that's used for the
+                        // tag-parameter name subsection
+                        ty.inline = inline;
                     }
                 }
                 Ok(())
@@ -267,8 +279,9 @@ impl<'a> Resolver<'a> {
 
     fn resolve_item_sig(&self, item: &mut ItemSig<'a>) -> Result<(), Error> {
         match &mut item.kind {
-            ItemKind::Func(t) | ItemKind::Tag(TagType::Exception(t)) => {
-                self.resolve_type_use(t)?;
+            ItemKind::Func(t) | ItemKind::FuncExact(t) | ItemKind::Tag(TagType::Exception(t)) => {
+                // The inline type is preserved for the local name subsection.
+                t.inline = self.resolve_type_use(t)?.1;
             }
             ItemKind::Global(t) => self.resolve_valtype(&mut t.ty)?,
             ItemKind::Table(t) => {
@@ -382,69 +395,80 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
     }
 
     fn resolve_instr(&mut self, instr: &mut Instruction<'a>) -> Result<(), Error> {
-        use Instruction::*;
+        use Instruction as I;
 
         if let Some(m) = instr.memarg_mut() {
-            self.resolver.resolve(&mut m.memory, Ns::Memory)?;
+            match &mut m.target {
+                MemArgTarget::Memory(memory) => {
+                    self.resolver.resolve(memory, Ns::Memory)?;
+                }
+                MemArgTarget::Array(ty) => {
+                    self.resolver.resolve(ty, Ns::Type)?;
+                }
+            }
         }
 
         match instr {
-            MemorySize(i) | MemoryGrow(i) | MemoryFill(i) | MemoryDiscard(i) => {
+            I::memory_size(i) | I::memory_grow(i) | I::memory_fill(i) | I::memory_discard(i) => {
                 self.resolver.resolve(&mut i.mem, Ns::Memory)?;
             }
-            MemoryInit(i) => {
+            I::memory_init(i) => {
                 self.resolver.datas.resolve(&mut i.data, "data")?;
                 self.resolver.resolve(&mut i.mem, Ns::Memory)?;
             }
-            MemoryCopy(i) => {
+            I::memory_copy(i) => {
                 self.resolver.resolve(&mut i.src, Ns::Memory)?;
                 self.resolver.resolve(&mut i.dst, Ns::Memory)?;
             }
-            DataDrop(i) => {
+            I::data_drop(i) => {
                 self.resolver.datas.resolve(i, "data")?;
             }
 
-            TableInit(i) => {
+            I::table_init(i) => {
                 self.resolver.elems.resolve(&mut i.elem, "elem")?;
                 self.resolver.resolve(&mut i.table, Ns::Table)?;
             }
-            ElemDrop(i) => {
+            I::elem_drop(i) => {
                 self.resolver.elems.resolve(i, "elem")?;
             }
 
-            TableCopy(i) => {
+            I::table_copy(i) => {
                 self.resolver.resolve(&mut i.dst, Ns::Table)?;
                 self.resolver.resolve(&mut i.src, Ns::Table)?;
             }
 
-            TableFill(i) | TableSet(i) | TableGet(i) | TableSize(i) | TableGrow(i) => {
+            I::table_fill(i)
+            | I::table_set(i)
+            | I::table_get(i)
+            | I::table_size(i)
+            | I::table_grow(i) => {
                 self.resolver.resolve(&mut i.dst, Ns::Table)?;
             }
 
-            TableAtomicGet(i)
-            | TableAtomicSet(i)
-            | TableAtomicRmwXchg(i)
-            | TableAtomicRmwCmpxchg(i) => {
+            I::table_atomic_get(i)
+            | I::table_atomic_set(i)
+            | I::table_atomic_rmw_xchg(i)
+            | I::table_atomic_rmw_cmpxchg(i) => {
                 self.resolver.resolve(&mut i.inner.dst, Ns::Table)?;
             }
 
-            GlobalSet(i) | GlobalGet(i) => {
+            I::global_set(i) | I::global_get(i) => {
                 self.resolver.resolve(i, Ns::Global)?;
             }
 
-            GlobalAtomicSet(i)
-            | GlobalAtomicGet(i)
-            | GlobalAtomicRmwAdd(i)
-            | GlobalAtomicRmwSub(i)
-            | GlobalAtomicRmwAnd(i)
-            | GlobalAtomicRmwOr(i)
-            | GlobalAtomicRmwXor(i)
-            | GlobalAtomicRmwXchg(i)
-            | GlobalAtomicRmwCmpxchg(i) => {
+            I::global_atomic_set(i)
+            | I::global_atomic_get(i)
+            | I::global_atomic_rmw_add(i)
+            | I::global_atomic_rmw_sub(i)
+            | I::global_atomic_rmw_and(i)
+            | I::global_atomic_rmw_or(i)
+            | I::global_atomic_rmw_xor(i)
+            | I::global_atomic_rmw_xchg(i)
+            | I::global_atomic_rmw_cmpxchg(i) => {
                 self.resolver.resolve(&mut i.inner, Ns::Global)?;
             }
 
-            LocalSet(i) | LocalGet(i) | LocalTee(i) => {
+            I::local_set(i) | I::local_get(i) | I::local_tee(i) => {
                 assert!(self.scopes.len() > 0);
                 // Resolve a local by iterating over scopes from most recent
                 // to less recent. This allows locals added by `let` blocks to
@@ -464,27 +488,27 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
                 assert!(i.is_resolved());
             }
 
-            Call(i) | RefFunc(i) | ReturnCall(i) => {
+            I::call(i) | I::ref_func(i) | I::return_call(i) => {
                 self.resolver.resolve(i, Ns::Func)?;
             }
 
-            CallIndirect(c) | ReturnCallIndirect(c) => {
+            I::call_indirect(c) | I::return_call_indirect(c) => {
                 self.resolver.resolve(&mut c.table, Ns::Table)?;
                 self.resolver.resolve_type_use(&mut c.ty)?;
             }
 
-            CallRef(i) | ReturnCallRef(i) => {
+            I::call_ref(i) | I::return_call_ref(i) => {
                 self.resolver.resolve(i, Ns::Type)?;
             }
 
-            Block(bt) | If(bt) | Loop(bt) | Try(bt) => {
+            I::block(bt) | I::if_(bt) | I::loop_(bt) | I::try_(bt) => {
                 self.blocks.push(ExprBlock {
                     label: bt.label,
                     pushed_scope: false,
                 });
                 self.resolve_block_type(bt)?;
             }
-            TryTable(try_table) => {
+            I::try_table(try_table) => {
                 self.resolve_block_type(&mut try_table.block)?;
                 for catch in &mut try_table.catches {
                     if let Some(tag) = catch.kind.tag_index_mut() {
@@ -501,10 +525,10 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
             // On `End` instructions we pop a label from the stack, and for both
             // `End` and `Else` instructions if they have labels listed we
             // verify that they match the label at the beginning of the block.
-            Else(_) | End(_) => {
+            I::else_(_) | I::end(_) => {
                 let (matching_block, label) = match &instr {
-                    Else(label) => (self.blocks.last().cloned(), label),
-                    End(label) => (self.blocks.pop(), label),
+                    I::else_(label) => (self.blocks.last().cloned(), label),
+                    I::end(label) => (self.blocks.pop(), label),
                     _ => unreachable!(),
                 };
                 let matching_block = match matching_block {
@@ -514,7 +538,7 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
 
                 // Reset the local scopes to before this block was entered
                 if matching_block.pushed_scope {
-                    if let End(_) = instr {
+                    if let I::end(_) = instr {
                         self.scopes.pop();
                     }
                 }
@@ -532,33 +556,33 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
                 ));
             }
 
-            Br(i) | BrIf(i) | BrOnNull(i) | BrOnNonNull(i) => {
+            I::br(i) | I::br_if(i) | I::br_on_null(i) | I::br_on_non_null(i) => {
                 self.resolve_label(i)?;
             }
 
-            BrTable(i) => {
+            I::br_table(i) => {
                 for label in i.labels.iter_mut() {
                     self.resolve_label(label)?;
                 }
                 self.resolve_label(&mut i.default)?;
             }
 
-            Throw(i) | Catch(i) => {
+            I::throw(i) | I::catch(i) => {
                 self.resolver.resolve(i, Ns::Tag)?;
             }
 
-            Rethrow(i) => {
+            I::rethrow(i) => {
                 self.resolve_label(i)?;
             }
 
-            Delegate(i) => {
+            I::delegate(i) => {
                 // Since a delegate starts counting one layer out from the
                 // current try-delegate block, we pop before we resolve labels.
                 self.blocks.pop();
                 self.resolve_label(i)?;
             }
 
-            Select(s) => {
+            I::select(s) => {
                 if let Some(list) = &mut s.tys {
                     for ty in list {
                         self.resolver.resolve_valtype(ty)?;
@@ -566,111 +590,141 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
                 }
             }
 
-            RefTest(i) => {
+            I::ref_test(i) => {
                 self.resolver.resolve_reftype(&mut i.r#type)?;
             }
-            RefCast(i) => {
+            I::ref_cast(i) => {
                 self.resolver.resolve_reftype(&mut i.r#type)?;
             }
-            BrOnCast(i) => {
+            I::br_on_cast(i) => {
                 self.resolve_label(&mut i.label)?;
                 self.resolver.resolve_reftype(&mut i.to_type)?;
                 self.resolver.resolve_reftype(&mut i.from_type)?;
             }
-            BrOnCastFail(i) => {
+            I::br_on_cast_fail(i) => {
                 self.resolve_label(&mut i.label)?;
                 self.resolver.resolve_reftype(&mut i.to_type)?;
                 self.resolver.resolve_reftype(&mut i.from_type)?;
             }
 
-            StructNew(i) | StructNewDefault(i) | ArrayNew(i) | ArrayNewDefault(i) | ArrayGet(i)
-            | ArrayGetS(i) | ArrayGetU(i) | ArraySet(i) => {
+            I::struct_new(i)
+            | I::struct_new_default(i)
+            | I::array_new(i)
+            | I::array_new_default(i)
+            | I::array_get(i)
+            | I::array_get_s(i)
+            | I::array_get_u(i)
+            | I::array_set(i) => {
                 self.resolver.resolve(i, Ns::Type)?;
             }
 
-            StructSet(s) | StructGet(s) | StructGetS(s) | StructGetU(s) => {
+            I::struct_set(s) | I::struct_get(s) | I::struct_get_s(s) | I::struct_get_u(s) => {
                 self.resolve_field(s)?;
             }
 
-            StructAtomicGet(s)
-            | StructAtomicGetS(s)
-            | StructAtomicGetU(s)
-            | StructAtomicSet(s)
-            | StructAtomicRmwAdd(s)
-            | StructAtomicRmwSub(s)
-            | StructAtomicRmwAnd(s)
-            | StructAtomicRmwOr(s)
-            | StructAtomicRmwXor(s)
-            | StructAtomicRmwXchg(s)
-            | StructAtomicRmwCmpxchg(s) => {
+            I::struct_atomic_get(s)
+            | I::struct_atomic_get_s(s)
+            | I::struct_atomic_get_u(s)
+            | I::struct_atomic_set(s)
+            | I::struct_atomic_rmw_add(s)
+            | I::struct_atomic_rmw_sub(s)
+            | I::struct_atomic_rmw_and(s)
+            | I::struct_atomic_rmw_or(s)
+            | I::struct_atomic_rmw_xor(s)
+            | I::struct_atomic_rmw_xchg(s)
+            | I::struct_atomic_rmw_cmpxchg(s) => {
                 self.resolve_field(&mut s.inner)?;
             }
 
-            ArrayNewFixed(a) => {
+            I::array_new_fixed(a) => {
                 self.resolver.resolve(&mut a.array, Ns::Type)?;
             }
-            ArrayNewData(a) => {
+            I::array_new_data(a) => {
                 self.resolver.resolve(&mut a.array, Ns::Type)?;
                 self.resolver.datas.resolve(&mut a.data_idx, "data")?;
             }
-            ArrayNewElem(a) => {
+            I::array_new_elem(a) => {
                 self.resolver.resolve(&mut a.array, Ns::Type)?;
                 self.resolver.elems.resolve(&mut a.elem_idx, "elem")?;
             }
-            ArrayFill(a) => {
+            I::array_fill(a) => {
                 self.resolver.resolve(&mut a.array, Ns::Type)?;
             }
-            ArrayCopy(a) => {
+            I::array_copy(a) => {
                 self.resolver.resolve(&mut a.dest_array, Ns::Type)?;
                 self.resolver.resolve(&mut a.src_array, Ns::Type)?;
             }
-            ArrayInitData(a) => {
+            I::array_init_data(a) => {
                 self.resolver.resolve(&mut a.array, Ns::Type)?;
                 self.resolver.datas.resolve(&mut a.segment, "data")?;
             }
-            ArrayInitElem(a) => {
+            I::array_init_elem(a) => {
                 self.resolver.resolve(&mut a.array, Ns::Type)?;
                 self.resolver.elems.resolve(&mut a.segment, "elem")?;
             }
 
-            ArrayAtomicGet(i)
-            | ArrayAtomicGetS(i)
-            | ArrayAtomicGetU(i)
-            | ArrayAtomicSet(i)
-            | ArrayAtomicRmwAdd(i)
-            | ArrayAtomicRmwSub(i)
-            | ArrayAtomicRmwAnd(i)
-            | ArrayAtomicRmwOr(i)
-            | ArrayAtomicRmwXor(i)
-            | ArrayAtomicRmwXchg(i)
-            | ArrayAtomicRmwCmpxchg(i) => {
+            I::array_atomic_get(i)
+            | I::array_atomic_get_s(i)
+            | I::array_atomic_get_u(i)
+            | I::array_atomic_set(i)
+            | I::array_atomic_rmw_add(i)
+            | I::array_atomic_rmw_sub(i)
+            | I::array_atomic_rmw_and(i)
+            | I::array_atomic_rmw_or(i)
+            | I::array_atomic_rmw_xor(i)
+            | I::array_atomic_rmw_xchg(i)
+            | I::array_atomic_rmw_cmpxchg(i) => {
                 self.resolver.resolve(&mut i.inner, Ns::Type)?;
             }
 
-            RefNull(ty) => self.resolver.resolve_heaptype(ty)?,
+            I::ref_null(ty) => self.resolver.resolve_heaptype(ty)?,
 
-            ContNew(ty) => {
+            I::cont_new(ty) => {
                 self.resolver.resolve(ty, Ns::Type)?;
             }
-            ContBind(cb) => {
+            I::cont_bind(cb) => {
                 self.resolver.resolve(&mut cb.argument_index, Ns::Type)?;
                 self.resolver.resolve(&mut cb.result_index, Ns::Type)?;
             }
-            Suspend(ty) => {
+            I::suspend(ty) => {
                 self.resolver.resolve(ty, Ns::Tag)?;
             }
-            Resume(r) => {
+            I::resume(r) => {
                 self.resolver.resolve(&mut r.type_index, Ns::Type)?;
                 self.resolve_resume_table(&mut r.table)?;
             }
-            ResumeThrow(rt) => {
+            I::resume_throw(rt) => {
                 self.resolver.resolve(&mut rt.type_index, Ns::Type)?;
                 self.resolver.resolve(&mut rt.tag_index, Ns::Tag)?;
                 self.resolve_resume_table(&mut rt.table)?;
             }
-            Switch(s) => {
+            I::resume_throw_ref(rt) => {
+                self.resolver.resolve(&mut rt.type_index, Ns::Type)?;
+                self.resolve_resume_table(&mut rt.table)?;
+            }
+            I::switch(s) => {
                 self.resolver.resolve(&mut s.type_index, Ns::Type)?;
                 self.resolver.resolve(&mut s.tag_index, Ns::Tag)?;
+            }
+
+            I::struct_new_desc(i) | I::struct_new_default_desc(i) => {
+                self.resolver.resolve(i, Ns::Type)?;
+            }
+            I::ref_get_desc(i) => {
+                self.resolver.resolve(i, Ns::Type)?;
+            }
+            I::ref_cast_desc_eq(i) => {
+                self.resolver.resolve_reftype(&mut i.r#type)?;
+            }
+            I::br_on_cast_desc_eq(i) => {
+                self.resolve_label(&mut i.label)?;
+                self.resolver.resolve_reftype(&mut i.to_type)?;
+                self.resolver.resolve_reftype(&mut i.from_type)?;
+            }
+            I::br_on_cast_desc_eq_fail(i) => {
+                self.resolve_label(&mut i.label)?;
+                self.resolver.resolve_reftype(&mut i.to_type)?;
+                self.resolver.resolve_reftype(&mut i.from_type)?;
             }
 
             _ => {}
@@ -810,8 +864,14 @@ pub(crate) trait ResolveCoreType<'a> {
     }
 
     fn resolve_type_def(&mut self, ty: &mut TypeDef<'a>) -> Result<(), Error> {
-        if let Some(parent) = &mut ty.parent {
+        for parent in ty.parents.iter_mut() {
             self.resolve_type_name(parent)?;
+        }
+        if let Some(descriptor) = &mut ty.descriptor {
+            self.resolve_type_name(descriptor)?;
+        }
+        if let Some(describes) = &mut ty.describes {
+            self.resolve_type_name(describes)?;
         }
         match &mut ty.kind {
             InnerTypeKind::Func(func) => self.resolve_type_func(func),
@@ -853,7 +913,7 @@ pub(crate) trait ResolveCoreType<'a> {
 
     fn resolve_heaptype(&mut self, ty: &mut HeapType<'a>) -> Result<(), Error> {
         match ty {
-            HeapType::Concrete(i) => {
+            HeapType::Concrete(i) | HeapType::Exact(i) => {
                 self.resolve_type_name(i)?;
             }
             HeapType::Abstract { .. } => {}

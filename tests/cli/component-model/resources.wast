@@ -12,7 +12,7 @@
   (core func (canon resource.drop $x))
 )
 
-(component
+(component definition
   (import "x" (type $x (sub resource)))
 
   (core func (canon resource.drop $x))
@@ -23,7 +23,7 @@
     (func (export "dtor") (param i32))
   )
   (core instance $m (instantiate $m))
-  (type $x (resource (rep i32) (dtor (func $m "dtor"))))
+  (type $x (resource (rep i32) (dtor (core func $m "dtor"))))
   (core func (canon resource.new $x))
 )
 
@@ -52,7 +52,7 @@
   (component
     (type $x (resource (rep i64)))
   )
-  "resources can only be represented by `i32`")
+  "resources with `i64` require the `cm64` feature to be enabled")
 
 (assert_invalid
   (component
@@ -127,14 +127,14 @@
       (func (export "dtor"))
     )
     (core instance $m (instantiate $m))
-    (type $x (resource (rep i32) (dtor (func $m "dtor"))))
+    (type $x (resource (rep i32) (dtor (core func $m "dtor"))))
     (core func (canon resource.new $x))
   )
   "wrong signature for a destructor")
 
 (assert_invalid
   (component
-    (type (resource (rep i32) (dtor (func 100))))
+    (type (resource (rep i32) (dtor (core func 100))))
   )
   "function index out of bounds")
 
@@ -188,7 +188,7 @@
   ))
 )
 
-(component
+(component definition
   (import "fancy-fs" (instance $fancy-fs
     (export "fs" (instance $fs
       (export "file" (type (sub resource)))
@@ -217,12 +217,12 @@
   ))
 )
 
-(component
+(component definition
   (import "T1" (type $T1 (sub resource)))
   (import "T2" (type $T2 (sub resource)))
 )
 
-(component $C
+(component definition $C
   (import "T1" (type $T1 (sub resource)))
   (import "T2" (type $T2 (sub resource)))
   (import "T3" (type $T3 (eq $T2)))
@@ -231,7 +231,7 @@
   (type $ListT3 (list (own $T3)))
 )
 
-(component
+(component definition
   (import "T" (type $T (sub resource)))
   (import "U" (type $U (sub resource)))
   (type $Own1 (own $T))
@@ -249,15 +249,17 @@
 )
 
 (component
-  (import "C" (component $C
-    (export "T1" (type (sub resource)))
-    (export "T2" (type $T2 (sub resource)))
-    (export "T3" (type (eq $T2)))
-  ))
-  (instance $c (instantiate $C))
-  (alias export $c "T1" (type $T1))
-  (alias export $c "T2" (type $T2))
-  (alias export $c "T3" (type $T3))
+  (component
+    (import "C" (component $C
+      (export "T1" (type (sub resource)))
+      (export "T2" (type $T2 (sub resource)))
+      (export "T3" (type (eq $T2)))
+    ))
+    (instance $c (instantiate $C))
+    (alias export $c "T1" (type $T1))
+    (alias export $c "T2" (type $T2))
+    (alias export $c "T3" (type $T3))
+  )
 )
 
 (component
@@ -299,42 +301,46 @@
   ))
 )
 
-(component $P
-  (import "C1" (component $C1
-    (import "T" (type $T (sub resource)))
-    (export "foo" (func (param "t" (own $T))))
-  ))
-  (import "C2" (component $C2
-    (import "T" (type $T (sub resource)))
-    (import "foo" (func (param "t" (own $T))))
-  ))
-  (type $R (resource (rep i32)))
-  (instance $c1 (instantiate $C1 (with "T" (type $R))))
-  (instance $c2 (instantiate $C2
-    (with "T" (type $R))
-    (with "foo" (func $c1 "foo"))
-  ))
+(component
+  (component $P
+    (import "C1" (component $C1
+      (import "T" (type $T (sub resource)))
+      (export "foo" (func (param "t" (own $T))))
+    ))
+    (import "C2" (component $C2
+      (import "T" (type $T (sub resource)))
+      (import "foo" (func (param "t" (own $T))))
+    ))
+    (type $R (resource (rep i32)))
+    (instance $c1 (instantiate $C1 (with "T" (type $R))))
+    (instance $c2 (instantiate $C2
+      (with "T" (type $R))
+      (with "foo" (func $c1 "foo"))
+    ))
+  )
 )
 
 (component
-  (import "C1" (component $C1
-    (import "T1" (type $T1 (sub resource)))
-    (import "T2" (type $T2 (sub resource)))
-    (export "foo" (func (param "t" (tuple (own $T1) (own $T2)))))
-  ))
-  (import "C2" (component $C2
-    (import "T" (type $T (sub resource)))
-    (export "foo" (func (param "t" (tuple (own $T) (own $T)))))
-  ))
-  (type $R (resource (rep i32)))
-  (instance $c1 (instantiate $C1
-    (with "T1" (type $R))
-    (with "T2" (type $R))
-  ))
-  (instance $c2 (instantiate $C2
-    (with "T" (type $R))
-    (with "foo" (func $c1 "foo"))
-  ))
+  (component
+    (import "C1" (component $C1
+      (import "T1" (type $T1 (sub resource)))
+      (import "T2" (type $T2 (sub resource)))
+      (export "foo" (func (param "t" (tuple (own $T1) (own $T2)))))
+    ))
+    (import "C2" (component $C2
+      (import "T" (type $T (sub resource)))
+      (export "foo" (func (param "t" (tuple (own $T) (own $T)))))
+    ))
+    (type $R (resource (rep i32)))
+    (instance $c1 (instantiate $C1
+      (with "T1" (type $R))
+      (with "T2" (type $R))
+    ))
+    (instance $c2 (instantiate $C2
+      (with "T" (type $R))
+      (with "foo" (func $c1 "foo"))
+    ))
+  )
 )
 
 (assert_invalid
@@ -668,7 +674,7 @@
     (canon lift (core func $f)))
 )
 
-(component
+(component definition
   (type $i (instance
     (export "r" (type $r (sub resource)))
     (export "f" (func (result (own $r))))
@@ -917,16 +923,16 @@
     (import "b" (type $a (sub resource)))
     (import "[constructor]a" (func (result (result(own $a))))))
   "function does not match expected resource name `b`")
-(component
+(component definition
   (import "a" (type $a (sub resource)))
   (import "[constructor]a" (func (result (own $a)))))
-(component
+(component definition
   (import "a" (type $a (sub resource)))
   (import "[constructor]a" (func (result (result (own $a))))))
-(component
+(component definition
   (import "a" (type $a (sub resource)))
   (import "[constructor]a" (func (result (result (own $a) (error string))))))
-(component
+(component definition
   (import "a" (type $a (sub resource)))
   (import "[constructor]a" (func (param "x" u32) (result (own $a)))))
 (assert_invalid
@@ -973,7 +979,7 @@
     (import "b" (type $T (sub resource)))
     (import "[method]a.b" (func (param "self" (borrow $T)))))
   "does not match expected resource name")
-(component
+(component definition
   (import "a" (type $T (sub resource)))
   (import "[method]a.b" (func (param "self" (borrow $T)))))
 
@@ -1000,7 +1006,7 @@
   (component (import "[static]a.b" (func)))
   "static resource name is not known in this context")
 
-(component
+(component definition
   (import "a" (type (sub resource)))
   (import "[static]a.b" (func)))
 
@@ -1014,10 +1020,12 @@
   "resource used in function does not have a name in this context")
 
 (component
-  (import "b" (type $T (sub resource)))
-  (import "f" (func $f (param "self" (borrow $T))))
-  (export $c "c" (type $T))
-  (export "[method]c.foo" (func $f) (func (param "self" (borrow $c))))
+  (component
+    (import "b" (type $T (sub resource)))
+    (import "f" (func $f (param "self" (borrow $T))))
+    (export $c "c" (type $T))
+    (export "[method]c.foo" (func $f) (func (param "self" (borrow $c))))
+  )
 )
 
 ;; imports aren't transitive
@@ -1185,3 +1193,142 @@
   (core func (canon resource.rep $r))
   (canon resource.rep $r (core func))
 )
+
+;; Nested component subtyping where the expected component type has been
+;; remapped by a resource substitution.
+;; valid
+(component $Outer
+  (import "r" (type $R (sub resource)))
+  (import "actual" (component $actual
+    (alias outer $Outer $R (type $R2))
+    (import "r" (type $rr (eq $R2)))
+    (type $o (own $rr))
+    (import "t" (type $t (eq $o)))
+    (export "f" (func (param "x" $t)))
+  ))
+  (component $X
+    (import "r" (type $r (sub resource)))
+    (import "c" (component
+      (alias outer $X $r (type $r2))
+      (import "r" (type $rr (eq $r2)))
+      (type $o (own $rr))
+      (import "t" (type $t (eq $o)))
+      (export "f" (func (param "x" $t)))
+    ))
+  )
+  (instance (instantiate $X (with "r" (type $R)) (with "c" (component $actual))))
+)
+
+;; invalid: `actual` uses a different resource
+(assert_invalid
+  (component $Outer
+    (import "r" (type $R (sub resource)))
+    (import "r2" (type $Other (sub resource)))
+    (import "actual" (component $actual
+      (alias outer $Outer $Other (type $R2))
+      (import "r" (type $rr (eq $R2)))
+      (type $o (own $rr))
+      (import "t" (type $t (eq $o)))
+      (export "f" (func (param "x" $t)))
+    ))
+    (component $X
+      (import "r" (type $r (sub resource)))
+      (import "c" (component
+        (alias outer $X $r (type $r2))
+        (import "r" (type $rr (eq $r2)))
+        (type $o (own $rr))
+        (import "t" (type $t (eq $o)))
+        (export "f" (func (param "x" $t)))
+      ))
+    )
+    (instance (instantiate $X (with "r" (type $R)) (with "c" (component $actual))))
+  )
+  "type mismatch")
+
+;; invalid: `actual`'s export doesn't use the imported type
+(assert_invalid
+  (component $Outer
+    (import "r" (type $R (sub resource)))
+    (import "actual" (component $actual
+      (alias outer $Outer $R (type $R2))
+      (import "r" (type $rr (eq $R2)))
+      (type $o (own $rr))
+      (import "t" (type $t (eq $o)))
+      (export "f" (func (param "x" u32)))
+    ))
+    (component $X
+      (import "r" (type $r (sub resource)))
+      (import "c" (component
+        (alias outer $X $r (type $r2))
+        (import "r" (type $rr (eq $r2)))
+        (type $o (own $rr))
+        (import "t" (type $t (eq $o)))
+        (export "f" (func (param "x" $t)))
+      ))
+    )
+    (instance (instantiate $X (with "r" (type $R)) (with "c" (component $actual))))
+  )
+  "type mismatch")
+
+;; invalid: `actual` exports a borrow where an own is expected
+(assert_invalid
+  (component $Outer
+    (import "r" (type $R (sub resource)))
+    (import "actual" (component $actual
+      (alias outer $Outer $R (type $R2))
+      (import "r" (type $rr (eq $R2)))
+      (type $o (own $rr))
+      (import "t" (type $t (eq $o)))
+      (type $b (borrow $rr))
+      (export "f" (func (param "x" $b)))
+    ))
+    (component $X
+      (import "r" (type $r (sub resource)))
+      (import "c" (component
+        (alias outer $X $r (type $r2))
+        (import "r" (type $rr (eq $r2)))
+        (type $o (own $rr))
+        (import "t" (type $t (eq $o)))
+        (export "f" (func (param "x" $t)))
+      ))
+    )
+    (instance (instantiate $X (with "r" (type $R)) (with "c" (component $actual))))
+  )
+  "type mismatch")
+
+;; Errors in nested component and module subtyping, where the expected type
+;; has been remapped by a resource substitution, are reported as errors.
+(assert_invalid
+  (component
+    (import "R" (type $R (sub resource)))
+    (import "c" (instance $c
+      (export "f" (func (param "p" (own $R))))
+      (export "e" (component (import "y" (func))))
+    ))
+    (component $C
+      (import "r" (type $r (sub resource)))
+      (import "c" (instance
+        (export "f" (func (param "p" (own $r))))
+        (export "e" (component (import "z" (func))))
+      ))
+    )
+    (instance (instantiate $C (with "r" (type $R)) (with "c" (instance $c))))
+  )
+  "missing import named `y`")
+(assert_invalid
+  (component
+    (import "R" (type $R (sub resource)))
+    (import "c" (instance $c
+      (export "f" (func (param "p" (own $R))))
+      (export "m" (core module (import "a" "b" (func))))
+    ))
+    (component $C
+      (import "r" (type $r (sub resource)))
+      (import "c" (instance
+        (export "f" (func (param "p" (own $r))))
+        (export "m" (core module))
+      ))
+    )
+    (instance (instantiate $C (with "r" (type $R)) (with "c" (instance $c))))
+  )
+  "missing expected import `a::b`")

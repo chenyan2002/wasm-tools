@@ -1,5 +1,5 @@
 ;; RUN: wast % --assert default --snapshot tests/snapshots \
-;;        -f=cm-async,-cm-async-builtins
+;;        -f=cm-async,-cm-more-async-builtins
 
 (assert_invalid
   (component
@@ -11,40 +11,3 @@
     )
   )
   "requires the component model async stackful feature")
-
-;; waitable-set.wait cancellable
-(assert_invalid
-  (component
-    (core module $libc (memory (export "memory") 1))
-    (core instance $libc (instantiate $libc))
-    (core func (canon waitable-set.wait cancellable (memory $libc "memory")))
-  )
-  "requires the component model async stackful feature")
-
-(component
-  (core module $libc (memory (export "memory") 1))
-  (core instance $libc (instantiate $libc))
-  (core func (canon waitable-set.wait (memory $libc "memory")))
-)
-
-;; waitable-set.poll cancellable
-(assert_invalid
-  (component
-    (core module $libc (memory (export "memory") 1))
-    (core instance $libc (instantiate $libc))
-    (core func (canon waitable-set.poll cancellable (memory $libc "memory")))
-  )
-  "requires the component model async stackful feature")
-
-(component
-  (core module $libc (memory (export "memory") 1))
-  (core instance $libc (instantiate $libc))
-  (core func (canon waitable-set.poll (memory $libc "memory")))
-)
-
-;; thread.yield
-(assert_invalid
-  (component (core func (canon thread.yield cancellable)))
-  "requires the component model async stackful feature")
-
-(component (core func (canon thread.yield)))

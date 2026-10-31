@@ -8,7 +8,7 @@
   (core module $main (;0;)
     (type (;0;) (func (param i32)))
     (type (;1;) (func (result i32)))
-    (import "foo:bar/a" "[resource-drop]r" (func (;0;) (type 0)))
+    (import "foo:bar/a" "[resource-drop]r" (func (;0;) (type 0) (param i32)))
     (export "b#foo" (func 1))
     (func (;1;) (type 1) (result i32)
       i32.const 0
@@ -32,7 +32,6 @@
   (type (;4;) (func (result 3)))
   (alias core export $main "b#foo" (core func $b#foo (;1;)))
   (func $foo (;0;) (type 4) (canon lift (core func $b#foo)))
-  (alias export $foo:bar/a "r" (type $"#type5 r" (@name "r") (;5;)))
   (component $b-shim-component (;0;)
     (import "import-type-r" (type (;0;) (sub resource)))
     (import "import-type-r0" (type (;1;) (eq 0)))
@@ -46,7 +45,7 @@
   )
   (instance $b-shim-instance (;1;) (instantiate $b-shim-component
       (with "import-func-foo" (func $foo))
-      (with "import-type-r" (type $"#type5 r"))
+      (with "import-type-r" (type $r))
       (with "import-type-r0" (type $r))
     )
   )

@@ -2,9 +2,8 @@ use std::fmt::{self, Debug};
 
 use anyhow::Result;
 use wasm_encoder::Encode;
+use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
 use wasmparser::{BinaryReader, NameSectionReader};
-
-use crate::utils::{indirect_name_map, name_map};
 
 /// Helper for rewriting a module's name section with a new module name.
 pub struct ModuleNames<'a> {
@@ -30,7 +29,7 @@ impl<'a> ModuleNames<'a> {
     }
     /// Read a name section from a WebAssembly binary. Records the module name, and all other
     /// contents of name section, for later serialization.
-    pub fn from_bytes(bytes: &'a [u8], offset: usize) -> Result<ModuleNames<'a>> {
+    pub fn from_bytes(bytes: &'a [u8], offset: u64) -> Result<ModuleNames<'a>> {
         let reader = BinaryReader::new(bytes, offset);
         let section = NameSectionReader::new(reader);
         let mut s = Self::empty();
@@ -73,21 +72,7 @@ impl<'a> ModuleNames<'a> {
             section.module(&module_name);
         }
         for n in self.names.iter() {
-            match n {
-                wasmparser::Name::Module { .. } => unreachable!(),
-                wasmparser::Name::Function(m) => section.functions(&name_map(&m)?),
-                wasmparser::Name::Local(m) => section.locals(&indirect_name_map(&m)?),
-                wasmparser::Name::Label(m) => section.labels(&indirect_name_map(&m)?),
-                wasmparser::Name::Type(m) => section.types(&name_map(&m)?),
-                wasmparser::Name::Table(m) => section.tables(&name_map(&m)?),
-                wasmparser::Name::Memory(m) => section.memories(&name_map(&m)?),
-                wasmparser::Name::Global(m) => section.globals(&name_map(&m)?),
-                wasmparser::Name::Element(m) => section.elements(&name_map(&m)?),
-                wasmparser::Name::Data(m) => section.data(&name_map(&m)?),
-                wasmparser::Name::Field(m) => section.fields(&indirect_name_map(&m)?),
-                wasmparser::Name::Tag(m) => section.tags(&name_map(&m)?),
-                wasmparser::Name::Unknown { .. } => {} // wasm-encoder doesn't support it
-            }
+            RoundtripReencoder.parse_custom_name_subsection(&mut section, n.clone())?;
         }
         Ok(section)
     }

@@ -1,6 +1,6 @@
 //! Lexing types
 
-use std::fmt::Display;
+use core::fmt::Display;
 
 pub use logos::Span;
 
@@ -11,7 +11,7 @@ pub type Lexer<'source> = logos::Lexer<'source, Token>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, logos::Logos)]
 #[logos(error = Option<Span>)]
 #[logos(skip r"[ \t\n\r]+")]
-#[logos(skip r"//[^\n]*")]
+#[logos(skip(r"//", skip_comment))]
 #[logos(subpattern first_label_word = r"[a-z][a-z0-9]*|[A-Z][A-Z0-9]*")]
 #[logos(subpattern label_word = r"[a-z0-9]+|[A-Z0-9]+")]
 #[logos(subpattern char_escape = r#"\\['"tnr\\]|\\u\{[0-9a-fA-F]{1,6}\}"#)]
@@ -72,9 +72,14 @@ pub enum Token {
 }
 
 impl Display for Token {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{self:?}")
     }
+}
+
+fn skip_comment(lex: &mut Lexer) {
+    let comment = lex.remainder().split_inclusive('\n').next().unwrap();
+    lex.bump(comment.len());
 }
 
 fn validate_char(lex: &mut Lexer) -> Result<(), Option<Span>> {
@@ -127,7 +132,7 @@ impl Keyword {
 }
 
 impl Display for Keyword {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Keyword::True => "true",
             Keyword::False => "false",
@@ -139,4 +144,22 @@ impl Display for Keyword {
             Keyword::Nan => "nan",
         })
     }
+}
+
+/// A lexer for function names. Different token type from WAVE values, because
+/// this is not part of the same context-free grammar.
+pub type FuncNameLexer<'source> = logos::Lexer<'source, FuncNameToken>;
+/// A function name token
+#[derive(Clone, Copy, Debug, PartialEq, Eq, logos::Logos)]
+#[logos(error = Option<logos::Span>)]
+#[logos(subpattern first_label_word = r"[a-z][a-z0-9]*|[A-Z][A-Z0-9]*")]
+#[logos(subpattern label_word = r"[a-z0-9]+|[A-Z0-9]+")]
+#[logos(subpattern label = r"(?&first_label_word)(\-(?&label_word))*")]
+#[logos(subpattern package_label = r"(?&label)\:(?&label)")]
+#[logos(subpattern semver = r"(0|([1-9][0-9]*))\.(0|([1-9][0-9]*))\.(0|([1-9][0-9]*))")]
+pub enum FuncNameToken {
+    /// A function inside an optional interface, with an optional package qualifier and
+    /// package version suffix
+    #[regex(r"((?&package_label)\/)?(?&label)(\.(?&label))?(\@(?&semver))?")]
+    FunctionName,
 }

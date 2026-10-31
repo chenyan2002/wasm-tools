@@ -40,10 +40,10 @@ impl Payload {
                     if output.is_empty() {
                         match encoding {
                             wasmparser::Encoding::Module => {
-                                output.push(Self::empty_module(0..input.len()))
+                                output.push(Self::empty_module(0..input.len() as u64))
                             }
                             wasmparser::Encoding::Component => {
-                                output.push(Self::empty_component(0..input.len()))
+                                output.push(Self::empty_component(0..input.len() as u64))
                             }
                         }
                     }
@@ -96,13 +96,11 @@ impl Payload {
                     #[cfg(feature = "oci")]
                     KnownCustom::Unknown if c.name() == "authors" => {
                         let a = Authors::parse_custom_section(&c)?;
-                        let Metadata {
-                            authors: author, ..
-                        } = output
+                        let Metadata { authors, .. } = output
                             .last_mut()
                             .expect("non-empty metadata stack")
                             .metadata_mut();
-                        *author = Some(a);
+                        *authors = Some(a);
                     }
                     #[cfg(feature = "oci")]
                     KnownCustom::Unknown if c.name() == "description" => {
@@ -193,7 +191,7 @@ impl Payload {
         }
     }
 
-    fn empty_component(range: Range<usize>) -> Self {
+    fn empty_component(range: Range<u64>) -> Self {
         let mut this = Self::Component {
             metadata: Metadata::default(),
             children: vec![],
@@ -202,7 +200,7 @@ impl Payload {
         this
     }
 
-    fn empty_module(range: Range<usize>) -> Self {
+    fn empty_module(range: Range<u64>) -> Self {
         let mut this = Self::Module(Metadata::default());
         this.metadata_mut().range = range;
         this

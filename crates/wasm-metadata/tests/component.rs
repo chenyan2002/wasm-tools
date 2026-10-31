@@ -28,7 +28,7 @@ fn add_to_empty_component() {
     let json_str = r#"{"packages":[{"name":"adler","version":"0.2.3","source":"registry"}]}"#;
     let info = VersionInfo::from_str(json_str).unwrap();
     let mut component = Component::new();
-    component.section(&Dependencies::new(info.clone()));
+    component.section(&Dependencies::new(info.clone()).unwrap());
     let component = component.finish();
     let component = add.to_wasm(&component).unwrap();
 
@@ -39,7 +39,7 @@ fn add_to_empty_component() {
                 Metadata {
                     name,
                     producers,
-                    authors: author,
+                    authors,
                     description,
                     licenses,
                     source,
@@ -62,7 +62,7 @@ fn add_to_empty_component() {
                 "1.0"
             );
 
-            assert_eq!(author.unwrap(), Authors::new("Chashu Cat"));
+            assert_eq!(authors.unwrap(), Authors::new("Chashu Cat"));
             assert_eq!(description.unwrap(), Description::new("Chashu likes tuna"));
             assert_eq!(
                 licenses.unwrap(),
@@ -115,7 +115,7 @@ fn add_to_nested_component() {
     let json_str = r#"{"packages":[{"name":"adler","version":"0.2.3","source":"registry"}]}"#;
     let info = VersionInfo::from_str(json_str).unwrap();
     let mut component = Module::new();
-    component.section(&Dependencies::new(info.clone()));
+    component.section(&Dependencies::new(info.clone()).unwrap());
     let module = component.finish();
     let module = add.to_wasm(&module).unwrap();
 
@@ -155,7 +155,7 @@ fn add_to_nested_component() {
                 Payload::Module(Metadata {
                     name,
                     producers,
-                    authors: author,
+                    authors,
                     licenses,
                     source,
                     range,
@@ -176,7 +176,7 @@ fn add_to_nested_component() {
                         "1.0"
                     );
 
-                    assert_eq!(author, &Some(Authors::new("Chashu Cat")));
+                    assert_eq!(authors, &Some(Authors::new("Chashu Cat")));
                     assert_eq!(description, &Some(Description::new("Chashu likes tuna")));
                     assert_eq!(
                         licenses,
@@ -239,7 +239,7 @@ fn add_then_clear_fields() {
     let json_str = r#"{"packages":[{"name":"adler","version":"0.2.3","source":"registry"}]}"#;
     let info = VersionInfo::from_str(json_str).unwrap();
     let mut component1 = Component::new();
-    component1.section(&Dependencies::new(info.clone()));
+    component1.section(&Dependencies::new(info.clone()).unwrap());
     let component1 = component1.finish();
     let component1 = add1.to_wasm(&component1).unwrap();
 
@@ -258,7 +258,7 @@ fn add_then_clear_fields() {
                 Metadata {
                     name,
                     producers,
-                    authors: author,
+                    authors,
                     description,
                     licenses,
                     source,
@@ -281,7 +281,7 @@ fn add_then_clear_fields() {
                 "1.0"
             );
 
-            assert_eq!(author.unwrap(), Authors::new("Chashu Cat"));
+            assert_eq!(authors.unwrap(), Authors::new("Chashu Cat"));
             assert_eq!(
                 description.unwrap(),
                 Description::new("Chashu likes something else")

@@ -1,4 +1,5 @@
 use crate::{Function, Handle, Int, Resolve, Type, TypeDefKind};
+use alloc::vec::Vec;
 
 /// A core WebAssembly signature with params and results.
 #[derive(Clone, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
@@ -132,6 +133,17 @@ pub enum AbiVariant {
     GuestExportAsyncStackful,
 }
 
+impl AbiVariant {
+    pub fn is_async(&self) -> bool {
+        match self {
+            Self::GuestImport | Self::GuestExport => false,
+            Self::GuestImportAsync | Self::GuestExportAsync | Self::GuestExportAsyncStackful => {
+                true
+            }
+        }
+    }
+}
+
 pub struct FlatTypes<'a> {
     types: &'a mut [WasmType],
     cur: usize,
@@ -180,7 +192,7 @@ impl Resolve {
         // is needed down below for imports.
         let mut storage = [WasmType::I32; Self::MAX_FLAT_PARAMS + 1];
         let mut params = FlatTypes::new(&mut storage);
-        let ok = self.push_flat_list(func.params.iter().map(|(_, param)| param), &mut params);
+        let ok = self.push_flat_list(func.params.iter().map(|p| &p.ty), &mut params);
         assert_eq!(ok, !params.overflow);
 
         let max = match variant {
@@ -199,7 +211,10 @@ impl Resolve {
             if matches!(
                 (&func.kind, variant),
                 (
-                    crate::FunctionKind::Method(_) | crate::FunctionKind::AsyncMethod(_),
+                    crate::FunctionKind::Method(_)
+                        | crate::FunctionKind::AsyncMethod(_)
+                        | crate::FunctionKind::MethodGetter(_)
+                        | crate::FunctionKind::MethodSetter(_),
                     AbiVariant::GuestExport
                         | AbiVariant::GuestExportAsync
                         | AbiVariant::GuestExportAsyncStackful
@@ -324,7 +339,11 @@ impl Resolve {
                     result.push(WasmType::Pointer) && result.push(WasmType::Length)
                 }
 
-                TypeDefKind::FixedSizeList(ty, size) => {
+                TypeDefKind::Map(_, _) => {
+                    result.push(WasmType::Pointer) && result.push(WasmType::Length)
+                }
+
+                TypeDefKind::FixedLengthList(ty, size) => {
                     self.push_flat_list((0..*size).map(|_| ty), result)
                 }
 

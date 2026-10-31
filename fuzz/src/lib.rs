@@ -26,6 +26,8 @@ pub fn generate_valid_module(
     config.canonicalize_nans = u.arbitrary()?;
     config.custom_page_sizes_enabled = u.arbitrary()?;
     config.wide_arithmetic_enabled = u.arbitrary()?;
+    config.acquire_release_atomics_enabled = u.arbitrary()?;
+    config.multibyte_array_access_enabled = u.arbitrary()?;
     config.shared_everything_threads_enabled = u.arbitrary()?;
 
     configure(&mut config, u)?;
@@ -108,7 +110,7 @@ pub fn log_wasm(wasm: &[u8], config: impl Debug) {
 #[cfg(test)]
 mod test {
     use arbitrary::{Result, Unstructured};
-    use rand::{RngCore, SeedableRng, rngs::SmallRng};
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
 
     fn gen_until_pass(mut f: impl FnMut(&mut Unstructured<'_>) -> Result<bool>) -> bool {
         let mut rng = SmallRng::seed_from_u64(0);

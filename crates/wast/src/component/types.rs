@@ -88,7 +88,7 @@ pub enum ModuleTypeDecl<'a> {
     /// An alias local to the component type.
     Alias(Alias<'a>),
     /// An import.
-    Import(core::Import<'a>),
+    Import(core::Imports<'a>),
     /// An export.
     Export(&'a str, core::ItemSig<'a>),
 }
@@ -386,7 +386,8 @@ pub enum ComponentDefinedType<'a> {
     Record(Record<'a>),
     Variant(Variant<'a>),
     List(List<'a>),
-    FixedSizeList(FixedSizeList<'a>),
+    Map(Map<'a>),
+    FixedLengthList(FixedLengthList<'a>),
     Tuple(Tuple<'a>),
     Flags(Flags<'a>),
     Enum(Enum<'a>),
@@ -407,6 +408,8 @@ impl<'a> ComponentDefinedType<'a> {
             Ok(Self::Variant(parser.parse()?))
         } else if l.peek::<kw::list>()? {
             parse_list(parser)
+        } else if l.peek::<kw::map>()? {
+            Ok(Self::Map(parser.parse()?))
         } else if l.peek::<kw::tuple>()? {
             Ok(Self::Tuple(parser.parse()?))
         } else if l.peek::<kw::flags>()? {
@@ -451,6 +454,7 @@ impl Peek for ComponentDefinedType<'_> {
                 Some(("record", _))
                     | Some(("variant", _))
                     | Some(("list", _))
+                    | Some(("map", _))
                     | Some(("tuple", _))
                     | Some(("flags", _))
                     | Some(("enum", _))
@@ -535,8 +539,6 @@ pub struct VariantCase<'a> {
     pub name: &'a str,
     /// The optional type of the case.
     pub ty: Option<ComponentValType<'a>>,
-    /// The optional refinement.
-    pub refines: Option<Refinement<'a>>,
 }
 
 impl<'a> Parse<'a> for VariantCase<'a> {
@@ -545,38 +547,7 @@ impl<'a> Parse<'a> for VariantCase<'a> {
         let id = parser.parse()?;
         let name = parser.parse()?;
         let ty = parser.parse()?;
-        let refines = if !parser.is_empty() {
-            Some(parser.parse()?)
-        } else {
-            None
-        };
-        Ok(Self {
-            span,
-            id,
-            name,
-            ty,
-            refines,
-        })
-    }
-}
-
-/// A refinement for a variant case.
-#[derive(Debug)]
-pub enum Refinement<'a> {
-    /// The refinement is referenced by index.
-    Index(Span, Index<'a>),
-    /// The refinement has been resolved to an index into
-    /// the cases of the variant.
-    Resolved(u32),
-}
-
-impl<'a> Parse<'a> for Refinement<'a> {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        parser.parens(|parser| {
-            let span = parser.parse::<kw::refines>()?.0;
-            let id = parser.parse()?;
-            Ok(Self::Index(span, id))
-        })
+        Ok(Self { span, id, name, ty })
     }
 }
 
@@ -587,9 +558,18 @@ pub struct List<'a> {
     pub element: Box<ComponentValType<'a>>,
 }
 
-/// A fixed size list type.
+/// A map type.
 #[derive(Debug)]
-pub struct FixedSizeList<'a> {
+pub struct Map<'a> {
+    /// The key type of the map.
+    pub key: Box<ComponentValType<'a>>,
+    /// The value type of the map.
+    pub value: Box<ComponentValType<'a>>,
+}
+
+/// A fixed-length list type.
+#[derive(Debug)]
+pub struct FixedLengthList<'a> {
     /// The element type of the array.
     pub element: Box<ComponentValType<'a>>,
     /// Number of Elements
@@ -601,7 +581,7 @@ fn parse_list<'a>(parser: Parser<'a>) -> Result<ComponentDefinedType<'a>> {
     let tp = parser.parse()?;
     let elements = parser.parse::<Option<u32>>()?;
     if let Some(elements) = elements {
-        Ok(ComponentDefinedType::FixedSizeList(FixedSizeList {
+        Ok(ComponentDefinedType::FixedLengthList(FixedLengthList {
             element: Box::new(tp),
             elements,
         }))
@@ -609,6 +589,18 @@ fn parse_list<'a>(parser: Parser<'a>) -> Result<ComponentDefinedType<'a>> {
         Ok(ComponentDefinedType::List(List {
             element: Box::new(tp),
         }))
+    }
+}
+
+impl<'a> Parse<'a> for Map<'a> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        parser.parse::<kw::map>()?;
+        let key = parser.parse()?;
+        let value = parser.parse()?;
+        Ok(Self {
+            key: Box::new(key),
+            value: Box::new(value),
+        })
     }
 }
 
@@ -747,6 +739,8 @@ impl<'a> Parse<'a> for Future<'a> {
 /// A component function type with parameters and result.
 #[derive(Debug)]
 pub struct ComponentFunctionType<'a> {
+    /// Whether or not this is an `async` function.
+    pub async_: bool,
     /// The parameters of a function, optionally each having an identifier for
     /// name resolution and a name for the custom `name` section.
     pub params: Box<[ComponentFunctionParam<'a>]>,
@@ -756,6 +750,7 @@ pub struct ComponentFunctionType<'a> {
 
 impl<'a> Parse<'a> for ComponentFunctionType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
+        let async_ = parser.parse::<Option<kw::r#async>>()?.is_some();
         let mut params: Vec<ComponentFunctionParam> = Vec::new();
         while parser.peek2::<kw::param>()? {
             params.push(parser.parens(|p| p.parse())?);
@@ -771,6 +766,7 @@ impl<'a> Parse<'a> for ComponentFunctionType<'a> {
         };
 
         Ok(Self {
+            async_,
             params: params.into(),
             result,
         })
@@ -856,6 +852,8 @@ impl<'a> Parse<'a> for ComponentType<'a> {
 pub enum ComponentTypeDecl<'a> {
     /// A core type definition local to the component type.
     CoreType(CoreType<'a>),
+    /// A core recursion group local to the component type.
+    CoreRec(core::Rec<'a>),
     /// A type definition local to the component type.
     Type(Type<'a>),
     /// An alias local to the component type.
@@ -870,7 +868,12 @@ impl<'a> Parse<'a> for ComponentTypeDecl<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let mut l = parser.lookahead1();
         if l.peek::<kw::core>()? {
-            Ok(Self::CoreType(parser.parse()?))
+            if parser.peek2::<kw::rec>()? {
+                parser.parse::<kw::core>()?;
+                Ok(Self::CoreRec(parser.parse()?))
+            } else {
+                Ok(Self::CoreType(parser.parse()?))
+            }
         } else if l.peek::<kw::r#type>()? {
             Ok(Self::Type(Type::parse_no_inline_exports(parser)?))
         } else if l.peek::<kw::alias>()? {
@@ -916,6 +919,8 @@ impl<'a> Parse<'a> for InstanceType<'a> {
 pub enum InstanceTypeDecl<'a> {
     /// A core type definition local to the component type.
     CoreType(CoreType<'a>),
+    /// A core recursion group local to the instance type.
+    CoreRec(core::Rec<'a>),
     /// A type definition local to the instance type.
     Type(Type<'a>),
     /// An alias local to the instance type.
@@ -928,7 +933,12 @@ impl<'a> Parse<'a> for InstanceTypeDecl<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let mut l = parser.lookahead1();
         if l.peek::<kw::core>()? {
-            Ok(Self::CoreType(parser.parse()?))
+            if parser.peek2::<kw::rec>()? {
+                parser.parse::<kw::core>()?;
+                Ok(Self::CoreRec(parser.parse()?))
+            } else {
+                Ok(Self::CoreType(parser.parse()?))
+            }
         } else if l.peek::<kw::r#type>()? {
             Ok(Self::Type(Type::parse_no_inline_exports(parser)?))
         } else if l.peek::<kw::alias>()? {
@@ -971,7 +981,7 @@ impl<'a> Parse<'a> for ResourceType<'a> {
         } else {
             Some(parser.parens(|p| {
                 p.parse::<kw::dtor>()?;
-                p.parens(|p| p.parse())
+                Ok(p.parse::<CorePrefixedRef<'_, _, true>>()?.0)
             })?)
         };
         Ok(Self { rep, dtor })
