@@ -2930,7 +2930,7 @@ dependencies = [
 [[package]]
 name = "wit-bindgen"
 version = "0.63.0"
-source = "git+https://github.com/chenyan2002/wit-bindgen?branch=fix-async#9c6884072c5975883b419351080be4bfa09cf4a2"
+source = "git+https://github.com/chenyan2002/wit-bindgen?branch=fix-async#dcc2a37b68b4da0284b3a3f29c45bfca81015d4e"
 
 [[package]]
 name = "wit-bindgen-core"

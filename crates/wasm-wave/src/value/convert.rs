@@ -423,7 +423,7 @@ mod async_handles {
     use alloc::format;
 
     use wit_bindgen::rt::async_support::ErrorContext;
-    use wit_bindgen::{FutureReader, StreamReader};
+    use wit_bindgen::{FutureReader, FutureWriter, StreamReader, StreamWriter};
 
     use super::{ToValue, ValueTyped};
     use crate::{
@@ -446,12 +446,36 @@ mod async_handles {
         }
     }
 
+    // Writable ends never appear in values, as only readable ends cross components, but they
+    // label streams and futures that the component writes, as their readable ends move on.
+    impl<T: 'static> ValueTyped for StreamWriter<T> {
+        fn value_type() -> Type {
+            Type::handle("stream")
+        }
+    }
+    impl<T: 'static> ToValue for StreamWriter<T> {
+        fn to_value(&self) -> Value {
+            handle_value("stream", self.handle())
+        }
+    }
+
     impl<T: 'static> ValueTyped for FutureReader<T> {
         fn value_type() -> Type {
             Type::handle("future")
         }
     }
     impl<T: 'static> ToValue for FutureReader<T> {
+        fn to_value(&self) -> Value {
+            handle_value("future", self.handle())
+        }
+    }
+
+    impl<T: 'static> ValueTyped for FutureWriter<T> {
+        fn value_type() -> Type {
+            Type::handle("future")
+        }
+    }
+    impl<T: 'static> ToValue for FutureWriter<T> {
         fn to_value(&self) -> Value {
             handle_value("future", self.handle())
         }
