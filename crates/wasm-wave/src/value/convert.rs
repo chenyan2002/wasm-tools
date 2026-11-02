@@ -416,11 +416,15 @@ impl_tuple!(
     )
 );
 
+#[cfg(feature = "wit-bindgen")]
+pub use async_handles::set_handle_label;
+
 // Streams, futures and error contexts are not tied to a WIT resource type,
 // so they are represented as handles with a fixed type name.
 #[cfg(feature = "wit-bindgen")]
 mod async_handles {
     use alloc::format;
+    use std::sync::RwLock;
 
     use wit_bindgen::rt::async_support::ErrorContext;
     use wit_bindgen::{FutureReader, FutureWriter, StreamReader, StreamWriter};
@@ -431,8 +435,46 @@ mod async_handles {
         value::{Type, Value},
     };
 
+    /// A function giving the number that labels a handle, see [`set_handle_label`].
+    type HandleLabel = fn(kind: &str, handle: u32) -> Option<u32>;
+
+    // The function `set_handle_label` set, if any.
+    static HANDLE_LABEL: RwLock<Option<HandleLabel>> = RwLock::new(None);
+
+    /// Sets how streams, futures and error-contexts are labeled, e.g. `#stream-7`: `label(kind,
+    /// handle)` gives the number for the handle `handle` of `kind` (`stream`, `future` or
+    /// `error-context`), or `None` for the handle itself, which is also the default.
+    ///
+    /// For a component that labels handles by its own numbers, e.g. a counter, as a handle's
+    /// number is reused once it's dropped, or moved to another component.
+    pub fn set_handle_label(label: HandleLabel) {
+        *HANDLE_LABEL.write().unwrap() = Some(label);
+    }
+
     fn handle_value(name: &str, handle: u32) -> Value {
-        Value::make_handle(format!("{name}-{handle}").into())
+        let label = *HANDLE_LABEL.read().unwrap();
+        let number = label
+            .and_then(|label| label(name, handle))
+            .unwrap_or(handle);
+        Value::make_handle(format!("{name}-{number}").into())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::wasm::WasmValue;
+
+        fn label(value: Value) -> alloc::string::String {
+            value.unwrap_handle().into_owned()
+        }
+
+        #[test]
+        fn handle_label() {
+            assert_eq!(label(handle_value("stream", 3)), "stream-3");
+            set_handle_label(|kind, handle| (kind == "stream").then_some(handle + 100));
+            assert_eq!(label(handle_value("stream", 3)), "stream-103");
+            assert_eq!(label(handle_value("future", 3)), "future-3");
+        }
     }
 
     impl<T: 'static> ValueTyped for StreamReader<T> {
@@ -548,4 +590,3 @@ mod tests {
         }
     }
 }
-
