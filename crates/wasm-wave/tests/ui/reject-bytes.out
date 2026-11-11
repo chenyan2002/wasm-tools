@@ -1,0 +1,19 @@
+// Non-ASCII content
+invalid byte string: byte strings may only contain ASCII characters at 8..13
+invalid byte string: byte strings may only contain ASCII characters at 8..17
+invalid byte string: byte strings may only contain ASCII characters at 8..17
+// Missing mandatory escapes
+invalid token at 11..13
+invalid token at 9..13
+// Invalid escapes
+invalid token at 9..11
+// Byte strings are only list<u8>
+invalid value type: byte strings can only be used for list<u8> at 13..19
+invalid value type: byte strings can only be used for list<u8> at 11..17
+invalid value type at 7..13
+// Uppercase prefix
+unexpected token: String at 9..14
+// Whitespace between prefix and string
+unexpected token: String at 10..15
+// Not a map key
+unexpected token: Bytes at 18..22

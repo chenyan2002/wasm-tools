@@ -46,6 +46,28 @@ fn list_round_trips() {
 }
 
 #[test]
+fn byte_string_round_trips() {
+    let ty = Type::list(Type::U8);
+    for (bytes, expected) in [
+        (&b"abc"[..], r#"b"abc""#),
+        (b" ~", r#"b" ~""#),
+        (b"\\\"'", r#"b"\\\"\'""#),
+        (b"\n", "[10]"),
+        (b"\x7f", "[127]"),
+        (b"a\xff", "[97, 255]"),
+        (b"", "[]"),
+    ] {
+        let val = Value::make_list(&ty, bytes.iter().copied().map(Value::make_u8)).unwrap();
+        assert_eq!(crate::to_string(&val).unwrap(), expected);
+        test_value_round_trip(val);
+    }
+    // All printable ASCII bytes.
+    let val = Value::make_list(&ty, (b' '..=b'~').map(Value::make_u8)).unwrap();
+    assert!(crate::to_string(&val).unwrap().starts_with("b\""));
+    test_value_round_trip(val);
+}
+
+#[test]
 fn record_round_trip() {
     let option_ty = Type::option(Type::U8);
     let record_ty =

@@ -11,7 +11,7 @@ WAVE is a human-oriented text encoding of WebAssembly Component Model values. It
 |Chars|`'x'`, `'☃︎'`, `'\''`, `'\u{0}'`
 |Strings|`"abc\t123"`
 |Tuples|`("abc", 123)`
-|Lists|`[1, 2, 3]`
+|Lists|`[1, 2, 3]`, `b"bytes"`
 |Maps|`{"one": 1, "two": 2}`, `{}`
 |Records|`{field-a: 1, field-b: "two"}`
 |Variants|`days(30)`, `forever`
@@ -144,6 +144,10 @@ Tuples are encoded as a parenthesized sequence of comma-separated values. Traili
 Lists are encoded as a square-braketed sequence of comma-separated values. Trailing commas are permitted.
 
 `list<char>` → `[]`, `['a', 'b', 'c']`
+
+A `list<u8>` may also be encoded as a byte string: a `b` immediately followed by a string (as for [Strings](#strings)) whose decoded characters are all ASCII, each encoding one byte. A non-empty `list<u8>` whose bytes are all printable ASCII (`0x20` through `0x7e`) is written as a byte string.
+
+`list<u8>` → `[]`, `[0, 255]`, `b"abc"` = `[97, 98, 99]`, `b"\t\u{0}"` = `[9, 0]`
 
 ### Maps
 

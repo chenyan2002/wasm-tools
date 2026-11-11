@@ -1,0 +1,19 @@
+// Non-ASCII content
+list-u8(b"é");
+list-u8(b"\u{80}");
+list-u8(b"\u{ff}");
+// Missing mandatory escapes
+list-u8(b""");
+list-u8(b"\");
+// Invalid escapes
+list-u8(b"\j");
+// Byte strings are only list<u8>
+list-strings(b"abc");
+list-chars(b"abc");
+string(b"abc");
+// Uppercase prefix
+list-u8(B"abc");
+// Whitespace between prefix and string
+list-u8(b "abc");
+// Not a map key
+map-bool-list-u8({b"a": []});

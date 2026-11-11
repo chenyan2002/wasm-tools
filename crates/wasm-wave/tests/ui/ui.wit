@@ -10,6 +10,8 @@ interface ui {
     list-chars: func(vals: list<char>);
     %string: func(val: string);
     list-strings: func(vals: list<string>);
+    list-u8: func(vals: list<u8>);
+    list-list-u8: func(vals: list<list<u8>>);
     option-u8: func(opt: option<u8>);
     result-ok-u8: func(res: result<u8>);
     result-err-u8: func(res: result<_, u8>);

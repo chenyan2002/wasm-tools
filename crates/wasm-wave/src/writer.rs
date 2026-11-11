@@ -75,6 +75,13 @@ impl<W: Write> Writer<W> {
                 self.write_str("\"")
             }
             WasmTypeKind::List => {
+                if let Some(bytes) = printable_ascii_bytes(val) {
+                    self.write_str("b\"")?;
+                    for byte in bytes {
+                        self.write_char(byte.into())?;
+                    }
+                    return self.write_str("\"");
+                }
                 self.write_str("[")?;
                 for (idx, val) in val.unwrap_list().enumerate() {
                     if idx != 0 {
@@ -223,6 +230,19 @@ impl<W: Write> Writer<W> {
         }
         Ok(())
     }
+}
+
+/// Returns the bytes of a non-empty list of `u8`s if they are all printable
+/// ASCII (space through `~`), which are written as a byte string, e.g. `b"abc"`.
+fn printable_ascii_bytes<V: WasmValue>(val: &V) -> Option<Vec<u8>> {
+    let bytes = val
+        .unwrap_list()
+        .map(|val| match val.kind() {
+            WasmTypeKind::U8 => Some(val.unwrap_u8()).filter(|b| matches!(b, b' '..=b'~')),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!bytes.is_empty()).then_some(bytes)
 }
 
 /// Merges map entries that have the same key, as the component model

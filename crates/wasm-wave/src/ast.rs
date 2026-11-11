@@ -126,6 +126,29 @@ impl Node {
         }
     }
 
+    /// Returns the decoded bytes if this node represents a valid byte string,
+    /// e.g. `b"abc"`.
+    ///
+    /// Byte strings use the same escapes as strings, but every decoded
+    /// character must be ASCII; each one becomes a single byte.
+    pub fn as_bytes(&self, src: &str) -> Result<Vec<u8>, ParserError> {
+        self.ensure_type(NodeType::Bytes)?;
+        let span = self.span.start + 2..self.span.end - 1;
+        let mut bytes = Vec::with_capacity(span.len());
+        for part in StringPartsIter::new(&src[span.clone()], span.start) {
+            let part = part?;
+            if !part.is_ascii() {
+                return Err(ParserError::with_detail(
+                    ParserErrorKind::InvalidBytes,
+                    self.span(),
+                    "byte strings may only contain ASCII characters",
+                ));
+            }
+            bytes.extend_from_slice(part.as_bytes());
+        }
+        Ok(bytes)
+    }
+
     /// Returns an iterator of value nodes if this node represents a tuple.
     pub fn as_tuple(&self) -> Result<impl ExactSizeIterator<Item = &Node>, ParserError> {
         self.ensure_type(NodeType::Tuple)?;
@@ -317,6 +340,17 @@ impl Node {
 
     fn to_wasm_list<V: WasmValue>(&self, ty: &V::Type, src: &str) -> Result<V, ParserError> {
         let element_type = ty.list_element_type().unwrap();
+        if self.ty == NodeType::Bytes {
+            if element_type.kind() != WasmTypeKind::U8 {
+                return Err(ParserError::with_detail(
+                    ParserErrorKind::InvalidType,
+                    self.span(),
+                    "byte strings can only be used for list<u8>",
+                ));
+            }
+            let elements = self.as_bytes(src)?.into_iter().map(V::make_u8);
+            return V::make_list(ty, elements).map_err(|err| self.wasm_value_error(err));
+        }
         let elements = self
             .as_list()?
             .map(|node| node.to_wasm_value(&element_type, src))
@@ -538,6 +572,9 @@ pub enum NodeType {
     /// Multiline String
     /// Span includes delimiters.
     MultilineString,
+    /// Byte string, e.g. `b"abc"`
+    /// Represents a `list<u8>`. Span includes the `b` prefix and delimiters.
+    Bytes,
     /// Tuple
     /// Child nodes are the tuple values.
     Tuple,

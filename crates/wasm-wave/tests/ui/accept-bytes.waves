@@ -1,0 +1,18 @@
+// Printable ASCII is written as a byte string
+list-u8([72, 105, 32, 126]);
+list-u8(b"Hi ~");
+list-u8(b"\\\'\"");
+// Other bytes are written as a list
+list-u8([0, 127, 255]);
+list-u8([72, 10]);
+list-u8(b"\t\n\r\u{0}\u{7f}");
+// Empty
+list-u8([]);
+list-u8(b"");
+// Nested
+list-list-u8([b"abc", [1, 2], b"", [104, 105]]);
+// Lists of other types are not written as byte strings
+list-strings(["a"]);
+list-chars(['a']);
+// Map values
+map-bool-list-u8({true: b"yes", false: [1, 2]});

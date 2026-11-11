@@ -14,6 +14,7 @@ value ::= number
         | char
         | string
         | multiline-string
+        | byte-string
         | variant-case
         | tuple
         | list
@@ -46,6 +47,8 @@ string-char ::= common-char | [']
 multiline-string ::= '"""' line-break multiline-string-line* [ ]* '"""'
 multiline-string-line ::= [ ]* multiline-string-char* line-break
 multiline-string-char ::= common-char | ['"]
+
+byte-string ::= 'b' string
 
 line-break ::= '\r\n' | '\n'
 
@@ -92,4 +95,5 @@ word ::= [a-z0-9]+
 * "`Unicode scalar value`" is defined by Unicode
 * `escape-unicode` must identify a valid Unicode scalar value, using 1 to 6 hexadecimal digits.
 * `multiline-string-line` must not contain `"""`
+* `byte-string` must only decode to ASCII characters, and is only valid for `list<u8>`
 * See [README.md#multiline-strings](./README.md#multiline-strings) for the indentation and decoding rules that constrain `multiline-string`.

@@ -69,6 +69,10 @@ pub enum Token {
     /// A multi-line string literal
     #[token(r#"""""#, lex_multiline_string)]
     MultilineString,
+
+    /// A byte string literal, e.g. `b"abc"`
+    #[regex(r#"b"([^\\"\n]|(?&char_escape))*""#)]
+    Bytes,
 }
 
 impl Display for Token {
