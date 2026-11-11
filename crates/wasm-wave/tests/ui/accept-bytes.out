@@ -2,10 +2,17 @@
 list-u8(vals: b"Hi ~")
 list-u8(vals: b"Hi ~")
 list-u8(vals: b"\\\'\"")
-// Other bytes are written as a list
+// Tab, newline and carriage return count as text
+list-u8(vals: b"Hi\t\n\r")
+// Up to 10% other bytes are escaped
+list-u8(vals: b"abcdefghi\x00")
+list-u8(vals: b"ezone_abbreviation\":\"GMT\",\"elevation\":86.0,\"current_units\":{\"time\":\"iso8601\",\"interval\":\"seconds\",\"temperature_2m\":\"\xc2\xb0C\",\"wind_s")
+// Otherwise bytes are written as a list
 list-u8(vals: [0, 127, 255])
-list-u8(vals: [72, 10])
+list-u8(vals: [34, 116, 101, 109, 112, 34, 58, 34, 194, 176, 67, 34])
+list-u8(vals: [97, 98, 99, 100, 101, 102, 103, 104, 0])
 list-u8(vals: [9, 10, 13, 0, 127])
+list-u8(vals: [0, 127, 255, 65])
 // Empty
 list-u8(vals: [])
 list-u8(vals: [])

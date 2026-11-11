@@ -52,15 +52,27 @@ fn byte_string_round_trips() {
         (&b"abc"[..], r#"b"abc""#),
         (b" ~", r#"b" ~""#),
         (b"\\\"'", r#"b"\\\"\'""#),
-        (b"\n", "[10]"),
+        (b"a\tb\r\n", r#"b"a\tb\r\n""#),
         (b"\x7f", "[127]"),
         (b"a\xff", "[97, 255]"),
         (b"", "[]"),
+        // 90% text bytes is a byte string...
+        (b"aaaaaaaaa\x00", r#"b"aaaaaaaaa\x00""#),
+        (
+            b"temperature: 18.5 \xc2\xb0",
+            r#"b"temperature: 18.5 \xc2\xb0""#,
+        ),
+        // ...but less than that is not.
+        (b"aaaaaaaa\x00", "[97, 97, 97, 97, 97, 97, 97, 97, 0]"),
     ] {
         let val = Value::make_list(&ty, bytes.iter().copied().map(Value::make_u8)).unwrap();
         assert_eq!(crate::to_string(&val).unwrap(), expected);
         test_value_round_trip(val);
     }
+    // All bytes, written as a list.
+    let val = Value::make_list(&ty, (0..=u8::MAX).map(Value::make_u8)).unwrap();
+    assert!(crate::to_string(&val).unwrap().starts_with('['));
+    test_value_round_trip(val);
     // All printable ASCII bytes.
     let val = Value::make_list(&ty, (b' '..=b'~').map(Value::make_u8)).unwrap();
     assert!(crate::to_string(&val).unwrap().starts_with("b\""));

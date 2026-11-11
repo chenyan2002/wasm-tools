@@ -145,9 +145,11 @@ Lists are encoded as a square-braketed sequence of comma-separated values. Trail
 
 `list<char>` → `[]`, `['a', 'b', 'c']`
 
-A `list<u8>` may also be encoded as a byte string: a `b` immediately followed by a string (as for [Strings](#strings)) whose decoded characters are all ASCII, each encoding one byte. A non-empty `list<u8>` whose bytes are all printable ASCII (`0x20` through `0x7e`) is written as a byte string.
+A `list<u8>` may also be encoded as a byte string: a `b` immediately followed by a string (as for [Strings](#strings)). Each character in a byte string encodes one byte and must be ASCII. Byte strings also accept the escape `\xNN`, where `NN` is exactly two hexadecimal digits, for any byte.
 
-`list<u8>` → `[]`, `[0, 255]`, `b"abc"` = `[97, 98, 99]`, `b"\t\u{0}"` = `[9, 0]`
+A non-empty `list<u8>` is written as a byte string if at least 90% of its bytes are printable ASCII (`0x20` through `0x7e`), tab, newline, or carriage return. Other bytes are written as `\xNN`.
+
+`list<u8>` → `[]`, `[0, 255]`, `b"abc"` = `[97, 98, 99]`, `b"\t\u{0}\xff"` = `[9, 0, 255]`
 
 ### Maps
 

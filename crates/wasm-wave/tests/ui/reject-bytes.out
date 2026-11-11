@@ -1,12 +1,17 @@
 // Non-ASCII content
-invalid byte string: byte strings may only contain ASCII characters at 8..13
-invalid byte string: byte strings may only contain ASCII characters at 8..17
-invalid byte string: byte strings may only contain ASCII characters at 8..17
+invalid byte string: non-ASCII characters must be written as \xNN escapes at 10..12
+invalid byte string: non-ASCII characters must be written as \xNN escapes at 10..16
+invalid byte string: non-ASCII characters must be written as \xNN escapes at 10..16
 // Missing mandatory escapes
 invalid token at 11..13
 invalid token at 9..13
 // Invalid escapes
 invalid token at 9..11
+invalid token at 9..11
+invalid token at 9..11
+invalid token at 9..11
+// Byte escapes are only for byte strings
+invalid token at 7..9
 // Byte strings are only list<u8>
 invalid value type: byte strings can only be used for list<u8> at 13..19
 invalid value type: byte strings can only be used for list<u8> at 11..17

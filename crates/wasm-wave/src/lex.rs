@@ -70,8 +70,8 @@ pub enum Token {
     #[token(r#"""""#, lex_multiline_string)]
     MultilineString,
 
-    /// A byte string literal, e.g. `b"abc"`
-    #[regex(r#"b"([^\\"\n]|(?&char_escape))*""#)]
+    /// A byte string literal, e.g. `b"abc\xff"`
+    #[regex(r#"b"([^\\"\n]|(?&char_escape)|\\x[0-9a-fA-F]{2})*""#)]
     Bytes,
 }
 

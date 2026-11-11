@@ -7,6 +7,11 @@ list-u8(b""");
 list-u8(b"\");
 // Invalid escapes
 list-u8(b"\j");
+list-u8(b"\x0");
+list-u8(b"\xg0");
+list-u8(b"\x{41}");
+// Byte escapes are only for byte strings
+string("\x41");
 // Byte strings are only list<u8>
 list-strings(b"abc");
 list-chars(b"abc");

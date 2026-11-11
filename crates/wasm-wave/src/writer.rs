@@ -75,10 +75,14 @@ impl<W: Write> Writer<W> {
                 self.write_str("\"")
             }
             WasmTypeKind::List => {
-                if let Some(bytes) = printable_ascii_bytes(val) {
+                if let Some(bytes) = text_bytes(val) {
                     self.write_str("b\"")?;
                     for byte in bytes {
-                        self.write_char(byte.into())?;
+                        if is_text_byte(byte) {
+                            self.write_char(byte.into())?;
+                        } else {
+                            write!(self.inner, "\\x{byte:02x}")?;
+                        }
                     }
                     return self.write_str("\"");
                 }
@@ -232,17 +236,23 @@ impl<W: Write> Writer<W> {
     }
 }
 
-/// Returns the bytes of a non-empty list of `u8`s if they are all printable
-/// ASCII (space through `~`), which are written as a byte string, e.g. `b"abc"`.
-fn printable_ascii_bytes<V: WasmValue>(val: &V) -> Option<Vec<u8>> {
+/// Returns the bytes of a non-empty list of `u8`s if they look like text,
+/// i.e. at least 90% of them are [text bytes](is_text_byte). Such a list is
+/// written as a byte string, e.g. `b"abc"`, with any other bytes escaped as
+/// `\xNN`.
+fn text_bytes<V: WasmValue>(val: &V) -> Option<Vec<u8>> {
     let bytes = val
         .unwrap_list()
-        .map(|val| match val.kind() {
-            WasmTypeKind::U8 => Some(val.unwrap_u8()).filter(|b| matches!(b, b' '..=b'~')),
-            _ => None,
-        })
+        .map(|val| (val.kind() == WasmTypeKind::U8).then(|| val.unwrap_u8()))
         .collect::<Option<Vec<_>>>()?;
-    (!bytes.is_empty()).then_some(bytes)
+    let text = bytes.iter().filter(|b| is_text_byte(**b)).count();
+    (!bytes.is_empty() && text * 10 >= bytes.len() * 9).then_some(bytes)
+}
+
+/// Returns true for printable ASCII (space through `~`), tab, newline and
+/// carriage return.
+fn is_text_byte(byte: u8) -> bool {
+    matches!(byte, b' '..=b'~' | b'\t' | b'\n' | b'\r')
 }
 
 /// Merges map entries that have the same key, as the component model

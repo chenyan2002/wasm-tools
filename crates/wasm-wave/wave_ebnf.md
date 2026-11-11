@@ -48,7 +48,8 @@ multiline-string ::= '"""' line-break multiline-string-line* [ ]* '"""'
 multiline-string-line ::= [ ]* multiline-string-char* line-break
 multiline-string-char ::= common-char | ['"]
 
-byte-string ::= 'b' string
+byte-string ::= 'b"' byte-string-char* '"'
+byte-string-char ::= string-char | '\x' [0-9a-fA-F] [0-9a-fA-F]
 
 line-break ::= '\r\n' | '\n'
 
@@ -95,5 +96,5 @@ word ::= [a-z0-9]+
 * "`Unicode scalar value`" is defined by Unicode
 * `escape-unicode` must identify a valid Unicode scalar value, using 1 to 6 hexadecimal digits.
 * `multiline-string-line` must not contain `"""`
-* `byte-string` must only decode to ASCII characters, and is only valid for `list<u8>`
+* `byte-string` is only valid for `list<u8>`; every `byte-string-char` other than a `\x` escape must be (or escape) an ASCII character
 * See [README.md#multiline-strings](./README.md#multiline-strings) for the indentation and decoding rules that constrain `multiline-string`.

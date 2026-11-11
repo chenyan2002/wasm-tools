@@ -127,24 +127,47 @@ impl Node {
     }
 
     /// Returns the decoded bytes if this node represents a valid byte string,
-    /// e.g. `b"abc"`.
+    /// e.g. `b"abc\xff"`.
     ///
-    /// Byte strings use the same escapes as strings, but every decoded
-    /// character must be ASCII; each one becomes a single byte.
+    /// Byte strings use the same escapes as strings, plus `\xNN` for any byte.
+    /// Every other character, escaped or not, must be ASCII and is a single
+    /// byte.
     pub fn as_bytes(&self, src: &str) -> Result<Vec<u8>, ParserError> {
         self.ensure_type(NodeType::Bytes)?;
-        let span = self.span.start + 2..self.span.end - 1;
-        let mut bytes = Vec::with_capacity(span.len());
-        for part in StringPartsIter::new(&src[span.clone()], span.start) {
-            let part = part?;
-            if !part.is_ascii() {
-                return Err(ParserError::with_detail(
-                    ParserErrorKind::InvalidBytes,
-                    self.span(),
-                    "byte strings may only contain ASCII characters",
-                ));
-            }
-            bytes.extend_from_slice(part.as_bytes());
+        let start = self.span.start + 2;
+        let inner = &src[start..self.span.end - 1];
+        let mut bytes = Vec::with_capacity(inner.len());
+        let mut rest = inner;
+        while let Some(ch) = rest.chars().next() {
+            let pos = start + inner.len() - rest.len();
+            let (byte, len) = if let Some(hex) = rest.strip_prefix("\\x") {
+                let byte = hex
+                    .get(..2)
+                    .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                    .ok_or_else(|| {
+                        ParserError::new(ParserErrorKind::InvalidEscape, pos..pos + 2)
+                    })?;
+                (byte, 4)
+            } else {
+                let (ch, len) = if ch == '\\' {
+                    unescape(rest).ok_or_else(|| {
+                        ParserError::new(ParserErrorKind::InvalidEscape, pos..pos + 1)
+                    })?
+                } else {
+                    (ch, ch.len_utf8())
+                };
+                let byte = u8::try_from(ch).ok().filter(u8::is_ascii).ok_or_else(|| {
+                    ParserError::with_detail(
+                        ParserErrorKind::InvalidBytes,
+                        pos..pos + len,
+                        "non-ASCII characters must be written as \\xNN escapes",
+                    )
+                })?;
+                (byte, len)
+            };
+            bytes.push(byte);
+            rest = &rest[len..];
         }
         Ok(bytes)
     }
