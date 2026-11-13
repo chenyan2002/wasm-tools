@@ -43,11 +43,37 @@ pub struct ComponentWorld<'a> {
     /// This set is used to determine when types are imported/used whether they
     /// come from imports or exports.
     pub exports_used: HashMap<InterfaceId, HashSet<InterfaceId>>,
+    /// Donut mode: how the embedded guest is wired up.
+    pub donut: Option<DonutWorld>,
+}
+
+/// Donut mode: how the embedded guest's imports and exports map onto the
+/// donut's world. See [`crate::donut`].
+#[derive(Debug, Default)]
+pub struct DonutWorld {
+    /// The guest component to embed.
+    pub guest: Vec<u8>,
+    /// For each import name of the guest component, the interface of the
+    /// donut's world that satisfies it: a virtualized export (made internal)
+    /// or a passthrough import.
+    pub guest_imports: IndexMap<String, InterfaceId>,
+    /// Exports of the donut's world that implement virtualized guest imports.
+    /// These are lifted but not exported from the component.
+    pub virtual_exports: IndexSet<WorldKey>,
+    /// Functions of passthrough imports that the guest needs, which must be
+    /// part of the donut's import even if the main module doesn't call them.
+    pub passthrough_funcs: IndexMap<InterfaceId, IndexSet<String>>,
+    /// The guest's exported interfaces and their names in the guest
+    /// component.
+    pub guest_exports: IndexMap<WorldKey, String>,
 }
 
 #[derive(Debug)]
 pub struct ImportedInterface {
     pub lowerings: IndexMap<(String, AbiVariant), Lowering>,
+    /// Donut mode: functions imported for the embedded guest, which are part
+    /// of the import's type but aren't lowered into the main module.
+    pub guest_funcs: IndexSet<String>,
     pub interface: Option<InterfaceId>,
     pub implements: Option<InterfaceId>,
     pub external_id: Option<String>,
@@ -82,8 +108,10 @@ impl<'a> ComponentWorld<'a> {
             import_map: IndexMap::new(),
             live_type_imports: Default::default(),
             exports_used: HashMap::new(),
+            donut: None,
         };
 
+        ret.process_donut()?;
         ret.process_adapters()?;
         ret.process_imports()?;
         ret.process_exports_used();
@@ -294,6 +322,16 @@ impl<'a> ComponentWorld<'a> {
                 &self.info,
             )?;
         }
+        if let Some(donut) = &self.donut {
+            for (id, funcs) in donut.passthrough_funcs.iter() {
+                let entry = self
+                    .import_map
+                    .values_mut()
+                    .find(|i| i.interface == Some(*id))
+                    .expect("passthrough imports are imports of the world");
+                entry.guest_funcs.extend(funcs.iter().cloned());
+            }
+        }
         return Ok(());
 
         fn add_item(
@@ -328,6 +366,7 @@ impl<'a> ComponentWorld<'a> {
                 .or_insert_with(|| ImportedInterface {
                     interface: interface_id,
                     lowerings: Default::default(),
+                    guest_funcs: Default::default(),
                     implements,
                     external_id: external_id.clone(),
                 });
@@ -364,6 +403,13 @@ impl<'a> ComponentWorld<'a> {
         // First use the previously calculated metadata about live imports to
         // determine the set of live types in those imports.
         self.add_live_imports(world, &self.info.imports, &mut live);
+        if let Some(donut) = &self.donut {
+            for (id, funcs) in donut.passthrough_funcs.iter() {
+                for func in funcs {
+                    live.add_func(resolve, &resolve.interfaces[*id].functions[func.as_str()]);
+                }
+            }
+        }
         for (adapter_name, adapter) in self.adapters.iter() {
             log::trace!("processing adapter `{adapter_name}`");
             self.add_live_imports(world, &adapter.info.imports, &mut live);
@@ -512,8 +558,142 @@ impl<'a> ComponentWorld<'a> {
                 | Import::ThreadYieldThenResume { .. }
                 | Import::ThreadSuspendThenPromote { .. }
                 | Import::ThreadYieldThenPromote { .. } => {}
+
+                // Guest exports are typed by the guest instance, not by this
+                // world's imports.
+                Import::GuestExportFunc(..) | Import::GuestResourceDrop(..) => {}
             }
         }
+    }
+
+    /// Donut mode: resolves how the guest's imports are satisfied and which
+    /// of the world's exports are internal.
+    fn process_donut(&mut self) -> Result<()> {
+        let Some(donut) = &self.encoder.donut else {
+            if self.encoder.donut_guest.is_some() {
+                bail!(
+                    "a donut guest was provided, but the module has no `{}` section",
+                    crate::donut::MANIFEST_SECTION_NAME
+                );
+            }
+            return Ok(());
+        };
+        let Some(guest) = &self.encoder.donut_guest else {
+            bail!(
+                "the module is a donut (it has a `{}` section), but no guest \
+                 component to embed was provided",
+                crate::donut::MANIFEST_SECTION_NAME
+            );
+        };
+        let resolve = &self.encoder.metadata.resolve;
+        let world = &resolve.worlds[self.encoder.metadata.world];
+        let guest_world = &resolve.worlds[donut.guest_world];
+        let mut ret = DonutWorld {
+            guest: guest.clone(),
+            ..DonutWorld::default()
+        };
+
+        for name in donut.virtualized.iter() {
+            let key = world
+                .exports
+                .keys()
+                .find(|k| resolve.name_world_key(k) == *name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "virtualized guest import `{name}` is not exported by the donut's world"
+                    )
+                })?;
+            ret.virtual_exports.insert(key.clone());
+        }
+
+        // The actual imports and exports of the guest component.
+        let (guest_resolve, guest_world_id) =
+            match crate::decode(guest).context("failed to decode the donut guest component")? {
+                crate::DecodedWasm::Component(resolve, world) => (resolve, world),
+                crate::DecodedWasm::WitPackage(..) => {
+                    bail!("the donut guest must be a component, not a WIT package")
+                }
+            };
+        let actual = &guest_resolve.worlds[guest_world_id];
+
+        for (actual_key, _) in actual.imports.iter() {
+            let name = guest_resolve.name_world_key(actual_key);
+            let Some((_, item)) = guest_world
+                .imports
+                .iter()
+                .find(|(k, _)| resolve.name_world_key(k) == name)
+            else {
+                bail!("the donut guest imports `{name}`, which is not imported by its world");
+            };
+            let guest_id = match item {
+                WorldItem::Interface { id, .. } => *id,
+                _ => bail!(
+                    "the donut guest imports `{name}`, but only interface imports are \
+                     supported for donut guests"
+                ),
+            };
+
+            if donut.virtualized.contains(&name) {
+                let key = ret
+                    .virtual_exports
+                    .iter()
+                    .find(|k| resolve.name_world_key(k) == name)
+                    .unwrap();
+                let WorldItem::Interface { id, .. } = &world.exports[key] else {
+                    bail!("virtualized guest import `{name}` must be exported as an interface");
+                };
+                ret.guest_imports.insert(name, *id);
+                continue;
+            }
+
+            // A passthrough import: find the world's import of the same
+            // interface, matching semver-compatible versions.
+            let wanted = resolve.canonicalized_id_of(guest_id);
+            let found = world.imports.iter().find_map(|(_, item)| match item {
+                WorldItem::Interface { id, .. }
+                    if wanted.is_some() && resolve.canonicalized_id_of(*id) == wanted =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            });
+            let Some(id) = found else {
+                bail!(
+                    "the donut guest imports `{name}`, which is neither virtualized nor \
+                     imported by the donut's world"
+                );
+            };
+            let funcs = ret.passthrough_funcs.entry(id).or_default();
+            for func in resolve.interfaces[guest_id].functions.keys() {
+                if !resolve.interfaces[id].functions.contains_key(func) {
+                    bail!(
+                        "the donut guest needs `{name}.{func}`, which the donut's import of \
+                         `{}` does not have",
+                        resolve.id_of(id).unwrap_or_default()
+                    );
+                }
+                funcs.insert(func.clone());
+            }
+            ret.guest_imports.insert(name, id);
+        }
+
+        for (key, item) in guest_world.exports.iter() {
+            if !matches!(item, WorldItem::Interface { .. }) {
+                continue;
+            }
+            let name = resolve.name_world_key(key);
+            if !actual
+                .exports
+                .keys()
+                .any(|k| guest_resolve.name_world_key(k) == name)
+            {
+                bail!("the donut guest does not export `{name}`, which its world exports");
+            }
+            ret.guest_exports.insert(key.clone(), name);
+        }
+
+        self.donut = Some(ret);
+        Ok(())
     }
 
     fn process_exports_used(&mut self) {

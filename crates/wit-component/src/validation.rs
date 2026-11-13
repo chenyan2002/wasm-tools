@@ -223,6 +223,18 @@ pub enum Import {
     /// the id within that interface.
     ExportedResourceDrop(WorldKey, TypeId),
 
+    /// Donut mode: a function exported by the embedded guest, imported via a
+    /// `[guest-export]` module.
+    ///
+    /// The `WorldKey` and `InterfaceId` identify the guest's exported
+    /// interface (an import of the donut's guest-exports world) and `String`
+    /// is the WIT name of the function.
+    GuestExportFunc(WorldKey, InterfaceId, String),
+
+    /// Donut mode: `resource.drop` of a resource defined by the embedded
+    /// guest, imported via a `[guest-export]` module.
+    GuestResourceDrop(WorldKey, TypeId),
+
     /// A `canon resource.new` intrinsic for an exported item is being
     /// imported.
     ///
@@ -617,12 +629,68 @@ impl ImportMap {
             });
         }
 
+        if let Some(module) = import
+            .module
+            .strip_prefix(crate::donut::GUEST_EXPORT_MODULE_PREFIX)
+        {
+            return self.classify_guest_export(module, import.name, encoder, ty);
+        }
+
         let (module, names) = match import.module.strip_prefix("cm32p2") {
             Some(suffix) => (suffix, STANDARD),
             None if encoder.reject_legacy_names => (import.module, STANDARD),
             None => (import.module, LEGACY),
         };
         self.classify_component_model_import(module, import.name, encoder, ty, names)
+    }
+
+    /// Classifies a donut-mode `[guest-export]{module}::{name}` import.
+    ///
+    /// `module` names an interface exported by the guest and `name` is either
+    /// one of its functions or `[resource-drop]R` for a resource it defines.
+    fn classify_guest_export(
+        &self,
+        module: &str,
+        name: &str,
+        encoder: &ComponentEncoder,
+        ty: &FuncType,
+    ) -> Result<Import> {
+        let donut = encoder.donut.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "`{}` imports require a donut manifest section (`{}`)",
+                crate::donut::GUEST_EXPORT_MODULE_PREFIX,
+                crate::donut::MANIFEST_SECTION_NAME,
+            )
+        })?;
+        let resolve = &encoder.metadata.resolve;
+        let world_id = donut.guest_exports_world;
+        let guest_exports = &resolve.worlds[donut.guest_world].exports;
+        let (key, id) = LEGACY
+            .module_to_interface(module, resolve, &resolve.worlds[world_id].imports)
+            .with_context(|| format!("the guest does not export `{module}`"))?;
+        if !guest_exports.contains_key(&key) {
+            bail!("`{module}` is not an interface exported by the guest");
+        }
+        let interface = &resolve.interfaces[id];
+
+        if let Some(func) = interface.functions.get(name) {
+            validate_func(resolve, ty, func, AbiVariant::GuestImport)?;
+            return Ok(Import::GuestExportFunc(key, id, func.name.clone()));
+        }
+
+        if let Some(resource) = name.strip_prefix("[resource-drop]") {
+            if let Some(ty_id) = interface.types.get(resource) {
+                if matches!(resolve.types[*ty_id].kind, TypeDefKind::Resource) {
+                    validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)?;
+                    return Ok(Import::GuestResourceDrop(key, *ty_id));
+                }
+            }
+        }
+
+        bail!(
+            "unsupported import `{name}` from guest export `{module}`: \
+             expected a function or `[resource-drop]` of a guest-defined resource"
+        )
     }
 
     /// Attempts to classify the import `{module}::{name}` with the rules

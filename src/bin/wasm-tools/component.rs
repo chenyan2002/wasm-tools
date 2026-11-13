@@ -134,6 +134,15 @@ pub struct NewOpts {
     /// Print the output in the WebAssembly text format instead of binary.
     #[clap(long, short = 't')]
     wat: bool,
+
+    /// The guest component to embed when the input module is a donut.
+    ///
+    /// A donut is a module carrying a `wit-bindgen-donut:v0` section: it
+    /// implements some of the guest's imports, embeds and instantiates the
+    /// guest, and calls the guest's exports. This flag is required for such
+    /// modules and rejected for others.
+    #[clap(long, value_name = "GUEST.wasm")]
+    donut_guest: Option<PathBuf>,
 }
 
 impl NewOpts {
@@ -146,6 +155,11 @@ impl NewOpts {
         let wasm = self.io.get_input_wasm(Some(&self.generate_dwarf))?;
         let mut encoder = ComponentEncoder::default();
         self.encoder_opts.configure(&mut encoder)?;
+        if let Some(path) = &self.donut_guest {
+            let guest = wat::parse_file(path)
+                .with_context(|| format!("failed to read donut guest `{}`", path.display()))?;
+            encoder.donut_guest(&guest);
+        }
         encoder.module(&wasm)?;
 
         let bytes = encoder

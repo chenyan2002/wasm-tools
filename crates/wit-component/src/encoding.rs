@@ -474,6 +474,10 @@ pub struct EncodingState<'a> {
     /// Used to invoke the task hook around lifted exports, post-return
     /// functions, callbacks, and `realloc` functions.
     export_task_initialization_wrappers: HashMap<(fixup::ImportedInstance, String), u32>,
+
+    /// Donut mode: the guest's exported instances, aliased out of the guest
+    /// instance, by the guest's world key.
+    donut_guest_exports: IndexMap<WorldKey, u32>,
 }
 
 impl<'a> EncodingState<'a> {
@@ -594,7 +598,8 @@ impl<'a> EncodingState<'a> {
                 .contains_key(&(func.name.clone(), AbiVariant::GuestImport))
                 || info
                     .lowerings
-                    .contains_key(&(func.name.clone(), AbiVariant::GuestImportAsync)))
+                    .contains_key(&(func.name.clone(), AbiVariant::GuestImportAsync))
+                || info.guest_funcs.contains(&func.name))
             {
                 continue;
             }
@@ -679,7 +684,7 @@ impl<'a> EncodingState<'a> {
     fn encode_core_instantiation(
         &mut self,
         fixup_hook: Option<&mut dyn FnMut(&mut fixup::FixupModule) -> Result<()>>,
-    ) -> Result<()> {
+    ) -> Result<Shims<'a>> {
         // Encode a shim instantiation if needed
         let (shims, mut fixups) = self.encode_shim_instantiation()?;
 
@@ -709,6 +714,112 @@ impl<'a> EncodingState<'a> {
         // module, if present, can be filled in with lowerings/adapters/etc.
         fixups.instantiate(&shims, self)?;
 
+        Ok(shims)
+    }
+
+    /// Donut mode: wires up the embedded guest. See [`crate::donut`].
+    ///
+    /// This runs after the main module is instantiated and the first fixup
+    /// phase has run (destructors, host lowerings, `_initialize`), and before
+    /// the component's public exports are lifted.
+    fn encode_donut(&mut self, shims: &Shims<'a>) -> Result<()> {
+        let Some(donut) = &self.info.donut else {
+            return Ok(());
+        };
+
+        // Lift the virtualized interfaces without exporting them.
+        self.encode_export_set(CustomModule::Main, true)?;
+
+        // Embed the guest and instantiate it with the virtual instances and
+        // the passthrough imports.
+        let guest = self.component.component_raw(Some("guest"), &donut.guest);
+        let mut args = Vec::new();
+        for (name, id) in donut.guest_imports.iter() {
+            let index = *self.instances.get(id).ok_or_else(|| {
+                anyhow!("no instance available to satisfy the guest's import `{name}`")
+            })?;
+            args.push((name.as_str(), ComponentExportKind::Instance, index));
+        }
+        let guest_instance = self.component.instantiate(Some("guest"), guest, args);
+
+        for (key, name) in donut.guest_exports.iter() {
+            let index =
+                self.component
+                    .alias_export(guest_instance, name, ComponentExportKind::Instance);
+            self.donut_guest_exports.insert(key.clone(), index);
+        }
+
+        self.encode_guest_export_fixup(shims)
+    }
+
+    /// Donut mode, second fixup phase: lowers the guest's exports and patches
+    /// them into their shim table slots.
+    fn encode_guest_export_fixup(&mut self, shims: &Shims<'a>) -> Result<()> {
+        let guest_shims = shims
+            .shims
+            .values()
+            .filter(|s| s.kind.is_guest_export())
+            .collect::<Vec<_>>();
+        if guest_shims.is_empty() {
+            return Ok(());
+        }
+
+        let mut types = TypeSection::new();
+        let mut imports = ImportSection::new();
+        let mut elements = ElementSection::new();
+        let table_len = shims.shims.len() as u64;
+        imports.import(
+            "",
+            INDIRECT_TABLE_NAME,
+            TableType {
+                element_type: RefType::FUNCREF,
+                minimum: table_len,
+                maximum: Some(table_len),
+                table64: false,
+                shared: false,
+            },
+        );
+
+        let table = self.core_alias_export(
+            Some(INDIRECT_TABLE_NAME),
+            self.shim_instance_index
+                .expect("shim should be instantiated"),
+            INDIRECT_TABLE_NAME,
+            ExportKind::Table,
+        );
+        let mut actual = vec![(INDIRECT_TABLE_NAME, ExportKind::Table, table)];
+        for (i, shim) in guest_shims.iter().enumerate() {
+            let i = i as u32;
+            types.ty().function(
+                shim.sig.params.iter().map(to_val_type),
+                shim.sig.results.iter().map(to_val_type),
+            );
+            imports.import("", &shim.name, EntityType::Function(i));
+            let slot = shims.shims.get_index_of(&shim.kind).unwrap();
+            elements.active(
+                None,
+                &ConstExpr::i32_const(slot as i32),
+                Elements::Functions(vec![i].into()),
+            );
+            let func = self.encode_shim(shims, shim)?;
+            actual.push((shim.name.as_str(), ExportKind::Func, func));
+        }
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&imports);
+        module.section(&elements);
+        let module = self
+            .component
+            .core_module(Some("wit-component-donut-fixup"), &module);
+        let actual = self
+            .component
+            .core_instantiate_exports(Some("donut-actual"), actual);
+        self.component.core_instantiate(
+            Some("donut-fixup"),
+            module,
+            [("", ModuleArg::Instance(actual))],
+        );
         Ok(())
     }
 
@@ -731,6 +842,21 @@ impl<'a> EncodingState<'a> {
     }
 
     fn encode_exports(&mut self, module: CustomModule) -> Result<()> {
+        self.encode_export_set(module, false)
+    }
+
+    /// Whether `key` is a donut export implementing a virtualized guest
+    /// import, which is lifted but not exported.
+    fn is_internal_export(&self, key: &WorldKey) -> bool {
+        self.info
+            .donut
+            .as_ref()
+            .is_some_and(|d| d.virtual_exports.contains(key))
+    }
+
+    /// Lifts the exports of `module`: the public ones if `internal` is false,
+    /// otherwise only the donut-internal ones (which aren't exported).
+    fn encode_export_set(&mut self, module: CustomModule, internal: bool) -> Result<()> {
         let resolve = &self.info.encoder.metadata.resolve;
         let exports = match module {
             CustomModule::Main => &self.info.encoder.main_module_exports,
@@ -775,6 +901,9 @@ impl<'a> EncodingState<'a> {
         let world = &resolve.worlds[self.info.encoder.metadata.world];
 
         for export_name in exports {
+            if self.is_internal_export(export_name) != internal {
+                continue;
+            }
             let export_string = if self.info.encoder.emit_canonical_names {
                 resolve.name_canonicalized_world_key(export_name)
             } else {
@@ -806,6 +935,7 @@ impl<'a> EncodingState<'a> {
                         item,
                         *id,
                         core_names,
+                        internal,
                     )?;
                 }
                 WorldItem::Type { .. } => unreachable!(),
@@ -823,8 +953,9 @@ impl<'a> EncodingState<'a> {
         item: &WorldItem,
         export: InterfaceId,
         interface_func_core_names: Option<&IndexMap<&str, &str>>,
+        internal: bool,
     ) -> Result<()> {
-        log::trace!("encode interface export `{export_name}`");
+        log::trace!("encode interface export `{export_name}` (internal: {internal})");
         let resolve = &self.info.encoder.metadata.resolve;
 
         // First execute a `canon lift` for all the functions in this interface
@@ -1010,14 +1141,20 @@ impl<'a> EncodingState<'a> {
             component_index,
             imports,
         );
-        let extern_name =
-            component_extern_name(resolve, key, item, self.info.encoder.emit_canonical_names);
-        let idx = self.component.export(
-            extern_name,
-            ComponentExportKind::Instance,
-            instance_index,
-            None,
-        );
+        // Donut-internal interfaces aren't exported: the shim instance itself
+        // is what the guest gets instantiated with.
+        let idx = if internal {
+            instance_index
+        } else {
+            let extern_name =
+                component_extern_name(resolve, key, item, self.info.encoder.emit_canonical_names);
+            self.component.export(
+                extern_name,
+                ComponentExportKind::Instance,
+                instance_index,
+                None,
+            )
+        };
         let prev = self.instances.insert(export, idx);
         assert!(prev.is_none());
 
@@ -1180,6 +1317,14 @@ impl<'a> EncodingState<'a> {
                 })?;
         }
 
+        // Donut mode: guest exports go last, so the first fixup phase fills a
+        // prefix of the table and the second phase fills the rest.
+        ret.append_guest_exports(self.info)?;
+        if self.info.donut.is_some() && self.info.encoder.shim_return_call_ref {
+            bail!("donut components do not support `return_call_ref` shims yet");
+        }
+        fixups.shim_table_len = ret.shims.len() as u64;
+
         // Determine if a TLS global needs to be synthesized here by seeing if
         // it was imported into any module.
         let tls_base_global_type = if self.info.can_use_context_slot_1() {
@@ -1276,7 +1421,9 @@ impl<'a> EncodingState<'a> {
             for i in 0..shim.sig.params.len() {
                 func.instructions().local_get(i as u32);
             }
-            fixups.add_shim(&self.info.encoder, shim)?;
+            if !shim.kind.is_guest_export() {
+                fixups.add_shim(&self.info.encoder, shim)?;
+            }
             if self.info.encoder.shim_return_call_ref {
                 // Generate a global-per-function which gets exported from the
                 // module and then filled in later.
@@ -1467,6 +1614,40 @@ impl<'a> EncodingState<'a> {
                     shim.options
                         .into_iter(*encoding, self.memory_index, realloc)?,
                 )
+            }
+
+            // Donut mode: lower a guest export with the main module's
+            // memory and `realloc`. Only possible after the guest has been
+            // instantiated, in the second fixup phase.
+            ShimKind::GuestExportFunc { key, func } => {
+                let instance = self.donut_guest_exports[*key];
+                let func_index =
+                    self.component
+                        .alias_export(instance, func, ComponentExportKind::Func);
+                let realloc = if shim.options.contains(RequiredOptions::REALLOC) {
+                    let export = self
+                        .info
+                        .exports_for(CustomModule::Main)
+                        .import_realloc_for(None, func);
+                    resolve_realloc(self.info, CustomModule::Main, export)
+                        .map(|(module, name)| self.hooked_core_alias_export(module, name))
+                } else {
+                    None
+                };
+                self.component.lower_func(
+                    Some(&shim.debug_name),
+                    func_index,
+                    shim.options
+                        .into_iter(StringEncoding::UTF8, self.memory_index, realloc)?,
+                )
+            }
+            ShimKind::GuestResourceDrop { key, resource } => {
+                let instance = self.donut_guest_exports[*key];
+                let name = resolve.types[*resource].name.as_ref().unwrap();
+                let ty = self
+                    .component
+                    .alias_export(instance, name, ComponentExportKind::Type);
+                self.component.resource_drop(ty)
             }
 
             // Adapter shims are defined by an export from an adapter
@@ -1855,6 +2036,19 @@ impl<'a> EncodingState<'a> {
                 assert!(self.info.encoder.adapters.contains_key(adapter));
                 Ok(self.materialize_shim_import(shims, &ShimKind::Adapter { adapter, func }))
             }
+
+            // Donut mode: guest exports always go through the shim table,
+            // which is filled in once the guest has been instantiated.
+            Import::GuestExportFunc(key, _, func) => {
+                Ok(self.materialize_shim_import(shims, &ShimKind::GuestExportFunc { key, func }))
+            }
+            Import::GuestResourceDrop(key, resource) => Ok(self.materialize_shim_import(
+                shims,
+                &ShimKind::GuestResourceDrop {
+                    key,
+                    resource: *resource,
+                },
+            )),
 
             // Adapters might use the main module's memory, in which case it
             // should have been previously instantiated.
@@ -2578,6 +2772,33 @@ enum ShimKind<'a> {
         /// The name of the `realloc` export within `module`.
         export: &'a str,
     },
+    /// Donut mode: the lowering of a function exported by the guest. This is
+    /// filled in by the second fixup phase, after the guest is instantiated.
+    GuestExportFunc {
+        /// The guest's exported interface.
+        key: &'a WorldKey,
+        /// The WIT name of the function.
+        func: &'a str,
+    },
+    /// Donut mode: `resource.drop` for a resource defined by the guest. This
+    /// is filled in by the second fixup phase, as the resource type only
+    /// exists once the guest is instantiated.
+    GuestResourceDrop {
+        /// The guest's exported interface.
+        key: &'a WorldKey,
+        /// The resource being dropped.
+        resource: TypeId,
+    },
+}
+
+impl ShimKind<'_> {
+    /// Whether this shim is filled in by the second (donut) fixup phase.
+    fn is_guest_export(&self) -> bool {
+        matches!(
+            self,
+            ShimKind::GuestExportFunc { .. } | ShimKind::GuestResourceDrop { .. }
+        )
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -2698,6 +2919,9 @@ impl<'a> Shims<'a> {
                 | Import::ThreadYieldThenResume { .. }
                 | Import::ThreadSuspendThenPromote { .. }
                 | Import::ThreadYieldThenPromote { .. } => {}
+
+                // Registered last, by `append_guest_exports`.
+                Import::GuestExportFunc(..) | Import::GuestResourceDrop(..) => {}
 
                 // If `task.return` needs to be indirect then generate a shim
                 // for it, otherwise skip the shim and let it get materialized
@@ -3140,6 +3364,57 @@ impl<'a> Shims<'a> {
         });
     }
 
+    /// Donut mode: registers a shim for every `[guest-export]` import of the
+    /// main module. These are always indirect since the guest can only be
+    /// instantiated after the main module.
+    fn append_guest_exports(&mut self, world: &'a ComponentWorld<'a>) -> Result<()> {
+        if world.encoder.donut.is_none() {
+            return Ok(());
+        }
+        let resolve = &world.encoder.metadata.resolve;
+        for (_, _, import) in world.info.imports.imports() {
+            match import {
+                Import::GuestExportFunc(key, id, func) => {
+                    let func = &resolve.interfaces[*id].functions[func.as_str()];
+                    self.push(Shim {
+                        name: self.shims.len().to_string(),
+                        debug_name: format!("guest-export-{}", func.name),
+                        options: RequiredOptions::for_import(
+                            resolve,
+                            func,
+                            AbiVariant::GuestImport,
+                        ),
+                        kind: ShimKind::GuestExportFunc {
+                            key,
+                            func: &func.name,
+                        },
+                        sig: resolve.wasm_signature(AbiVariant::GuestImport, func),
+                    });
+                }
+                Import::GuestResourceDrop(key, resource) => {
+                    let name = resolve.types[*resource].name.as_ref().unwrap();
+                    self.push(Shim {
+                        name: self.shims.len().to_string(),
+                        debug_name: format!("guest-resource-drop-{name}"),
+                        options: RequiredOptions::empty(),
+                        kind: ShimKind::GuestResourceDrop {
+                            key,
+                            resource: *resource,
+                        },
+                        sig: WasmSignature {
+                            params: vec![WasmType::I32],
+                            results: Vec::new(),
+                            indirect_params: false,
+                            retptr: false,
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn push(&mut self, shim: Shim<'a>) {
         // Only one shim per `ShimKind` is retained, so if it's already present
         // don't overwrite it. If it's not present though go ahead and insert
@@ -3303,6 +3578,10 @@ pub struct ComponentEncoder {
     debug_names: bool,
     shim_return_call_ref: bool,
     emit_canonical_names: bool,
+    /// Donut mode, enabled by a donut manifest section in the main module.
+    pub(super) donut: Option<crate::donut::Donut>,
+    /// The guest component to embed in donut mode.
+    donut_guest: Option<Vec<u8>>,
 }
 
 impl ComponentEncoder {
@@ -3312,6 +3591,7 @@ impl ComponentEncoder {
     /// It will also add any producers information inside the component type information to the
     /// core module.
     pub fn module(&mut self, module: &[u8]) -> Result<&mut Self> {
+        let (module, manifest) = crate::donut::extract_manifest(module)?;
         let (wasm, metadata) = self.decode(module.as_ref())?;
         let (wasm, module_import_map) = ModuleImportMap::new(wasm)?;
         self.module = if let Some(producers) = &metadata.producers {
@@ -3324,7 +3604,28 @@ impl ComponentEncoder {
             .context("failed merge WIT metadata for module with previous metadata")?;
         self.main_module_exports.extend(exports);
         self.module_import_map = module_import_map;
+        if let Some(manifest) = manifest {
+            if self.donut.is_some() {
+                bail!("only one module may carry a donut manifest");
+            }
+            self.donut = Some(crate::donut::Donut::new(
+                &mut self.metadata.resolve,
+                manifest,
+            )?);
+        }
         Ok(self)
+    }
+
+    /// Sets the guest component to embed when encoding a donut.
+    ///
+    /// This is required when the main module carries a donut manifest (see
+    /// [`crate::donut`]), and an error otherwise. The guest is instantiated
+    /// inside the produced component with the donut's virtualized interfaces
+    /// and its passthrough imports, and its exports are lowered into the main
+    /// module.
+    pub fn donut_guest(&mut self, guest: &[u8]) -> &mut Self {
+        self.donut_guest = Some(guest.to_vec());
+        self
     }
 
     fn decode<'a>(&self, wasm: &'a [u8]) -> Result<(Cow<'a, [u8]>, Bindgen)> {
@@ -3561,10 +3862,12 @@ impl ComponentEncoder {
             aliased_core_items: Default::default(),
             info: &world,
             export_task_initialization_wrappers: HashMap::new(),
+            donut_guest_exports: IndexMap::new(),
         };
         state.encode_imports(&self.import_name_map)?;
         state.encode_core_modules();
-        state.encode_core_instantiation(fixup_hook)?;
+        let shims = state.encode_core_instantiation(fixup_hook)?;
+        state.encode_donut(&shims)?;
         state.encode_exports(CustomModule::Main)?;
         for name in self.adapters.keys() {
             state.encode_exports(CustomModule::Adapter(name))?;
