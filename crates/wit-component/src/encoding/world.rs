@@ -47,6 +47,14 @@ pub struct ComponentWorld<'a> {
     pub donut: Option<DonutWorld>,
 }
 
+/// Donut mode: the functions and types the guest uses from a passthrough
+/// import, by name.
+#[derive(Debug, Default)]
+pub struct PassthroughNeeds {
+    pub funcs: IndexSet<String>,
+    pub types: IndexSet<String>,
+}
+
 /// Donut mode: how the embedded guest's imports and exports map onto the
 /// donut's world. See [`crate::donut`].
 #[derive(Debug, Default)]
@@ -60,9 +68,9 @@ pub struct DonutWorld {
     /// Exports of the donut's world that implement virtualized guest imports.
     /// These are lifted but not exported from the component.
     pub virtual_exports: IndexSet<WorldKey>,
-    /// Functions of passthrough imports that the guest needs, which must be
-    /// part of the donut's import even if the main module doesn't call them.
-    pub passthrough_funcs: IndexMap<InterfaceId, IndexSet<String>>,
+    /// What the guest needs from each passthrough import, which must be part
+    /// of the donut's import even if the main module doesn't use it.
+    pub passthrough: IndexMap<InterfaceId, PassthroughNeeds>,
     /// The guest's exported interfaces and their names in the guest
     /// component.
     pub guest_exports: IndexMap<WorldKey, String>,
@@ -323,13 +331,13 @@ impl<'a> ComponentWorld<'a> {
             )?;
         }
         if let Some(donut) = &self.donut {
-            for (id, funcs) in donut.passthrough_funcs.iter() {
+            for (id, needs) in donut.passthrough.iter() {
                 let entry = self
                     .import_map
                     .values_mut()
                     .find(|i| i.interface == Some(*id))
                     .expect("passthrough imports are imports of the world");
-                entry.guest_funcs.extend(funcs.iter().cloned());
+                entry.guest_funcs.extend(needs.funcs.iter().cloned());
             }
         }
         return Ok(());
@@ -404,9 +412,13 @@ impl<'a> ComponentWorld<'a> {
         // determine the set of live types in those imports.
         self.add_live_imports(world, &self.info.imports, &mut live);
         if let Some(donut) = &self.donut {
-            for (id, funcs) in donut.passthrough_funcs.iter() {
-                for func in funcs {
-                    live.add_func(resolve, &resolve.interfaces[*id].functions[func.as_str()]);
+            for (id, needs) in donut.passthrough.iter() {
+                let iface = &resolve.interfaces[*id];
+                for func in needs.funcs.iter() {
+                    live.add_func(resolve, &iface.functions[func.as_str()]);
+                }
+                for ty in needs.types.iter() {
+                    live.add_type_id(resolve, iface.types[ty.as_str()]);
                 }
             }
         }
@@ -616,16 +628,9 @@ impl<'a> ComponentWorld<'a> {
             };
         let actual = &guest_resolve.worlds[guest_world_id];
 
-        for (actual_key, _) in actual.imports.iter() {
+        for (actual_key, actual_item) in actual.imports.iter() {
             let name = guest_resolve.name_world_key(actual_key);
-            let Some((_, item)) = guest_world
-                .imports
-                .iter()
-                .find(|(k, _)| resolve.name_world_key(k) == name)
-            else {
-                bail!("the donut guest imports `{name}`, which is not imported by its world");
-            };
-            let guest_id = match item {
+            let actual_id = match actual_item {
                 WorldItem::Interface { id, .. } => *id,
                 _ => bail!(
                     "the donut guest imports `{name}`, but only interface imports are \
@@ -646,9 +651,11 @@ impl<'a> ComponentWorld<'a> {
                 continue;
             }
 
-            // A passthrough import: find the world's import of the same
-            // interface, matching semver-compatible versions.
-            let wanted = resolve.canonicalized_id_of(guest_id);
+            // Everything else is a passthrough: bound to the world's import of
+            // the same interface, matching semver-compatible versions. This
+            // includes imports that aren't in the guest's world at all, such as
+            // those added by its toolchain (e.g. Rust `std`'s WASI imports).
+            let wanted = guest_resolve.canonicalized_id_of(actual_id);
             let found = world.imports.iter().find_map(|(_, item)| match item {
                 WorldItem::Interface { id, .. }
                     if wanted.is_some() && resolve.canonicalized_id_of(*id) == wanted =>
@@ -658,21 +665,45 @@ impl<'a> ComponentWorld<'a> {
                 _ => None,
             });
             let Some(id) = found else {
+                let in_guest_world = guest_world
+                    .imports
+                    .keys()
+                    .any(|k| resolve.name_world_key(k) == name);
+                let hint = if in_guest_world {
+                    ""
+                } else {
+                    " (it isn't in the guest's world either, so it was probably added by \
+                     the guest's toolchain, e.g. Rust `std`'s WASI imports; the donut \
+                     needs to import it too, e.g. by also targeting `wasm32-wasip2`)"
+                };
                 bail!(
                     "the donut guest imports `{name}`, which is neither virtualized nor \
-                     imported by the donut's world"
+                     imported by the donut's world{hint}"
                 );
             };
-            let funcs = ret.passthrough_funcs.entry(id).or_default();
-            for func in resolve.interfaces[guest_id].functions.keys() {
-                if !resolve.interfaces[id].functions.contains_key(func) {
+
+            // What the guest needs is exactly what its own import type lists.
+            let ours = &resolve.interfaces[id];
+            let theirs = &guest_resolve.interfaces[actual_id];
+            let ours_name = resolve.id_of(id).unwrap_or_default();
+            let needs = ret.passthrough.entry(id).or_default();
+            for func in theirs.functions.keys() {
+                if !ours.functions.contains_key(func) {
                     bail!(
                         "the donut guest needs `{name}.{func}`, which the donut's import of \
-                         `{}` does not have",
-                        resolve.id_of(id).unwrap_or_default()
+                         `{ours_name}` does not have"
                     );
                 }
-                funcs.insert(func.clone());
+                needs.funcs.insert(func.clone());
+            }
+            for ty in theirs.types.keys() {
+                if !ours.types.contains_key(ty) {
+                    bail!(
+                        "the donut guest needs type `{ty}` of `{name}`, which the donut's \
+                         import of `{ours_name}` does not have"
+                    );
+                }
+                needs.types.insert(ty.clone());
             }
             ret.guest_imports.insert(name, id);
         }
