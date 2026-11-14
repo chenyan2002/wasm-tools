@@ -24,7 +24,7 @@
 use crate::StringEncoding;
 use crate::metadata::Bindgen;
 use anyhow::{Context, Result, bail};
-use indexmap::IndexSet;
+use indexmap::IndexMap;
 use std::borrow::Cow;
 use wasm_encoder::Encode;
 use wasmparser::{BinaryReader, Encoding, Parser, Payload};
@@ -49,21 +49,24 @@ const MANIFEST_VERSION: u8 = 0;
 /// Encodes the payload of a [`MANIFEST_SECTION_NAME`] custom section.
 ///
 /// * `guest` is the world of the guest component.
-/// * `virtualized` lists the guest imports, by their world key name (e.g.
-///   `"a:b/c"`), that the donut implements. These must be exported by the
-///   donut's world. Every other guest import is passed through from the
-///   donut's own imports.
+/// * `virtualized` lists the guest imports the donut implements, as pairs of
+///   the guest's import name (e.g. `"a:b/c"`) and the name of the donut
+///   world's export that implements it. The two are usually the same. They
+///   differ when the donut's own world also imports or exports that
+///   interface: then the donut exports a renamed copy for the guest (e.g.
+///   `"virtual-a:b/c"`), so its own world keeps the original. Every other
+///   guest import is passed through from the donut's own imports.
 ///
 /// Layout: `version: u8`, the guest world as encoded by
 /// [`metadata::encode`](crate::metadata::encode) (length-prefixed), and the
-/// virtualized names as a vector of strings.
+/// virtualized pairs as a vector of `(string, string)`.
 pub fn encode_manifest(
     resolve: &Resolve,
     guest: WorldId,
-    virtualized: &[String],
+    virtualized: &[(String, String)],
 ) -> Result<Vec<u8>> {
     let world = &resolve.worlds[guest];
-    for name in virtualized {
+    for (name, _) in virtualized {
         let found = world.imports.iter().any(|(key, item)| {
             matches!(item, WorldItem::Interface { .. }) && resolve.name_world_key(key) == *name
         });
@@ -75,8 +78,9 @@ pub fn encode_manifest(
     let mut out = vec![MANIFEST_VERSION];
     encoded_world.encode(&mut out);
     virtualized.len().encode(&mut out);
-    for name in virtualized {
-        name.as_str().encode(&mut out);
+    for (guest_name, donut_name) in virtualized {
+        guest_name.as_str().encode(&mut out);
+        donut_name.as_str().encode(&mut out);
     }
     Ok(out)
 }
@@ -84,7 +88,7 @@ pub fn encode_manifest(
 /// A decoded manifest.
 pub(crate) struct Manifest {
     guest: Bindgen,
-    virtualized: Vec<String>,
+    virtualized: Vec<(String, String)>,
 }
 
 fn decode_manifest(data: &[u8]) -> Result<Manifest> {
@@ -99,7 +103,9 @@ fn decode_manifest(data: &[u8]) -> Result<Manifest> {
     let count = reader.read_var_u32()?;
     let mut virtualized = Vec::new();
     for _ in 0..count {
-        virtualized.push(reader.read_string()?.to_string());
+        let guest_name = reader.read_string()?.to_string();
+        let donut_name = reader.read_string()?.to_string();
+        virtualized.push((guest_name, donut_name));
     }
     if !reader.eof() {
         bail!("trailing bytes in donut manifest");
@@ -155,8 +161,9 @@ pub(crate) struct Donut {
     /// "World B": the guest's exports, as imports. Classification and ABI
     /// details of `[guest-export]` core imports are derived from this world.
     pub guest_exports_world: WorldId,
-    /// Names of the guest imports that the donut virtualizes.
-    pub virtualized: IndexSet<String>,
+    /// Virtualized guest imports: the guest's import name, and the name of
+    /// the donut world's export that implements it.
+    pub virtualized: IndexMap<String, String>,
 }
 
 impl Donut {

@@ -605,14 +605,15 @@ impl<'a> ComponentWorld<'a> {
             ..DonutWorld::default()
         };
 
-        for name in donut.virtualized.iter() {
+        for (name, export) in donut.virtualized.iter() {
             let key = world
                 .exports
                 .keys()
-                .find(|k| resolve.name_world_key(k) == *name)
+                .find(|k| resolve.name_world_key(k) == *export)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "virtualized guest import `{name}` is not exported by the donut's world"
+                        "virtualized guest import `{name}` should be implemented by the \
+                         donut world's export `{export}`, which doesn't exist"
                     )
                 })?;
             ret.virtual_exports.insert(key.clone());
@@ -638,11 +639,11 @@ impl<'a> ComponentWorld<'a> {
                 ),
             };
 
-            if donut.virtualized.contains(&name) {
+            if let Some(export) = donut.virtualized.get(&name) {
                 let key = ret
                     .virtual_exports
                     .iter()
-                    .find(|k| resolve.name_world_key(k) == name)
+                    .find(|k| resolve.name_world_key(k) == *export)
                     .unwrap();
                 let WorldItem::Interface { id, .. } = &world.exports[key] else {
                     bail!("virtualized guest import `{name}` must be exported as an interface");
