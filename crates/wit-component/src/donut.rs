@@ -19,13 +19,16 @@
 //!   other import of `G` is passed through from the donut's own imports;
 //! * for each export of `G`, the interface the core module imports to call
 //!   it (a renamed copy, `guest-<child>:<ns>-<pkg>/…`);
+//! * the types-only copies of the virtualized interfaces those exports use,
+//!   which the copies above `use`;
 //! * which exports of `G` the donut re-exports unchanged.
 //!
-//! The bindings generator describes the `guest-<child>` copies as imports in
-//! the donut's `component-type` metadata. They aren't host imports: the
-//! encoder removes every import in namespace `guest-<child>` from the merged
-//! world, and satisfies the core imports from those modules by lowering the
-//! child instance's exports instead.
+//! The bindings generator describes both kinds of copies as imports in the
+//! donut's `component-type` metadata. They aren't host imports: the encoder
+//! removes the imports the manifests list from the merged world, and
+//! satisfies the core imports that call a child by lowering the child
+//! instance's exports instead. The copies' names are the bindings
+//! generator's business; the encoder only compares them with the manifest's.
 //!
 //! Children are instantiated in the order of their manifest sections, each
 //! linked (its exports patched into the main module's table) before the next
@@ -45,10 +48,6 @@ pub const MANIFEST_SECTION_PREFIX: &str = "wit-bindgen-child:";
 /// Version byte at the start of a manifest's payload.
 const MANIFEST_VERSION: u8 = 1;
 
-/// Namespace prefix of the copies of a child's exports (and of what they
-/// use) that the core module imports: `guest-<child>`.
-pub const GUEST_NAMESPACE_PREFIX: &str = "guest-";
-
 /// A decoded manifest.
 pub(crate) struct Manifest {
     name: String,
@@ -57,6 +56,7 @@ pub(crate) struct Manifest {
     guest: Bindgen,
     virtualized: Vec<(String, String)>,
     exports: Vec<(String, String)>,
+    guest_types: Vec<String>,
     export_passthrough: Vec<String>,
 }
 
@@ -64,7 +64,7 @@ pub(crate) struct Manifest {
 /// `guest: vec<u8>` (the world `G`, as encoded by
 /// [`metadata::encode`](crate::metadata::encode)),
 /// `virtualized: vec<(string, string)>`, `exports: vec<(string, string)>`,
-/// and `export_passthrough: vec<string>`.
+/// `guest_types: vec<string>`, and `export_passthrough: vec<string>`.
 fn decode_manifest(data: &[u8]) -> Result<Manifest> {
     let mut reader = BinaryReader::new(data, 0);
     let version = reader.read_u8()?;
@@ -89,10 +89,14 @@ fn decode_manifest(data: &[u8]) -> Result<Manifest> {
     };
     let virtualized = pairs()?;
     let exports = pairs()?;
-    let count = reader.read_var_u32()?;
-    let export_passthrough = (0..count)
-        .map(|_| Ok(reader.read_string()?.to_string()))
-        .collect::<Result<_>>()?;
+    let mut names = || -> Result<Vec<String>> {
+        let count = reader.read_var_u32()?;
+        (0..count)
+            .map(|_| Ok(reader.read_string()?.to_string()))
+            .collect()
+    };
+    let guest_types = names()?;
+    let export_passthrough = names()?;
     if !reader.eof() {
         bail!("trailing bytes in child manifest");
     }
@@ -102,6 +106,7 @@ fn decode_manifest(data: &[u8]) -> Result<Manifest> {
         guest,
         virtualized,
         exports,
+        guest_types,
         export_passthrough,
     })
 }
@@ -171,14 +176,17 @@ pub(crate) struct Child {
     /// The core import modules that call the child (`guest-<child>:…`), and
     /// the export of `G` each calls.
     pub exports: IndexMap<String, String>,
+    /// Types-only copies of what `exports` use: imports of the donut's
+    /// world that, like `exports`' keys, aren't the host's.
+    pub guest_types: Vec<String>,
     /// Exports of `G` the donut re-exports.
     pub export_passthrough: Vec<String>,
 }
 
 impl Donut {
     /// Merges each manifest's `G` into `resolve`, then fixes up `world`, the
-    /// donut's merged world: removes the children's `guest-<child>` imports,
-    /// and adds `G`'s passthrough imports that it lacks.
+    /// donut's merged world: removes the children's copies listed in the
+    /// manifests, and adds `G`'s passthrough imports that it lacks.
     pub fn new(resolve: &mut Resolve, world: WorldId, manifests: Vec<Manifest>) -> Result<Donut> {
         let mut donut = Donut::default();
         // Children of the same world merge it once: merging binds it to the
@@ -193,6 +201,7 @@ impl Donut {
                 guest,
                 virtualized,
                 exports,
+                guest_types,
                 export_passthrough,
             } = manifest;
             let guest_world = match merged.iter().find(|(b, _)| *b == guest_bytes) {
@@ -247,6 +256,7 @@ impl Donut {
                 guest_exports_world,
                 virtualized: virtualized.into_iter().collect(),
                 exports: exports.into_iter().map(|(g, m)| (m, g)).collect(),
+                guest_types,
                 export_passthrough,
             });
         }
@@ -256,23 +266,19 @@ impl Donut {
         Ok(donut)
     }
 
-    /// Removes the imports in the children's `guest-<child>` namespaces: the
-    /// children's exports (and types-only copies of what they use), which the
-    /// bindings generator describes as imports.
+    /// Removes the children's copies from the imports: of their exports, and
+    /// the types-only copies of what those use, which the bindings generator
+    /// describes as imports.
     fn remove_guest_imports(&self, resolve: &mut Resolve, world: WorldId) {
-        let namespaces = self
+        let copies = self
             .children
             .iter()
-            .map(|c| format!("{GUEST_NAMESPACE_PREFIX}{}", c.name))
+            .flat_map(|c| c.exports.keys().chain(c.guest_types.iter()))
+            .map(|s| s.as_str())
             .collect::<HashSet<_>>();
-        let packages = &resolve.packages;
-        let interfaces = &resolve.interfaces;
-        resolve.worlds[world].imports.retain(|_, item| match item {
-            WorldItem::Interface { id, .. } => interfaces[*id]
-                .package
-                .is_none_or(|p| !namespaces.contains(&packages[p].name.namespace)),
-            _ => true,
-        });
+        let mut imports = std::mem::take(&mut resolve.worlds[world].imports);
+        imports.retain(|key, _| !copies.contains(resolve.name_world_key(key).as_str()));
+        resolve.worlds[world].imports = imports;
     }
 
     /// Adds every passthrough import of every `G` (and what it depends on)
