@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use wasm_encoder::{CanonicalOption, Encode, Section};
 use wit_parser::{Resolve, WorldId};
 
+pub mod donut;
 mod encoding;
 mod gc;
 mod linking;

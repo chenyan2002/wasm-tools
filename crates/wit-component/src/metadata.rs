@@ -349,7 +349,7 @@ fn decode_string_encoding(byte: u8) -> Result<StringEncoding> {
 }
 
 impl Bindgen {
-    fn decode_custom_section(data: &[u8]) -> Result<Bindgen> {
+    pub(crate) fn decode_custom_section(data: &[u8]) -> Result<Bindgen> {
         let wasm;
         let world;
         let resolve;

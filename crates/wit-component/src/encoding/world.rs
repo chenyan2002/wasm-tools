@@ -44,11 +44,55 @@ pub struct ComponentWorld<'a> {
     /// This set is used to determine when types are imported/used whether they
     /// come from imports or exports.
     pub exports_used: HashMap<InterfaceId, HashSet<InterfaceId>>,
+    /// Hole mode: how the children are wired up.
+    pub donut: Option<DonutWorld>,
+}
+
+/// Hole mode: the functions and types a child's hole needs from a
+/// passthrough import, by name.
+#[derive(Debug, Default)]
+pub struct PassthroughNeeds {
+    pub funcs: IndexSet<String>,
+    pub types: IndexSet<String>,
+}
+
+/// Hole mode: how the children's imports and exports map onto the donut's
+/// world. See [`crate::donut`].
+#[derive(Debug, Default)]
+pub struct DonutWorld {
+    /// The children, in instantiation order.
+    pub children: Vec<ChildWorld>,
+    /// Exports of the donut's world that implement virtualized imports of a
+    /// child. These are lifted but not exported from the component.
+    pub virtual_exports: IndexSet<WorldKey>,
+    /// What the holes need from each passthrough import, which must be part
+    /// of the donut's import even if the main module doesn't use it.
+    pub passthrough: IndexMap<InterfaceId, PassthroughNeeds>,
+}
+
+/// Hole mode: one child.
+#[derive(Debug)]
+pub struct ChildWorld {
+    /// The hole's import name.
+    pub name: String,
+    /// `G`, the hole's type.
+    pub guest_world: WorldId,
+    /// For each import name of `G`, the interface of the donut's world that
+    /// satisfies it: a virtualized export (made internal) or a passthrough
+    /// import.
+    pub guest_imports: IndexMap<String, InterfaceId>,
+    /// `G`'s exported interfaces, and their names.
+    pub guest_exports: IndexMap<WorldKey, String>,
+    /// Exports of `G` the donut re-exports.
+    pub export_passthrough: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct ImportedInterface {
     pub lowerings: IndexMap<(String, AbiVariant), Lowering>,
+    /// Hole mode: functions imported to pass through to a child, which are
+    /// part of the import's type but aren't lowered into the main module.
+    pub guest_funcs: IndexSet<String>,
     pub interface: Option<InterfaceId>,
     pub implements: Option<InterfaceId>,
     pub external_id: Option<String>,
@@ -83,8 +127,10 @@ impl<'a> ComponentWorld<'a> {
             import_map: IndexMap::new(),
             live_type_imports: Default::default(),
             exports_used: HashMap::new(),
+            donut: None,
         };
 
+        ret.process_donut()?;
         ret.process_adapters()?;
         ret.process_imports()?;
         ret.process_exports_used();
@@ -314,6 +360,16 @@ impl<'a> ComponentWorld<'a> {
                 &self.info,
             )?;
         }
+        if let Some(donut) = &self.donut {
+            for (id, needs) in donut.passthrough.iter() {
+                let entry = self
+                    .import_map
+                    .values_mut()
+                    .find(|i| i.interface == Some(*id))
+                    .expect("passthrough imports are imports of the world");
+                entry.guest_funcs.extend(needs.funcs.iter().cloned());
+            }
+        }
         return Ok(());
 
         fn add_item(
@@ -349,6 +405,7 @@ impl<'a> ComponentWorld<'a> {
                 .or_insert_with(|| ImportedInterface {
                     interface: interface_id,
                     lowerings: Default::default(),
+                    guest_funcs: Default::default(),
                     implements,
                     external_id: external_id.clone(),
                 });
@@ -385,6 +442,17 @@ impl<'a> ComponentWorld<'a> {
         // First use the previously calculated metadata about live imports to
         // determine the set of live types in those imports.
         self.add_live_imports(world, &self.info.imports, &mut live);
+        if let Some(donut) = &self.donut {
+            for (id, needs) in donut.passthrough.iter() {
+                let iface = &resolve.interfaces[*id];
+                for func in needs.funcs.iter() {
+                    live.add_func(resolve, &iface.functions[func.as_str()]);
+                }
+                for ty in needs.types.iter() {
+                    live.add_type_id(resolve, iface.types[ty.as_str()]);
+                }
+            }
+        }
         for (adapter_name, adapter) in self.adapters.iter() {
             log::trace!("processing adapter `{adapter_name}`");
             self.add_live_imports(world, &adapter.info.imports, &mut live);
@@ -533,8 +601,126 @@ impl<'a> ComponentWorld<'a> {
                 | Import::ThreadYieldThenResume { .. }
                 | Import::ThreadSuspendThenPromote { .. }
                 | Import::ThreadYieldThenPromote { .. } => {}
+
+                // Children's exports are typed by the child instances, not by
+                // this world's imports.
+                Import::GuestExportFunc(..) | Import::GuestResourceDrop(..) => {}
             }
         }
+    }
+
+    /// Hole mode: resolves how each child's imports are satisfied, and which
+    /// of the world's exports are internal.
+    fn process_donut(&mut self) -> Result<()> {
+        let Some(donut) = &self.encoder.donut else {
+            return Ok(());
+        };
+        let resolve = &self.encoder.metadata.resolve;
+        let world_id = self.encoder.metadata.world;
+        let world = &resolve.worlds[world_id];
+        let mut ret = DonutWorld::default();
+        let mut exported = world
+            .exports
+            .keys()
+            .map(|k| resolve.name_world_key(k))
+            .collect::<HashSet<_>>();
+        let imported = world
+            .imports
+            .keys()
+            .map(|k| resolve.name_world_key(k))
+            .collect::<HashSet<_>>();
+
+        for child in donut.children.iter() {
+            let name = &child.name;
+            if imported.contains(name) {
+                bail!("child `{name}`'s hole clashes with the import `{name}`");
+            }
+            let g = &resolve.worlds[child.guest_world];
+            let mut guest_imports = IndexMap::new();
+            for (key, item) in g.imports.iter() {
+                let import = resolve.name_world_key(key);
+                let WorldItem::Interface { id, .. } = item else {
+                    bail!(
+                        "child `{name}`'s world imports `{import}`, but only interface \
+                         imports are supported for children"
+                    );
+                };
+                if let Some(export) = child.virtualized.get(&import) {
+                    let (key, item) = world
+                        .exports
+                        .iter()
+                        .find(|(k, _)| resolve.name_world_key(k) == *export)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "child `{name}`'s virtualized import `{import}` should be \
+                                 implemented by the export `{export}`, which doesn't exist"
+                            )
+                        })?;
+                    let WorldItem::Interface { id: export_id, .. } = item else {
+                        bail!("`{export}` must be exported as an interface");
+                    };
+                    ret.virtual_exports.insert(key.clone());
+                    guest_imports.insert(import, *export_id);
+                    continue;
+                }
+
+                // A passthrough: the hole's type lists all of `G`'s version
+                // of the interface, so the donut's import must have it all.
+                let ours = crate::donut::passthrough_import(resolve, world_id, *id)
+                    .expect("passthrough imports were added to the world");
+                let ours_iface = &resolve.interfaces[ours];
+                let theirs = &resolve.interfaces[*id];
+                let ours_name = resolve.id_of(ours).unwrap_or_default();
+                let needs = ret.passthrough.entry(ours).or_default();
+                for func in theirs.functions.keys() {
+                    if !ours_iface.functions.contains_key(func) {
+                        bail!(
+                            "child `{name}` needs `{import}.{func}`, which the donut's import \
+                             of `{ours_name}` does not have"
+                        );
+                    }
+                    needs.funcs.insert(func.clone());
+                }
+                for ty in theirs.types.keys() {
+                    if !ours_iface.types.contains_key(ty) {
+                        bail!(
+                            "child `{name}` needs type `{ty}` of `{import}`, which the donut's \
+                             import of `{ours_name}` does not have"
+                        );
+                    }
+                    needs.types.insert(ty.clone());
+                }
+                guest_imports.insert(import, ours);
+            }
+
+            let mut guest_exports = IndexMap::new();
+            for (key, item) in g.exports.iter() {
+                let export = resolve.name_world_key(key);
+                if !matches!(item, WorldItem::Interface { .. }) {
+                    bail!(
+                        "child `{name}`'s world exports `{export}`, but only interface \
+                         exports are supported for children"
+                    );
+                }
+                guest_exports.insert(key.clone(), export);
+            }
+            for export in child.export_passthrough.iter() {
+                if !exported.insert(export.clone()) {
+                    bail!("child `{name}`'s re-export `{export}` clashes with another export");
+                }
+            }
+
+            ret.children.push(ChildWorld {
+                name: name.clone(),
+                guest_world: child.guest_world,
+                guest_imports,
+                guest_exports,
+                export_passthrough: child.export_passthrough.clone(),
+            });
+        }
+
+        self.donut = Some(ret);
+        Ok(())
     }
 
     fn process_exports_used(&mut self) {

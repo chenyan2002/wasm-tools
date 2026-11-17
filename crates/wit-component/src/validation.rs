@@ -349,6 +349,19 @@ pub enum Import {
     /// the id within that interface.
     ExportedResourceDrop(WorldKey, TypeId),
 
+    /// Hole mode: a function exported by a child, imported via the child's
+    /// `guest-<child>:…` copy of the interface.
+    ///
+    /// The `usize` is the child's index, the `WorldKey` and `InterfaceId`
+    /// identify the child's exported interface (an import of its importized
+    /// world) and `String` is the WIT name of the function.
+    GuestExportFunc(usize, WorldKey, InterfaceId, String),
+
+    /// Hole mode: `resource.drop` of a resource defined by a child (by its
+    /// index), imported via the child's `guest-<child>:…` copy of the
+    /// interface.
+    GuestResourceDrop(usize, WorldKey, TypeId),
+
     /// A `canon resource.new` intrinsic for an exported item is being
     /// imported.
     ///
@@ -748,6 +761,14 @@ impl ImportMap {
             });
         }
 
+        if let Some((child, export)) = encoder
+            .donut
+            .as_ref()
+            .and_then(|d| d.child_export(import.module))
+        {
+            return self.classify_guest_export(child, export, import.name, encoder, ty);
+        }
+
         let (module, names) = match import.module.strip_prefix("cm32p2") {
             Some(suffix) => {
                 require_standard_index_type(self.index_type)?;
@@ -760,6 +781,62 @@ impl ImportMap {
             None => (import.module, LEGACY),
         };
         self.classify_component_model_import(module, import.name, encoder, ty, names)
+    }
+
+    /// Classifies a hole-mode import calling child `child`'s export `module`
+    /// (an interface name of the child's world).
+    ///
+    /// `name` is either one of the interface's functions or
+    /// `[resource-drop]R` for a resource the child defines.
+    fn classify_guest_export(
+        &self,
+        child: usize,
+        module: &str,
+        name: &str,
+        encoder: &ComponentEncoder,
+        ty: &FuncType,
+    ) -> Result<Import> {
+        let child_info = &encoder.donut.as_ref().unwrap().children[child];
+        let resolve = &encoder.metadata.resolve;
+        let world_id = child_info.guest_exports_world;
+        let guest_exports = &resolve.worlds[child_info.guest_world].exports;
+        let (key, id) = LEGACY
+            .module_to_interface(module, resolve, &resolve.worlds[world_id].imports)
+            .with_context(|| format!("child `{}` does not export `{module}`", child_info.name))?;
+        if !guest_exports.contains_key(&key) {
+            bail!(
+                "`{module}` is not an interface exported by child `{}`",
+                child_info.name
+            );
+        }
+        let interface = &resolve.interfaces[id];
+
+        if let Some(func) = interface.functions.get(name) {
+            validate_func(
+                resolve,
+                world_id,
+                ty,
+                func,
+                AbiVariant::GuestImport,
+                self.index_type,
+            )?;
+            return Ok(Import::GuestExportFunc(child, key, id, func.name.clone()));
+        }
+
+        if let Some(resource) = name.strip_prefix("[resource-drop]") {
+            if let Some(ty_id) = interface.types.get(resource) {
+                if matches!(resolve.types[*ty_id].kind, TypeDefKind::Resource) {
+                    validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)?;
+                    return Ok(Import::GuestResourceDrop(child, key, *ty_id));
+                }
+            }
+        }
+
+        bail!(
+            "unsupported import `{name}` from child `{}`'s export `{module}`: \
+             expected a function or `[resource-drop]` of a resource the child defines",
+            child_info.name
+        )
     }
 
     /// Attempts to classify the import `{module}::{name}` with the rules

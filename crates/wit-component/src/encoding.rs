@@ -484,6 +484,10 @@ pub struct EncodingState<'a> {
     /// Used to invoke the task hook around lifted exports, post-return
     /// functions, callbacks, and `realloc` functions.
     export_task_initialization_wrappers: HashMap<(fixup::ImportedInstance, String), u32>,
+
+    /// Hole mode: the children's exported instances, aliased out of the child
+    /// instances, by child index and the key in the child's world.
+    child_exports: IndexMap<(usize, WorldKey), u32>,
 }
 
 impl<'a> EncodingState<'a> {
@@ -604,7 +608,8 @@ impl<'a> EncodingState<'a> {
                 .contains_key(&(func.name.clone(), AbiVariant::GuestImport))
                 || info
                     .lowerings
-                    .contains_key(&(func.name.clone(), AbiVariant::GuestImportAsync)))
+                    .contains_key(&(func.name.clone(), AbiVariant::GuestImportAsync))
+                || info.guest_funcs.contains(&func.name))
             {
                 continue;
             }
@@ -689,7 +694,7 @@ impl<'a> EncodingState<'a> {
     fn encode_core_instantiation(
         &mut self,
         fixup_hook: Option<&mut dyn FnMut(&mut fixup::FixupModule) -> Result<()>>,
-    ) -> Result<()> {
+    ) -> Result<Shims<'a>> {
         // Encode a shim instantiation if needed
         let (shims, mut fixups) = self.encode_shim_instantiation()?;
 
@@ -719,6 +724,152 @@ impl<'a> EncodingState<'a> {
         // module, if present, can be filled in with lowerings/adapters/etc.
         fixups.instantiate(&shims, self)?;
 
+        Ok(shims)
+    }
+
+    /// Hole mode: imports, instantiates, and links each child. See
+    /// [`crate::donut`].
+    ///
+    /// This runs after the main module is instantiated and the first fixup
+    /// phase has run (destructors, host lowerings, `_initialize`), and before
+    /// the component's public exports are lifted.
+    fn encode_donut(&mut self, shims: &Shims<'a>) -> Result<()> {
+        let info = self.info;
+        let Some(donut) = &info.donut else {
+            return Ok(());
+        };
+        let resolve = &info.encoder.metadata.resolve;
+
+        // Lift the virtualized interfaces without exporting them.
+        self.encode_export_set(CustomModule::Main, true)?;
+
+        for (i, child) in donut.children.iter().enumerate() {
+            // The hole: a component-typed import of the child's world.
+            let ty = encode_world(
+                resolve,
+                child.guest_world,
+                info.encoder.emit_canonical_names,
+            )
+            .with_context(|| format!("encoding child `{}`'s world", child.name))?;
+            let ty = self.component.type_component(Some(&child.name), &ty);
+            let hole = self
+                .component
+                .import(child.name.as_str(), ComponentTypeRef::Component(ty));
+
+            // Instantiate it with the virtual instances and the passthrough
+            // imports.
+            let mut args = Vec::new();
+            for (name, id) in child.guest_imports.iter() {
+                let index = *self.instances.get(id).ok_or_else(|| {
+                    anyhow!(
+                        "no instance available to satisfy child `{}`'s import `{name}`",
+                        child.name
+                    )
+                })?;
+                args.push((name.as_str(), ComponentExportKind::Instance, index));
+            }
+            let instance = self.component.instantiate(Some(&child.name), hole, args);
+            for (key, name) in child.guest_exports.iter() {
+                let index =
+                    self.component
+                        .alias_export(instance, name, ComponentExportKind::Instance);
+                self.child_exports.insert((i, key.clone()), index);
+            }
+
+            // Link it before the next child is instantiated, so that the next
+            // child's start function can reach it through the donut.
+            self.encode_guest_export_fixup(shims, i)?;
+
+            for name in child.export_passthrough.iter() {
+                let (key, _) = child
+                    .guest_exports
+                    .iter()
+                    .find(|(_, n)| *n == name)
+                    .ok_or_else(|| anyhow!("child `{}` doesn't export `{name}`", child.name))?;
+                let index = self.child_exports[&(i, key.clone())];
+                self.component
+                    .export(name.as_str(), ComponentExportKind::Instance, index, None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Hole mode, linking child `child`: lowers its exports and patches them
+    /// into their shim table slots.
+    fn encode_guest_export_fixup(&mut self, shims: &Shims<'a>, child: usize) -> Result<()> {
+        let guest_shims = shims
+            .shims
+            .values()
+            .filter(|s| s.kind.child() == Some(child))
+            .collect::<Vec<_>>();
+        if guest_shims.is_empty() {
+            return Ok(());
+        }
+
+        let mut types = TypeSection::new();
+        let mut imports = ImportSection::new();
+        let mut elements = ElementSection::new();
+        let table_len = shims.shims.len() as u64;
+        imports.import(
+            "",
+            INDIRECT_TABLE_NAME,
+            TableType {
+                element_type: RefType::FUNCREF,
+                minimum: table_len,
+                maximum: Some(table_len),
+                table64: false,
+                shared: false,
+            },
+        );
+
+        let table = self.core_alias_export(
+            Some(INDIRECT_TABLE_NAME),
+            self.shim_instance_index
+                .expect("shim should be instantiated"),
+            INDIRECT_TABLE_NAME,
+            ExportKind::Table,
+        );
+        let mut actual = vec![(INDIRECT_TABLE_NAME, ExportKind::Table, table)];
+        for (i, shim) in guest_shims.iter().enumerate() {
+            let i = i as u32;
+            let index_type = self.info.index_type();
+            types.ty().function(
+                shim.sig
+                    .params
+                    .iter()
+                    .map(|t| index_type.encoder_val_type(t)),
+                shim.sig
+                    .results
+                    .iter()
+                    .map(|t| index_type.encoder_val_type(t)),
+            );
+            imports.import("", &shim.name, EntityType::Function(i));
+            let slot = shims.shims.get_index_of(&shim.kind).unwrap();
+            elements.active(
+                None,
+                &ConstExpr::i32_const(slot as i32),
+                Elements::Functions(vec![i].into()),
+            );
+            let func = self.encode_shim(shims, shim)?;
+            actual.push((shim.name.as_str(), ExportKind::Func, func));
+        }
+
+        let name = &self.info.donut.as_ref().unwrap().children[child].name;
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&imports);
+        module.section(&elements);
+        let module = self
+            .component
+            .core_module(Some(&format!("wit-component-fixup-{name}")), &module);
+        let actual = self
+            .component
+            .core_instantiate_exports(Some(&format!("actual-{name}")), actual);
+        self.component.core_instantiate(
+            Some(&format!("fixup-{name}")),
+            module,
+            [("", ModuleArg::Instance(actual))],
+        );
         Ok(())
     }
 
@@ -741,6 +892,21 @@ impl<'a> EncodingState<'a> {
     }
 
     fn encode_exports(&mut self, module: CustomModule) -> Result<()> {
+        self.encode_export_set(module, false)
+    }
+
+    /// Whether `key` is an export implementing a virtualized import of a
+    /// child, which is lifted but not exported.
+    fn is_internal_export(&self, key: &WorldKey) -> bool {
+        self.info
+            .donut
+            .as_ref()
+            .is_some_and(|d| d.virtual_exports.contains(key))
+    }
+
+    /// Lifts the exports of `module`: the public ones if `internal` is false,
+    /// otherwise only the ones children import (which aren't exported).
+    fn encode_export_set(&mut self, module: CustomModule, internal: bool) -> Result<()> {
         let resolve = &self.info.encoder.metadata.resolve;
         let exports = match module {
             CustomModule::Main => &self.info.encoder.main_module_exports,
@@ -785,6 +951,9 @@ impl<'a> EncodingState<'a> {
         let world = &resolve.worlds[self.info.encoder.metadata.world];
 
         for export_name in exports {
+            if self.is_internal_export(export_name) != internal {
+                continue;
+            }
             let export_string = if self.info.encoder.emit_canonical_names {
                 resolve.name_canonicalized_world_key(export_name)
             } else {
@@ -816,6 +985,7 @@ impl<'a> EncodingState<'a> {
                         item,
                         *id,
                         core_names,
+                        internal,
                     )?;
                 }
                 WorldItem::Type { .. } => unreachable!(),
@@ -833,8 +1003,9 @@ impl<'a> EncodingState<'a> {
         item: &WorldItem,
         export: InterfaceId,
         interface_func_core_names: Option<&IndexMap<&str, &str>>,
+        internal: bool,
     ) -> Result<()> {
-        log::trace!("encode interface export `{export_name}`");
+        log::trace!("encode interface export `{export_name}` (internal: {internal})");
         let resolve = &self.info.encoder.metadata.resolve;
 
         // First execute a `canon lift` for all the functions in this interface
@@ -1020,14 +1191,20 @@ impl<'a> EncodingState<'a> {
             component_index,
             imports,
         );
-        let extern_name =
-            component_extern_name(resolve, key, item, self.info.encoder.emit_canonical_names);
-        let idx = self.component.export(
-            extern_name,
-            ComponentExportKind::Instance,
-            instance_index,
-            None,
-        );
+        // Interfaces only children import aren't exported: the shim instance
+        // itself is what the children get instantiated with.
+        let idx = if internal {
+            instance_index
+        } else {
+            let extern_name =
+                component_extern_name(resolve, key, item, self.info.encoder.emit_canonical_names);
+            self.component.export(
+                extern_name,
+                ComponentExportKind::Instance,
+                instance_index,
+                None,
+            )
+        };
         let prev = self.instances.insert(export, idx);
         assert!(prev.is_none());
 
@@ -1192,6 +1369,15 @@ impl<'a> EncodingState<'a> {
                 })?;
         }
 
+        // Hole mode: children's exports go last, so the first fixup phase
+        // fills a prefix of the table and each child's linking fills its own
+        // slots after it.
+        ret.append_guest_exports(self.info)?;
+        if self.info.donut.is_some() && self.info.encoder.shim_return_call_ref {
+            bail!("components with holes do not support `return_call_ref` shims yet");
+        }
+        fixups.shim_table_len = ret.shims.len() as u64;
+
         // Determine if a TLS global needs to be synthesized here by seeing if
         // it was imported into any module.
         let tls_base_global_type = if self.info.can_use_context_slot_1() {
@@ -1296,7 +1482,9 @@ impl<'a> EncodingState<'a> {
             for i in 0..shim.sig.params.len() {
                 func.instructions().local_get(i as u32);
             }
-            fixups.add_shim(&self.info.encoder, shim)?;
+            if !shim.kind.is_guest_export() {
+                fixups.add_shim(&self.info.encoder, shim)?;
+            }
             if self.info.encoder.shim_return_call_ref {
                 // Generate a global-per-function which gets exported from the
                 // module and then filled in later.
@@ -1487,6 +1675,44 @@ impl<'a> EncodingState<'a> {
                     shim.options
                         .into_iter(*encoding, self.memory_index, realloc)?,
                 )
+            }
+
+            // Hole mode: lower a child's export with the main module's
+            // memory and `realloc`. Only possible after the child has been
+            // instantiated, when it's linked.
+            ShimKind::GuestExportFunc { child, key, func } => {
+                let instance = self.child_exports[&(*child, (*key).clone())];
+                let func_index =
+                    self.component
+                        .alias_export(instance, func, ComponentExportKind::Func);
+                let realloc = if shim.options.contains(RequiredOptions::REALLOC) {
+                    let export = self
+                        .info
+                        .exports_for(CustomModule::Main)
+                        .import_realloc_for(None, func);
+                    resolve_realloc(self.info, CustomModule::Main, export)
+                        .map(|(module, name)| self.hooked_core_alias_export(module, name))
+                } else {
+                    None
+                };
+                self.component.lower_func(
+                    Some(&shim.debug_name),
+                    func_index,
+                    shim.options
+                        .into_iter(StringEncoding::UTF8, self.memory_index, realloc)?,
+                )
+            }
+            ShimKind::GuestResourceDrop {
+                child,
+                key,
+                resource,
+            } => {
+                let instance = self.child_exports[&(*child, (*key).clone())];
+                let name = resolve.types[*resource].name.as_ref().unwrap();
+                let ty = self
+                    .component
+                    .alias_export(instance, name, ComponentExportKind::Type);
+                self.component.resource_drop(ty)
             }
 
             // Adapter shims are defined by an export from an adapter
@@ -1880,6 +2106,26 @@ impl<'a> EncodingState<'a> {
                 assert!(self.info.encoder.adapters.contains_key(adapter));
                 Ok(self.materialize_shim_import(shims, &ShimKind::Adapter { adapter, func }))
             }
+
+            // Hole mode: children's exports always go through the shim
+            // table, which is filled in once each child has been
+            // instantiated.
+            Import::GuestExportFunc(child, key, _, func) => Ok(self.materialize_shim_import(
+                shims,
+                &ShimKind::GuestExportFunc {
+                    child: *child,
+                    key,
+                    func,
+                },
+            )),
+            Import::GuestResourceDrop(child, key, resource) => Ok(self.materialize_shim_import(
+                shims,
+                &ShimKind::GuestResourceDrop {
+                    child: *child,
+                    key,
+                    resource: *resource,
+                },
+            )),
 
             // Adapters might use the main module's memory, in which case it
             // should have been previously instantiated.
@@ -2604,6 +2850,46 @@ enum ShimKind<'a> {
         /// The name of the `realloc` export within `module`.
         export: &'a str,
     },
+    /// Hole mode: the lowering of a function exported by a child. This is
+    /// filled in when the child is linked, after it's instantiated.
+    GuestExportFunc {
+        /// The child's index.
+        child: usize,
+        /// The child's exported interface.
+        key: &'a WorldKey,
+        /// The WIT name of the function.
+        func: &'a str,
+    },
+    /// Hole mode: `resource.drop` for a resource defined by a child. This is
+    /// filled in when the child is linked, as the resource type only exists
+    /// once the child is instantiated.
+    GuestResourceDrop {
+        /// The child's index.
+        child: usize,
+        /// The child's exported interface.
+        key: &'a WorldKey,
+        /// The resource being dropped.
+        resource: TypeId,
+    },
+}
+
+impl ShimKind<'_> {
+    /// The child whose linking fills in this shim, if it's one of a child's
+    /// exports.
+    fn child(&self) -> Option<usize> {
+        match self {
+            ShimKind::GuestExportFunc { child, .. } | ShimKind::GuestResourceDrop { child, .. } => {
+                Some(*child)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this shim is filled in by a child's linking rather than the
+    /// first fixup phase.
+    fn is_guest_export(&self) -> bool {
+        self.child().is_some()
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -2724,6 +3010,9 @@ impl<'a> Shims<'a> {
                 | Import::ThreadYieldThenResume { .. }
                 | Import::ThreadSuspendThenPromote { .. }
                 | Import::ThreadYieldThenPromote { .. } => {}
+
+                // Registered last, by `append_guest_exports`.
+                Import::GuestExportFunc(..) | Import::GuestResourceDrop(..) => {}
 
                 // If `task.return` needs to be indirect then generate a shim
                 // for it, otherwise skip the shim and let it get materialized
@@ -3165,6 +3454,61 @@ impl<'a> Shims<'a> {
         });
     }
 
+    /// Hole mode: registers a shim for every import of the main module that
+    /// calls a child. These are always indirect since a child can only be
+    /// instantiated after the main module.
+    fn append_guest_exports(&mut self, world: &'a ComponentWorld<'a>) -> Result<()> {
+        let Some(donut) = &world.encoder.donut else {
+            return Ok(());
+        };
+        let resolve = &world.encoder.metadata.resolve;
+        for (_, _, import) in world.info.imports.imports() {
+            match import {
+                Import::GuestExportFunc(child, key, id, func) => {
+                    let exports_world = donut.children[*child].guest_exports_world;
+                    let func = &resolve.interfaces[*id].functions[func.as_str()];
+                    self.push(Shim {
+                        name: self.shims.len().to_string(),
+                        debug_name: format!("{}-export-{}", donut.children[*child].name, func.name),
+                        options: RequiredOptions::for_import(
+                            resolve,
+                            exports_world,
+                            func,
+                            AbiVariant::GuestImport,
+                        ),
+                        kind: ShimKind::GuestExportFunc {
+                            child: *child,
+                            key,
+                            func: &func.name,
+                        },
+                        sig: resolve.wasm_signature(exports_world, AbiVariant::GuestImport, func),
+                    });
+                }
+                Import::GuestResourceDrop(child, key, resource) => {
+                    let name = resolve.types[*resource].name.as_ref().unwrap();
+                    self.push(Shim {
+                        name: self.shims.len().to_string(),
+                        debug_name: format!("{}-resource-drop-{name}", donut.children[*child].name),
+                        options: RequiredOptions::empty(),
+                        kind: ShimKind::GuestResourceDrop {
+                            child: *child,
+                            key,
+                            resource: *resource,
+                        },
+                        sig: WasmSignature {
+                            params: vec![WasmType::I32],
+                            results: Vec::new(),
+                            indirect_params: false,
+                            retptr: false,
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn push(&mut self, shim: Shim<'a>) {
         // Only one shim per `ShimKind` is retained, so if it's already present
         // don't overwrite it. If it's not present though go ahead and insert
@@ -3335,6 +3679,8 @@ pub struct ComponentEncoder {
     debug_names: bool,
     shim_return_call_ref: bool,
     emit_canonical_names: bool,
+    /// Hole mode, enabled by child manifest sections in the main module.
+    pub(super) donut: Option<crate::donut::Donut>,
 }
 
 impl ComponentEncoder {
@@ -3344,6 +3690,7 @@ impl ComponentEncoder {
     /// It will also add any producers information inside the component type information to the
     /// core module.
     pub fn module(&mut self, module: &[u8]) -> Result<&mut Self> {
+        let (module, manifests) = crate::donut::extract_manifests(module)?;
         let (wasm, metadata) = self.decode(module.as_ref())?;
         let (wasm, module_import_map) = ModuleImportMap::new(wasm)?;
         self.module = if let Some(producers) = &metadata.producers {
@@ -3356,6 +3703,16 @@ impl ComponentEncoder {
             .context("failed merge WIT metadata for module with previous metadata")?;
         self.main_module_exports.extend(exports);
         self.module_import_map = module_import_map;
+        if !manifests.is_empty() {
+            if self.donut.is_some() {
+                bail!("only one module may carry child manifests");
+            }
+            self.donut = Some(crate::donut::Donut::new(
+                &mut self.metadata.resolve,
+                self.metadata.world,
+                manifests,
+            )?);
+        }
         Ok(self)
     }
 
@@ -3593,10 +3950,12 @@ impl ComponentEncoder {
             aliased_core_items: Default::default(),
             info: &world,
             export_task_initialization_wrappers: HashMap::new(),
+            child_exports: IndexMap::new(),
         };
         state.encode_imports(&self.import_name_map)?;
         state.encode_core_modules();
-        state.encode_core_instantiation(fixup_hook)?;
+        let shims = state.encode_core_instantiation(fixup_hook)?;
+        state.encode_donut(&shims)?;
         state.encode_exports(CustomModule::Main)?;
         for name in self.adapters.keys() {
             state.encode_exports(CustomModule::Adapter(name))?;

@@ -51,6 +51,11 @@ pub struct FixupModule {
     /// The index type of the component's linear memory.
     pub index_type: IndexType,
 
+    /// The total number of slots in the shim's table. In hole mode, this
+    /// fills only a prefix of the table; the children's slots are filled as
+    /// each child is linked.
+    pub shim_table_len: u64,
+
     // Current counters for index spaces.
     funcs: u32,
     globals: u32,
@@ -397,6 +402,9 @@ impl FixupModule {
                 ImportedInstance::Actual => {
                     let mut actual = Vec::new();
                     for shim in shims.shims.values() {
+                        if shim.kind.is_guest_export() {
+                            continue;
+                        }
                         let core_func_index = state.encode_shim(shims, shim)?;
                         actual.push((shim.name.as_str(), ExportKind::Func, core_func_index));
                     }
@@ -531,10 +539,11 @@ impl FixupModule {
         // If this fixup is filling in a table, then import the table and use an
         // element segment for its initialization.
         if !self.shims_in_table.is_empty() {
+            let len = self.shim_table_len.max(self.shims_in_table.len() as u64);
             let table_type = TableType {
                 element_type: RefType::FUNCREF,
-                minimum: self.shims_in_table.len() as u64,
-                maximum: Some(self.shims_in_table.len() as u64),
+                minimum: len,
+                maximum: Some(len),
                 table64: false,
                 shared: false,
             };
